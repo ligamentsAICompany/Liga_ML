@@ -100,6 +100,9 @@ class AgentSession:
     is_processing: bool = False  # True while a submission is being executed
     broadcaster: Any = None
     title: str | None = None
+    cloud_provider: str = "hf-jobs"
+    training_goal: str = "agent-decide"
+    output_policy: str = "cloud-and-hf-hub"
     # True once this session has been counted against the user's daily
     # Claude quota. Guards double-counting when the user re-selects an
     # Anthropic model mid-session.
@@ -170,6 +173,9 @@ class SessionManager:
         model: str | None,
         event_queue: asyncio.Queue,
         notification_destinations: list[str] | None = None,
+        cloud_provider: str = "hf-jobs",
+        training_goal: str = "agent-decide",
+        output_policy: str = "cloud-and-hf-hub",
     ) -> tuple[ToolRouter, Session]:
         """Build blocking per-session resources in a worker thread."""
         import time as _time
@@ -193,6 +199,9 @@ class SessionManager:
             session_id=session_id,
             persistence_store=self._store(),
         )
+        session.cloud_provider = cloud_provider
+        session.training_goal = training_goal
+        session.output_policy = output_policy
         t1 = _time.monotonic()
         logger.info("Session initialized in %.2fs", t1 - t0)
         return tool_router, session
@@ -203,18 +212,36 @@ class SessionManager:
     def _serialize_pending_approval(self, session: Session) -> list[dict[str, Any]]:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
+        records = {
+            str(record.get("tool_call_id")): record
+            for record in (pending.get("approvals") or [])
+            if isinstance(record, dict) and record.get("tool_call_id")
+        }
         serialized: list[dict[str, Any]] = []
         for tc in tool_calls:
             if hasattr(tc, "model_dump"):
-                serialized.append(tc.model_dump(mode="json"))
+                raw = tc.model_dump(mode="json")
+                if record := records.get(str(getattr(tc, "id", ""))):
+                    raw.update(record)
+                serialized.append(raw)
             elif isinstance(tc, dict):
                 serialized.append(tc)
         return serialized
 
     @staticmethod
+    def _serialize_uploaded_datasets(session: Session) -> list[dict[str, Any]]:
+        uploads = getattr(session, "uploaded_datasets", []) or []
+        return [dict(upload) for upload in uploads if isinstance(upload, dict)]
+
+    @staticmethod
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
+        records = {
+            str(record.get("tool_call_id")): record
+            for record in (pending.get("approvals") or [])
+            if isinstance(record, dict) and record.get("tool_call_id")
+        }
         if not tool_calls:
             return None
         result: list[dict[str, Any]] = []
@@ -223,13 +250,15 @@ class SessionManager:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError, TypeError):
                 args = {}
-            result.append(
-                {
-                    "tool": getattr(tc.function, "name", None),
-                    "tool_call_id": getattr(tc, "id", None),
-                    "arguments": args,
-                }
-            )
+            tool_call_id = getattr(tc, "id", None)
+            payload = {
+                "tool": getattr(tc.function, "name", None),
+                "tool_call_id": tool_call_id,
+                "arguments": args,
+            }
+            if record := records.get(str(tool_call_id)):
+                payload.update(record)
+            result.append(payload)
         return result
 
     def _restore_pending_approval(
@@ -241,10 +270,27 @@ class SessionManager:
         from litellm import ChatCompletionMessageToolCall as ToolCall
 
         restored = []
+        records = []
         for raw in pending_approval:
             try:
                 if "function" in raw:
                     restored.append(ToolCall(**raw))
+                    records.append(
+                        {
+                            key: raw.get(key)
+                            for key in (
+                                "approval_id",
+                                "tool_call_id",
+                                "tool",
+                                "operation",
+                                "provider",
+                                "created_at",
+                                "expires_at",
+                                "status",
+                            )
+                            if raw.get(key) is not None
+                        }
+                    )
                 else:
                     restored.append(
                         ToolCall(
@@ -256,9 +302,27 @@ class SessionManager:
                             },
                         )
                     )
+                    records.append(
+                        {
+                            key: raw.get(key)
+                            for key in (
+                                "approval_id",
+                                "tool_call_id",
+                                "tool",
+                                "operation",
+                                "provider",
+                                "created_at",
+                                "expires_at",
+                                "status",
+                            )
+                            if raw.get(key) is not None
+                        }
+                    )
             except Exception as e:
                 logger.warning("Dropping malformed pending approval: %s", e)
-        session.pending_approval = {"tool_calls": restored} if restored else None
+        session.pending_approval = (
+            {"tool_calls": restored, "approvals": records} if restored else None
+        )
 
     @staticmethod
     def _pending_docs_for_api(
@@ -279,6 +343,12 @@ class SessionManager:
                         "tool": function.get("name"),
                         "tool_call_id": raw.get("id"),
                         "arguments": args,
+                        "approval_id": raw.get("approval_id"),
+                        "operation": raw.get("operation"),
+                        "provider": raw.get("provider"),
+                        "created_at": raw.get("created_at"),
+                        "expires_at": raw.get("expires_at"),
+                        "status": raw.get("status"),
                     }
                 )
             elif {"tool", "tool_call_id"}.issubset(raw):
@@ -287,6 +357,12 @@ class SessionManager:
                         "tool": raw.get("tool"),
                         "tool_call_id": raw.get("tool_call_id"),
                         "arguments": raw.get("arguments") or {},
+                        "approval_id": raw.get("approval_id"),
+                        "operation": raw.get("operation"),
+                        "provider": raw.get("provider"),
+                        "created_at": raw.get("created_at"),
+                        "expires_at": raw.get("expires_at"),
+                        "status": raw.get("status"),
                     }
                 )
         return result or None
@@ -537,6 +613,20 @@ class SessionManager:
                     )
                     or 0.0
                 ),
+                cloud_provider=getattr(
+                    agent_session.session,
+                    "cloud_provider",
+                    agent_session.cloud_provider,
+                ),
+                training_goal=getattr(
+                    agent_session.session, "training_goal", agent_session.training_goal
+                ),
+                output_policy=getattr(
+                    agent_session.session, "output_policy", agent_session.output_policy
+                ),
+                uploaded_datasets=self._serialize_uploaded_datasets(
+                    agent_session.session
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -605,6 +695,9 @@ class SessionManager:
         from litellm import Message
 
         model = meta.get("model") or self.config.model_name
+        cloud_provider = meta.get("cloud_provider") or "hf-jobs"
+        training_goal = meta.get("training_goal") or "agent-decide"
+        output_policy = meta.get("output_policy") or "cloud-and-hf-hub"
         event_queue: asyncio.Queue = asyncio.Queue()
         submission_queue: asyncio.Queue = asyncio.Queue()
         tool_router, session = await asyncio.to_thread(
@@ -616,6 +709,9 @@ class SessionManager:
             model=model,
             event_queue=event_queue,
             notification_destinations=meta.get("notification_destinations") or [],
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
 
         restored_messages: list[Message] = []
@@ -644,6 +740,11 @@ class SessionManager:
         session.auto_approval_estimated_spend_usd = float(
             meta.get("auto_approval_estimated_spend_usd") or 0.0
         )
+        session.uploaded_datasets = [
+            dict(upload)
+            for upload in meta.get("uploaded_datasets") or []
+            if isinstance(upload, dict)
+        ]
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):
@@ -662,6 +763,9 @@ class SessionManager:
             is_processing=False,
             claude_counted=bool(meta.get("claude_counted")),
             title=meta.get("title"),
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
         started = await self._start_agent_session(
             agent_session=agent_session,
@@ -687,6 +791,9 @@ class SessionManager:
         hf_token: str | None = None,
         model: str | None = None,
         is_pro: bool | None = None,
+        cloud_provider: str = "hf-jobs",
+        training_goal: str = "agent-decide",
+        output_policy: str = "cloud-and-hf-hub",
     ) -> str:
         """Create a new agent session and return its ID.
 
@@ -739,6 +846,9 @@ class SessionManager:
             hf_token=hf_token,
             model=model,
             event_queue=event_queue,
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
 
         # Create wrapper
@@ -750,6 +860,9 @@ class SessionManager:
             user_id=user_id,
             hf_username=hf_username,
             hf_token=hf_token,
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
 
         await self._start_agent_session(
@@ -1005,9 +1118,40 @@ class SessionManager:
         await agent_session.submission_queue.put(submission)
         return True
 
-    async def submit_user_input(self, session_id: str, text: str) -> bool:
+    async def submit_user_input(
+        self,
+        session_id: str,
+        text: str,
+        cloud_provider: str | None = None,
+        training_goal: str | None = None,
+        output_policy: str | None = None,
+    ) -> bool:
         """Submit user input to a session."""
-        operation = Operation(op_type=OpType.USER_INPUT, data={"text": text})
+        agent_session = self.sessions.get(session_id)
+        if cloud_provider in {"hf-jobs", "gcp-vertex"} and agent_session:
+            agent_session.cloud_provider = cloud_provider
+            agent_session.session.cloud_provider = cloud_provider
+        if (
+            training_goal in {"smoke-test", "production", "agent-decide"}
+            and agent_session
+        ):
+            agent_session.training_goal = training_goal
+            agent_session.session.training_goal = training_goal
+        if (
+            output_policy in {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
+            and agent_session
+        ):
+            agent_session.output_policy = output_policy
+            agent_session.session.output_policy = output_policy
+        operation = Operation(
+            op_type=OpType.USER_INPUT,
+            data={
+                "text": text,
+                "cloud_provider": cloud_provider,
+                "training_goal": training_goal,
+                "output_policy": output_policy,
+            },
+        )
         return await self.submit(session_id, operation)
 
     async def submit_approval(
@@ -1118,6 +1262,27 @@ class SessionManager:
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
         return True
 
+    async def update_session_cloud_provider(
+        self,
+        session_id: str,
+        cloud_provider: str,
+        training_goal: str | None = None,
+        output_policy: str | None = None,
+    ) -> bool:
+        agent_session = self.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            return False
+        agent_session.cloud_provider = cloud_provider
+        agent_session.session.cloud_provider = cloud_provider
+        if training_goal in {"smoke-test", "production", "agent-decide"}:
+            agent_session.training_goal = training_goal
+            agent_session.session.training_goal = training_goal
+        if output_policy in {"cloud-private", "hf-hub", "cloud-and-hf-hub"}:
+            agent_session.output_policy = output_policy
+            agent_session.session.output_policy = output_policy
+        await self.persist_session_snapshot(agent_session, runtime_state="idle")
+        return True
+
     async def update_session_auto_approval(
         self,
         session_id: str,
@@ -1191,11 +1356,17 @@ class SessionManager:
             "user_id": agent_session.user_id,
             "pending_approval": pending_approval,
             "model": agent_session.session.config.model_name,
+            "cloud_provider": agent_session.cloud_provider,
+            "training_goal": agent_session.training_goal,
+            "output_policy": agent_session.output_policy,
             "title": agent_session.title,
             "notification_destinations": list(
                 agent_session.session.notification_destinations
             ),
             "auto_approval": self._auto_approval_summary(agent_session.session),
+            "uploaded_datasets": self._serialize_uploaded_datasets(
+                agent_session.session
+            ),
         }
 
     def set_notification_destinations(
@@ -1258,6 +1429,9 @@ class SessionManager:
                         "user_id": row.get("user_id") or "dev",
                         "pending_approval": pending or None,
                         "model": row.get("model"),
+                        "cloud_provider": row.get("cloud_provider") or "hf-jobs",
+                        "training_goal": row.get("training_goal") or "agent-decide",
+                        "output_policy": row.get("output_policy") or "cloud-and-hf-hub",
                         "title": row.get("title"),
                         "notification_destinations": row.get(
                             "notification_destinations"
@@ -1287,6 +1461,7 @@ class SessionManager:
                                 )
                             ),
                         },
+                        "uploaded_datasets": row.get("uploaded_datasets") or [],
                     }
                 )
             return results

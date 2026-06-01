@@ -17,16 +17,27 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
-from session_manager import AgentSession, SessionManager  # noqa: E402
+from session_manager import AgentSession, Operation, SessionManager  # noqa: E402
 
 
 class FakeRuntimeSession:
-    def __init__(self, *, hf_token: str | None = None, model: str = "test-model"):
+    def __init__(
+        self,
+        *,
+        hf_token: str | None = None,
+        model: str = "test-model",
+        cloud_provider: str = "hf-jobs",
+        training_goal: str = "agent-decide",
+        output_policy: str = "cloud-and-hf-hub",
+    ):
         self.hf_token = hf_token
         self.context_manager = SimpleNamespace(items=[])
         self.pending_approval = None
         self.turn_count = 0
         self.config = SimpleNamespace(model_name=model)
+        self.cloud_provider = cloud_provider
+        self.training_goal = training_goal
+        self.output_policy = output_policy
         self.notification_destinations = []
         self.auto_approval_enabled = False
         self.auto_approval_cost_cap_usd = None
@@ -143,6 +154,41 @@ async def test_update_session_auto_approval_defaults_to_five_dollars():
     assert summary["remaining_usd"] == 5.0
 
 
+@pytest.mark.asyncio
+async def test_submit_user_input_preserves_hf_training_metadata():
+    manager = _manager_with_store(NoopSessionStore())
+    existing = _runtime_agent_session("s1", user_id="owner")
+    manager.sessions["s1"] = existing
+    submitted: list[Operation] = []
+
+    async def fake_submit(session_id: str, operation: Operation) -> bool:
+        submitted.append(operation)
+        return True
+
+    manager.submit = fake_submit  # type: ignore[method-assign]
+
+    ok = await manager.submit_user_input(
+        "s1",
+        "fine tune this",
+        cloud_provider="hf-jobs",
+        training_goal="production",
+        output_policy="hf-hub",
+    )
+
+    assert ok is True
+    assert existing.cloud_provider == "hf-jobs"
+    assert existing.training_goal == "production"
+    assert existing.output_policy == "hf-hub"
+    assert existing.session.training_goal == "production"
+    assert existing.session.output_policy == "hf-hub"
+    assert submitted[0].data == {
+        "text": "fine tune this",
+        "cloud_provider": "hf-jobs",
+        "training_goal": "production",
+        "output_policy": "hf-hub",
+    }
+
+
 def _install_fake_runtime(manager: SessionManager) -> asyncio.Event:
     stop = asyncio.Event()
     manager.run_calls = 0  # type: ignore[attr-defined]
@@ -151,6 +197,9 @@ def _install_fake_runtime(manager: SessionManager) -> asyncio.Event:
         return object(), FakeRuntimeSession(
             hf_token=kwargs.get("hf_token"),
             model=kwargs.get("model") or "test-model",
+            cloud_provider=kwargs.get("cloud_provider") or "hf-jobs",
+            training_goal=kwargs.get("training_goal") or "agent-decide",
+            output_policy=kwargs.get("output_policy") or "cloud-and-hf-hub",
         )
 
     async def fake_run_session(*_: Any) -> None:
@@ -621,6 +670,50 @@ async def test_lazy_restore_preserves_auto_approval_policy():
         assert restored.session.auto_approval_cost_cap_usd == 5.0
         assert restored.session.auto_approval_estimated_spend_usd == 1.25
         assert restored.session.auto_approval_policy_summary()["remaining_usd"] == 3.75
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_lazy_restore_preserves_hf_training_metadata_and_uploaded_datasets():
+    store = RestoreStore(
+        metadata={
+            "session_id": "hf-session",
+            "user_id": "owner",
+            "model": "test-model",
+            "cloud_provider": "hf-jobs",
+            "training_goal": "production",
+            "output_policy": "hf-hub",
+            "uploaded_datasets": [
+                {
+                    "repo_id": "owner/uploaded-dataset",
+                    "config_name": "normalized",
+                    "normalized_row_count": 42,
+                }
+            ],
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+
+    try:
+        restored = await manager.ensure_session_loaded("hf-session", user_id="owner")
+
+        assert restored is not None
+        assert restored.cloud_provider == "hf-jobs"
+        assert restored.training_goal == "production"
+        assert restored.output_policy == "hf-hub"
+        assert restored.session.cloud_provider == "hf-jobs"
+        assert restored.session.training_goal == "production"
+        assert restored.session.output_policy == "hf-hub"
+        assert restored.session.uploaded_datasets == [
+            {
+                "repo_id": "owner/uploaded-dataset",
+                "config_name": "normalized",
+                "normalized_row_count": 42,
+            }
+        ]
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)

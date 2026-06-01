@@ -25,6 +25,8 @@ env/
 !.env.example
 *.local
 credentials*.json
+*service-account*.json
+ligaments-portal-*.json
 
 # OS-specific
 .DS_Store

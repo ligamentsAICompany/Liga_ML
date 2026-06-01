@@ -64,7 +64,19 @@ jobs:
       - name: Prepare Claude Code bin directory
         run: mkdir -p "$HOME/.local/bin"
 
+      - name: Check Claude auth secret
+        id: claude-auth
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: anthropics/claude-code-action@v1
+        if: steps.claude-auth.outputs.available == 'true'
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           # Bypass the OIDC -> Claude GitHub App token exchange. That exchange
@@ -76,3 +88,8 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           track_progress: true
           prompt: ${{ steps.compose.outputs.prompt }}
+
+      - name: Skip Claude review when secret is missing
+        if: steps.claude-auth.outputs.available != 'true'
+        run: |
+          echo "::notice::Skipping Claude PR Review because ANTHROPIC_API_KEY is not configured."

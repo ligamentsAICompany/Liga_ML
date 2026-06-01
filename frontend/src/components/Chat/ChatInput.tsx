@@ -19,6 +19,7 @@ import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDropDownIcon from '@mui/icons-material/ArrowDropDown';
 import StopIcon from '@mui/icons-material/Stop';
 import AddIcon from '@mui/icons-material/Add';
+import CloudQueueIcon from '@mui/icons-material/CloudQueue';
 import { apiFetch, apiUpload } from '@/utils/api';
 import { useUserQuota } from '@/hooks/useUserQuota';
 import ClaudeCapDialog from '@/components/ClaudeCapDialog';
@@ -26,12 +27,28 @@ import JobsUpgradeDialog from '@/components/JobsUpgradeDialog';
 import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import {
+  DEFAULT_OUTPUT_POLICY,
+  DEFAULT_TRAINING_GOAL,
+  OUTPUT_POLICY_OPTIONS,
+  TRAINING_GOAL_OPTIONS,
+  outputPolicyLabel,
+  trainingGoalLabel,
+} from '@/lib/gcloud-preflight';
+import {
   CLAUDE_MODEL_PATH,
   FIRST_FREE_MODEL_PATH,
   GPT_55_MODEL_PATH,
   isClaudePath,
   isPremiumPath,
 } from '@/utils/model';
+import { clearLlmErrorOnModelChange, isModelUnavailable } from '@/lib/llm-error-recovery';
+import type {
+  CloudProviderId,
+  DatasetUploadResponse,
+  OutputPolicy,
+  TrainingGoal,
+  UploadedDatasetInfo,
+} from '@/types/agent';
 
 // Model configuration
 interface ModelOption {
@@ -95,6 +112,23 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
   },
 ];
 
+const CLOUD_PROVIDER_OPTIONS: Array<{
+  id: CloudProviderId;
+  name: string;
+  description: string;
+}> = [
+  {
+    id: 'hf-jobs',
+    name: 'Hugging Face Jobs',
+    description: 'Run training on Hugging Face infrastructure',
+  },
+  {
+    id: 'gcp-vertex',
+    name: 'Google Cloud Vertex AI',
+    description: 'Run training with the gcp_vertex_jobs backend',
+  },
+];
+
 const findModelByPath = (path: string, options: ModelOption[]): ModelOption | undefined => {
   if (isClaudePath(path)) {
     const claude = options.find(isClaudeModel);
@@ -127,24 +161,9 @@ interface ChatInputProps {
   placeholder?: string;
 }
 
-interface DatasetUploadResponse {
-  session_id: string;
-  repo_id: string;
-  repo_type: 'dataset';
-  private: true;
-  upload_id: string;
-  config_name: string;
-  filename: string;
-  path_in_repo: string;
-  size_bytes: number;
-  format: 'csv' | 'json' | 'jsonl';
-  hub_url: string;
-  load_dataset_snippet: string;
-}
-
 const MAX_DATASET_UPLOAD_BYTES = 100 * 1024 * 1024;
-const DATASET_UPLOAD_ACCEPT = '.csv,.json,.jsonl';
-const DATASET_UPLOAD_EXTENSIONS = new Set(['csv', 'json', 'jsonl']);
+const DATASET_UPLOAD_ACCEPT = '.csv,.json,.jsonl,.pdf,.docx,.xlsx,.md';
+const DATASET_UPLOAD_EXTENSIONS = new Set(['csv', 'json', 'jsonl', 'pdf', 'docx', 'xlsx', 'md']);
 
 const isClaudeModel = (m: ModelOption) => isClaudePath(m.modelPath);
 const isPremiumModel = (m: ModelOption) => isPremiumPath(m.modelPath);
@@ -160,10 +179,39 @@ const datasetRepoUrl = (repoId: string) => (
   `https://huggingface.co/datasets/${repoId.split('/').map(encodeURIComponent).join('/')}`
 );
 
+const datasetFilename = (dataset: UploadedDatasetInfo) => (
+  dataset.filename?.trim() || 'Unknown file'
+);
+
+const datasetFormatLabel = (dataset: UploadedDatasetInfo) => (
+  dataset.source_format || dataset.format
+    ? (dataset.source_format || dataset.format || '').toUpperCase()
+    : 'Unknown format'
+);
+
+const datasetRowLabel = (dataset: UploadedDatasetInfo) => {
+  if (typeof dataset.normalized_row_count !== 'number') return 'Row count unavailable';
+  const unit = dataset.source_format === 'md' ? 'chunks' : 'rows';
+  return `${dataset.normalized_row_count.toLocaleString()} normalized ${unit}`;
+};
+
+const datasetUploadedAtLabel = (dataset: UploadedDatasetInfo) => {
+  if (!dataset.uploaded_at) return 'Upload time unavailable';
+  const uploadedAt = new Date(dataset.uploaded_at);
+  if (Number.isNaN(uploadedAt.getTime())) return 'Upload time unavailable';
+  return `Uploaded ${uploadedAt.toLocaleString()}`;
+};
+
+const datasetReadinessLabel = (dataset: UploadedDatasetInfo) => {
+  const ready = (dataset.status ?? 'ready') === 'ready' && dataset.supports_training !== false;
+  return ready ? 'Ready for training' : 'Needs attention';
+};
+
 export default function ChatInput({ sessionId, initialModelPath, onSend, onStop, onDatasetUploaded, isProcessing = false, disabled = false, placeholder = 'Ask anything...' }: ChatInputProps) {
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const modelButtonRef = useRef<HTMLDivElement>(null);
   const [modelOptions, setModelOptions] = useState<ModelOption[]>(DEFAULT_MODEL_OPTIONS);
   const modelOptionsRef = useRef<ModelOption[]>(DEFAULT_MODEL_OPTIONS);
   const sessionIdRef = useRef<string | undefined>(sessionId);
@@ -171,6 +219,9 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     () => findModelByPath(initialModelPath ?? '', DEFAULT_MODEL_OPTIONS)?.id ?? DEFAULT_MODEL_OPTIONS[0].id,
   );
   const [modelAnchorEl, setModelAnchorEl] = useState<null | HTMLElement>(null);
+  const [providerAnchorEl, setProviderAnchorEl] = useState<null | HTMLElement>(null);
+  const [trainingGoalAnchorEl, setTrainingGoalAnchorEl] = useState<null | HTMLElement>(null);
+  const [outputPolicyAnchorEl, setOutputPolicyAnchorEl] = useState<null | HTMLElement>(null);
   const { quota, refresh: refreshQuota } = useUserQuota();
   // The daily-cap dialog is triggered from two places: (a) a 429 returned
   // from the chat transport when the user tries to send on a premium model over cap —
@@ -181,12 +232,34 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
   const setClaudeQuotaExhausted = useAgentStore((s) => s.setClaudeQuotaExhausted);
   const jobsUpgradeRequired = useAgentStore((s) => s.jobsUpgradeRequired);
   const setJobsUpgradeRequired = useAgentStore((s) => s.setJobsUpgradeRequired);
+  const llmHealthError = useAgentStore((s) => s.llmHealthError);
+  const setLlmHealthError = useAgentStore((s) => s.setLlmHealthError);
   const updateSessionModel = useSessionStore((s) => s.updateSessionModel);
+  const updateSessionCloudProvider = useSessionStore((s) => s.updateSessionCloudProvider);
+  const updateSessionGcloudPreflight = useSessionStore((s) => s.updateSessionGcloudPreflight);
+  const selectedCloudProvider = useSessionStore((s) => (
+    sessionId
+      ? s.sessions.find((session) => session.id === sessionId)?.cloudProvider ?? 'hf-jobs'
+      : 'hf-jobs'
+  ));
+  const selectedTrainingGoal = useSessionStore((s) => (
+    sessionId
+      ? s.sessions.find((session) => session.id === sessionId)?.trainingGoal ?? DEFAULT_TRAINING_GOAL
+      : DEFAULT_TRAINING_GOAL
+  ));
+  const selectedOutputPolicy = useSessionStore((s) => (
+    sessionId
+      ? s.sessions.find((session) => session.id === sessionId)?.outputPolicy ?? DEFAULT_OUTPUT_POLICY
+      : DEFAULT_OUTPUT_POLICY
+  ));
+  const currentSessionMeta = useSessionStore((s) => (
+    sessionId ? s.sessions.find((session) => session.id === sessionId) : undefined
+  ));
   const [awaitingTopUp, setAwaitingTopUp] = useState(false);
   const [modelSwitchError, setModelSwitchError] = useState<string | null>(null);
   const [datasetUploadError, setDatasetUploadError] = useState<string | null>(null);
   const [datasetUploadSuccess, setDatasetUploadSuccess] = useState<string | null>(null);
-  const [uploadedDatasets, setUploadedDatasets] = useState<DatasetUploadResponse[]>([]);
+  const [uploadedDatasets, setUploadedDatasets] = useState<UploadedDatasetInfo[]>([]);
   const [isUploadingDataset, setIsUploadingDataset] = useState(false);
   const [datasetUploadProgress, setDatasetUploadProgress] = useState<number | null>(null);
   const lastSentRef = useRef<string>('');
@@ -240,12 +313,28 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
           if (model) setSelectedModelId(model.id);
           updateSessionModel(sessionId, data.model);
         }
+        if (data?.cloud_provider === 'hf-jobs' || data?.cloud_provider === 'gcp-vertex') {
+          updateSessionCloudProvider(sessionId, data.cloud_provider);
+        }
+        if (data?.training_goal || data?.output_policy) {
+          updateSessionGcloudPreflight(sessionId, {
+            trainingGoal: data.training_goal,
+            outputPolicy: data.output_policy,
+          });
+        }
+        if (Array.isArray(data?.uploaded_datasets)) {
+          setUploadedDatasets(data.uploaded_datasets);
+        } else {
+          setUploadedDatasets([]);
+        }
       })
       .catch(() => { /* ignore */ });
     return () => { cancelled = true; };
-  }, [sessionId, updateSessionModel]);
+  }, [sessionId, updateSessionModel, updateSessionCloudProvider, updateSessionGcloudPreflight]);
 
   const selectedModel = modelOptions.find(m => m.id === selectedModelId) || modelOptions[0];
+  const selectedProvider = CLOUD_PROVIDER_OPTIONS.find((provider) => provider.id === selectedCloudProvider)
+    ?? CLOUD_PROVIDER_OPTIONS[0];
 
   // Auto-focus the textarea when the session becomes ready
   useEffect(() => {
@@ -279,7 +368,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
 
       const extension = file.name.split('.').pop()?.toLowerCase() || '';
       if (!DATASET_UPLOAD_EXTENSIONS.has(extension)) {
-        setDatasetUploadError('Only CSV, JSON, and JSONL dataset files are supported.');
+        setDatasetUploadError('Only CSV, JSON, JSONL, PDF, DOCX, XLSX, and Markdown dataset files are supported.');
         return;
       }
       if (file.size > MAX_DATASET_UPLOAD_BYTES) {
@@ -311,7 +400,10 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
         }
         const payload = await res.json() as DatasetUploadResponse;
         setUploadedDatasets((previous) => [payload, ...previous]);
-        setDatasetUploadSuccess(`Uploaded ${payload.filename} to ${payload.repo_id}`);
+        const rowSummary = typeof payload.normalized_row_count === 'number'
+          ? ` (${payload.normalized_row_count.toLocaleString()} normalized rows)`
+          : '';
+        setDatasetUploadSuccess(`Uploaded ${payload.filename}${rowSummary} to ${payload.repo_id}`);
         await onDatasetUploaded?.();
       } catch (error) {
         setDatasetUploadError(
@@ -370,9 +462,111 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
     setModelAnchorEl(null);
   };
 
+  useEffect(() => {
+    const openModelSelector = () => {
+      if (modelButtonRef.current) setModelAnchorEl(modelButtonRef.current);
+    };
+    window.addEventListener('liga-open-model-selector', openModelSelector);
+    return () => window.removeEventListener('liga-open-model-selector', openModelSelector);
+  }, []);
+
+  const handleProviderClick = (event: React.MouseEvent<HTMLElement>) => {
+    setProviderAnchorEl(event.currentTarget);
+  };
+
+  const handleProviderClose = () => {
+    setProviderAnchorEl(null);
+  };
+
+  const handleTrainingGoalClose = () => {
+    setTrainingGoalAnchorEl(null);
+  };
+
+  const handleOutputPolicyClose = () => {
+    setOutputPolicyAnchorEl(null);
+  };
+
+  const handleSelectProvider = async (provider: CloudProviderId) => {
+    handleProviderClose();
+    if (!sessionId) return;
+    const previousProvider = selectedCloudProvider;
+    updateSessionCloudProvider(sessionId, provider);
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/cloud-provider`, {
+        method: 'POST',
+        body: JSON.stringify({
+          cloud_provider: provider,
+          training_goal: selectedTrainingGoal,
+          output_policy: selectedOutputPolicy,
+        }),
+      });
+      if (!res.ok) {
+        updateSessionCloudProvider(sessionId, previousProvider);
+        setModelSwitchError(await readApiErrorMessage(res, 'Could not switch training provider.'));
+        return;
+      }
+      setModelSwitchError(null);
+    } catch (error) {
+      updateSessionCloudProvider(sessionId, previousProvider);
+      setModelSwitchError(error instanceof Error ? error.message : 'Could not switch training provider.');
+    }
+  };
+
+  const handleSelectTrainingGoal = async (trainingGoal: TrainingGoal) => {
+    handleTrainingGoalClose();
+    if (!sessionId) return;
+    const previous = selectedTrainingGoal;
+    updateSessionGcloudPreflight(sessionId, { trainingGoal });
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/cloud-provider`, {
+        method: 'POST',
+        body: JSON.stringify({
+          cloud_provider: selectedCloudProvider,
+          training_goal: trainingGoal,
+          output_policy: selectedOutputPolicy,
+        }),
+      });
+      if (!res.ok) {
+        updateSessionGcloudPreflight(sessionId, { trainingGoal: previous });
+        setModelSwitchError(await readApiErrorMessage(res, 'Could not update training goal.'));
+      }
+    } catch (error) {
+      updateSessionGcloudPreflight(sessionId, { trainingGoal: previous });
+      setModelSwitchError(error instanceof Error ? error.message : 'Could not update training goal.');
+    }
+  };
+
+  const handleSelectOutputPolicy = async (outputPolicy: OutputPolicy) => {
+    handleOutputPolicyClose();
+    if (!sessionId) return;
+    const previous = selectedOutputPolicy;
+    updateSessionGcloudPreflight(sessionId, { outputPolicy });
+    try {
+      const res = await apiFetch(`/api/session/${sessionId}/cloud-provider`, {
+        method: 'POST',
+        body: JSON.stringify({
+          cloud_provider: selectedCloudProvider,
+          training_goal: selectedTrainingGoal,
+          output_policy: outputPolicy,
+        }),
+      });
+      if (!res.ok) {
+        updateSessionGcloudPreflight(sessionId, { outputPolicy: previous });
+        setModelSwitchError(await readApiErrorMessage(res, 'Could not update final model storage.'));
+      }
+    } catch (error) {
+      updateSessionGcloudPreflight(sessionId, { outputPolicy: previous });
+      setModelSwitchError(error instanceof Error ? error.message : 'Could not update final model storage.');
+    }
+  };
+
   const handleSelectModel = async (model: ModelOption) => {
     handleModelClose();
     if (!sessionId) return;
+    if (currentSessionMeta && isModelUnavailable(currentSessionMeta, model.modelPath)) {
+      setModelSwitchError(`${model.name} is unavailable in this session after a quota or billing failure. Select another model.`);
+      return;
+    }
     try {
       const res = await apiFetch(`/api/session/${sessionId}/model`, {
         method: 'POST',
@@ -381,6 +575,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
       if (res.ok) {
         setSelectedModelId(model.id);
         updateSessionModel(sessionId, model.modelPath);
+        setLlmHealthError(clearLlmErrorOnModelChange(llmHealthError, model.modelPath));
         setModelSwitchError(null);
         return;
       }
@@ -410,6 +605,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
       if (res.ok) {
         setSelectedModelId(free.id);
         updateSessionModel(sessionId, free.modelPath);
+        setLlmHealthError(clearLlmErrorOnModelChange(llmHealthError, free.modelPath));
         const retryText = lastSentRef.current;
         if (retryText) {
           onSend(retryText);
@@ -418,7 +614,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
         }
       }
     } catch { /* ignore */ }
-  }, [sessionId, onSend, setClaudeQuotaExhausted, modelOptions, updateSessionModel]);
+  }, [sessionId, onSend, setClaudeQuotaExhausted, modelOptions, updateSessionModel, setLlmHealthError, llmHealthError]);
 
   const handlePremiumUpgradeClick = useCallback(async () => {
     if (!sessionId) return;
@@ -662,62 +858,192 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
             </Alert>
           </Box>
         )}
-        {uploadedDatasets.length > 0 && (
-          <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, justifyContent: 'center', mt: 1 }}>
-            {uploadedDatasets.map((dataset) => (
-              <Chip
-                key={dataset.upload_id}
-                size="small"
-                label={`Dataset: ${dataset.filename}`}
-                component="a"
-                href={datasetRepoUrl(dataset.repo_id)}
-                target="_blank"
-                rel="noreferrer"
-                clickable
-                sx={{
-                  maxWidth: '100%',
-                  bgcolor: 'rgba(255,255,255,0.08)',
-                  color: 'var(--text)',
-                  border: '1px solid var(--divider)',
-                  '& .MuiChip-label': {
-                    overflow: 'hidden',
-                    textOverflow: 'ellipsis',
-                  },
-                }}
-              />
-            ))}
-          </Box>
-        )}
-
-        {/* Powered By Badge */}
         <Box
-          onClick={handleModelClick}
+          aria-label="Uploaded Data"
           sx={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            mt: 1.5,
-            gap: 0.8,
-            opacity: 0.6,
-            cursor: 'pointer',
-            transition: 'opacity 0.2s',
-            '&:hover': {
-              opacity: 1
-            }
+            mt: 1,
+            p: 1,
+            border: '1px solid var(--divider)',
+            borderRadius: '12px',
+            bgcolor: 'rgba(255,255,255,0.04)',
           }}
         >
-          <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
-            powered by
+          <Typography
+            variant="caption"
+            sx={{
+              display: 'block',
+              mb: 0.5,
+              color: 'var(--muted-text)',
+              fontWeight: 700,
+              letterSpacing: '0.05em',
+              textTransform: 'uppercase',
+            }}
+          >
+            Uploaded Data
           </Typography>
-          <img
-            src={selectedModel.avatarUrl}
-            alt={selectedModel.name}
-            style={{ height: '14px', width: '14px', objectFit: 'contain', borderRadius: '2px' }}
-          />
-          <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
-            {selectedModel.name}
+          <Typography variant="caption" sx={{ display: 'block', mb: uploadedDatasets.length ? 0.75 : 0, color: 'var(--muted-text)' }}>
+            Uploaded data is prioritized for fine-tuning planning before external dataset suggestions.
           </Typography>
-          <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
+          {uploadedDatasets.length === 0 ? (
+            <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: 'var(--muted-text)' }}>
+              No uploaded data yet. Upload CSV, JSONL, JSON, Markdown, PDF, DOCX, or XLSX to prepare a normalized training JSONL dataset.
+            </Typography>
+          ) : (
+            <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: 'repeat(auto-fit, minmax(260px, 1fr))' }, gap: 0.75 }}>
+              {uploadedDatasets.map((dataset, index) => {
+                const ready = (dataset.status ?? 'ready') === 'ready' && dataset.supports_training !== false;
+                const repoUrl = dataset.repo_id ? datasetRepoUrl(dataset.repo_id) : undefined;
+                return (
+                  <Box
+                    key={dataset.upload_id ?? `${dataset.filename ?? 'dataset'}-${index}`}
+                    component={repoUrl ? 'a' : 'div'}
+                    href={repoUrl}
+                    target={repoUrl ? '_blank' : undefined}
+                    rel={repoUrl ? 'noreferrer' : undefined}
+                    sx={{
+                      minWidth: 0,
+                      p: 1,
+                      borderRadius: '10px',
+                      textDecoration: 'none',
+                      bgcolor: ready ? 'rgba(54, 211, 153, 0.09)' : 'rgba(248, 113, 113, 0.09)',
+                      border: `1px solid ${ready ? 'rgba(54, 211, 153, 0.32)' : 'rgba(248, 113, 113, 0.32)'}`,
+                      color: 'var(--text)',
+                      cursor: repoUrl ? 'pointer' : 'default',
+                    }}
+                  >
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, minWidth: 0 }}>
+                      <Typography variant="caption" sx={{ fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {datasetFilename(dataset)}
+                      </Typography>
+                      <Chip
+                        size="small"
+                        label={datasetReadinessLabel(dataset)}
+                        sx={{
+                          height: 20,
+                          flexShrink: 0,
+                          bgcolor: ready ? 'rgba(54, 211, 153, 0.16)' : 'rgba(248, 113, 113, 0.16)',
+                          color: 'var(--text)',
+                        }}
+                      />
+                    </Box>
+                    <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: 'var(--muted-text)' }}>
+                      {datasetFormatLabel(dataset)} · {dataset.normalized_format ?? 'jsonl'} · {datasetRowLabel(dataset)}
+                    </Typography>
+                    <Typography variant="caption" sx={{ display: 'block', color: 'var(--muted-text)' }}>
+                      {datasetUploadedAtLabel(dataset)} · Source: {dataset.source ?? 'session-upload'}
+                    </Typography>
+                    <Typography variant="caption" sx={{ display: 'block', color: 'var(--muted-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      Config: {dataset.config_name ?? 'missing config'} · Repo: {dataset.repo_id ?? 'missing repo'}
+                    </Typography>
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
+        </Box>
+
+        {/* Model and training backend selectors */}
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', mt: 1.5, gap: 1.5, flexWrap: 'wrap' }}>
+          <Box
+            ref={modelButtonRef}
+            onClick={handleModelClick}
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 0.8,
+              opacity: 0.6,
+              cursor: 'pointer',
+              transition: 'opacity 0.2s',
+              '&:hover': {
+                opacity: 1
+              }
+            }}
+          >
+            <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
+              powered by
+            </Typography>
+            <img
+              src={selectedModel.avatarUrl}
+              alt={selectedModel.name}
+              style={{ height: '14px', width: '14px', objectFit: 'contain', borderRadius: '2px' }}
+            />
+            <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
+              {selectedModel.name}
+            </Typography>
+            <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
+          </Box>
+
+          <Box
+            onClick={handleProviderClick}
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 0.6,
+              opacity: 0.7,
+              cursor: 'pointer',
+              transition: 'opacity 0.2s',
+              '&:hover': {
+                opacity: 1
+              }
+            }}
+          >
+            <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
+              training on
+            </Typography>
+            <CloudQueueIcon sx={{ fontSize: '14px', color: selectedCloudProvider === 'gcp-vertex' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
+            <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
+              {selectedProvider.name}
+            </Typography>
+            <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
+          </Box>
+
+          {(selectedCloudProvider === 'gcp-vertex' || selectedCloudProvider === 'hf-jobs') && (
+            <>
+              <Box
+                onClick={(event) => setTrainingGoalAnchorEl(event.currentTarget)}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.6,
+                  opacity: 0.75,
+                  cursor: 'pointer',
+                  transition: 'opacity 0.2s',
+                  '&:hover': { opacity: 1 },
+                }}
+              >
+                <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
+                  goal
+                </Typography>
+                <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
+                  {trainingGoalLabel(selectedTrainingGoal)}
+                </Typography>
+                <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
+              </Box>
+
+              <Box
+                onClick={(event) => setOutputPolicyAnchorEl(event.currentTarget)}
+                sx={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 0.6,
+                  opacity: 0.75,
+                  cursor: 'pointer',
+                  transition: 'opacity 0.2s',
+                  '&:hover': { opacity: 1 },
+                }}
+              >
+                <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
+                  storage
+                </Typography>
+                <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
+                  {outputPolicyLabel(selectedOutputPolicy, selectedCloudProvider)}
+                </Typography>
+                <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
+              </Box>
+            </>
+          )}
         </Box>
 
         {/* Model Selection Menu */}
@@ -744,11 +1070,14 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
             }
           }}
         >
-          {modelOptions.map((model) => (
+          {modelOptions.map((model) => {
+            const unavailable = currentSessionMeta ? isModelUnavailable(currentSessionMeta, model.modelPath) : false;
+            return (
             <MenuItem
               key={model.id}
               onClick={() => handleSelectModel(model)}
               selected={selectedModelId === model.id}
+              disabled={unavailable}
               sx={{
                 py: 1.5,
                 '&.Mui-selected': {
@@ -793,9 +1122,113 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
                         }}
                       />
                     )}
+                    {unavailable && (
+                      <Chip
+                        label="Unavailable"
+                        size="small"
+                        sx={{
+                          height: '18px',
+                          fontSize: '10px',
+                          bgcolor: 'rgba(224,90,79,0.14)',
+                          color: 'var(--accent-red)',
+                          fontWeight: 600,
+                        }}
+                      />
+                    )}
                   </Box>
                 }
                 secondary={model.description}
+                secondaryTypographyProps={{
+                  sx: { fontSize: '12px', color: 'var(--muted-text)' }
+                }}
+              />
+            </MenuItem>
+            );
+          })}
+        </Menu>
+
+        {/* GCloud Training Goal Menu */}
+        <Menu
+          anchorEl={trainingGoalAnchorEl}
+          open={Boolean(trainingGoalAnchorEl)}
+          onClose={handleTrainingGoalClose}
+          anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+          transformOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+          slotProps={{ paper: { sx: { bgcolor: 'var(--panel)', border: '1px solid var(--divider)', mb: 1, minWidth: '260px' } } }}
+        >
+          {TRAINING_GOAL_OPTIONS.map((option) => (
+            <MenuItem
+              key={option.value}
+              onClick={() => handleSelectTrainingGoal(option.value)}
+              selected={selectedTrainingGoal === option.value}
+            >
+              <ListItemText primary={option.label} />
+            </MenuItem>
+          ))}
+        </Menu>
+
+        {/* GCloud Output Policy Menu */}
+        <Menu
+          anchorEl={outputPolicyAnchorEl}
+          open={Boolean(outputPolicyAnchorEl)}
+          onClose={handleOutputPolicyClose}
+          anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
+          transformOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+          slotProps={{ paper: { sx: { bgcolor: 'var(--panel)', border: '1px solid var(--divider)', mb: 1, minWidth: '320px' } } }}
+        >
+          {OUTPUT_POLICY_OPTIONS.map((option) => (
+            <MenuItem
+              key={option.value}
+              onClick={() => handleSelectOutputPolicy(option.value)}
+              selected={selectedOutputPolicy === option.value}
+            >
+              <ListItemText primary={outputPolicyLabel(option.value, selectedCloudProvider)} />
+            </MenuItem>
+          ))}
+        </Menu>
+
+        {/* Training Provider Selection Menu */}
+        <Menu
+          anchorEl={providerAnchorEl}
+          open={Boolean(providerAnchorEl)}
+          onClose={handleProviderClose}
+          anchorOrigin={{
+            vertical: 'top',
+            horizontal: 'center',
+          }}
+          transformOrigin={{
+            vertical: 'bottom',
+            horizontal: 'center',
+          }}
+          slotProps={{
+            paper: {
+              sx: {
+                bgcolor: 'var(--panel)',
+                border: '1px solid var(--divider)',
+                mb: 1,
+                minWidth: '280px',
+              }
+            }
+          }}
+        >
+          {CLOUD_PROVIDER_OPTIONS.map((provider) => (
+            <MenuItem
+              key={provider.id}
+              onClick={() => handleSelectProvider(provider.id)}
+              selected={selectedCloudProvider === provider.id}
+              sx={{
+                py: 1.5,
+                '&.Mui-selected': {
+                  bgcolor: 'rgba(255,255,255,0.05)',
+                }
+              }}
+            >
+              <ListItemIcon>
+                <CloudQueueIcon sx={{ color: provider.id === 'gcp-vertex' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
+              </ListItemIcon>
+              <ListItemText
+                primary={provider.name}
+                secondary={provider.description}
                 secondaryTypographyProps={{
                   sx: { fontSize: '12px', color: 'var(--muted-text)' }
                 }}

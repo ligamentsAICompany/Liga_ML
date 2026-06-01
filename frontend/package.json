@@ -7,6 +7,13 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test:training-result": "node -e \"require('fs').rmSync('.training-result-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .training-result-test --noEmit false --allowImportingTsExtensions false src/utils/trainingResult.ts test/trainingResult.test.ts && node --test .training-result-test/test/trainingResult.test.js && node -e \"require('fs').rmSync('.training-result-test', { recursive: true, force: true })\"",
+    "test:cloud-providers": "node -e \"require('fs').rmSync('.cloud-providers-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .cloud-providers-test --noEmit false --allowImportingTsExtensions false src/types/agent.ts src/lib/output-policy.ts src/lib/gcloud-preflight.ts src/lib/explicit-tool-approvals.ts test/cloudProviders.test.ts && node --test .cloud-providers-test/test/cloudProviders.test.js && node -e \"require('fs').rmSync('.cloud-providers-test', { recursive: true, force: true })\"",
+    "test:output-policy": "node -e \"require('fs').rmSync('.output-policy-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .output-policy-test --noEmit false --allowImportingTsExtensions false src/types/agent.ts src/lib/output-policy.ts test/outputPolicy.test.ts && node --test .output-policy-test/test/outputPolicy.test.js && node -e \"require('fs').rmSync('.output-policy-test', { recursive: true, force: true })\"",
+    "test:dataset-upload-ui": "node -e \"require('fs').rmSync('.dataset-upload-ui-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .dataset-upload-ui-test --noEmit false --allowImportingTsExtensions false test/datasetUploadUi.test.ts && node --test .dataset-upload-ui-test/datasetUploadUi.test.js && node -e \"require('fs').rmSync('.dataset-upload-ui-test', { recursive: true, force: true })\"",
+    "test:llm-error-recovery": "node -e \"require('fs').rmSync('.llm-error-recovery-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .llm-error-recovery-test --noEmit false --allowImportingTsExtensions false src/types/agent.ts src/lib/llm-error-recovery.ts test/llmErrorRecovery.test.ts && node --test .llm-error-recovery-test/test/llmErrorRecovery.test.js && node -e \"require('fs').rmSync('.llm-error-recovery-test', { recursive: true, force: true })\"",
+    "test:training-planner-panel": "node -e \"require('fs').rmSync('.training-planner-panel-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .training-planner-panel-test --noEmit false --allowImportingTsExtensions false src/types/agent.ts src/lib/output-policy.ts src/lib/training-planner-panel.ts test/trainingPlannerPanel.test.ts && node --test .training-planner-panel-test/test/trainingPlannerPanel.test.js && node -e \"require('fs').rmSync('.training-planner-panel-test', { recursive: true, force: true })\"",
+    "test:dataset-discovery-panel": "node -e \"require('fs').rmSync('.dataset-discovery-panel-test', { recursive: true, force: true })\" && tsc --module NodeNext --moduleResolution NodeNext --target ES2022 --outDir .dataset-discovery-panel-test --noEmit false --allowImportingTsExtensions false src/lib/dataset-discovery-panel.ts test/datasetDiscoveryPanel.test.ts && node --test .dataset-discovery-panel-test/test/datasetDiscoveryPanel.test.js && node -e \"require('fs').rmSync('.dataset-discovery-panel-test', { recursive: true, force: true })\"",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -25,6 +32,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",
+    "@types/node": "^25.9.1",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@types/react-syntax-highlighter": "^15.5.13",

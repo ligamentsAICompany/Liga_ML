@@ -9,7 +9,21 @@ import type { ChatTransport, UIMessage, UIMessageChunk, ChatRequestOptions } fro
 import { apiFetch } from '@/utils/api';
 import { logger } from '@/utils/logger';
 import type { AgentEvent } from '@/types/events';
+import type { ToolStateChangeEventData } from '@/types/events';
 import { useAgentStore } from '@/store/agentStore';
+import { useSessionStore } from '@/store/sessionStore';
+import { buildGcloudChatRequestMetadata } from '@/lib/gcloud-preflight';
+import { consumeExplicitApprovalDecision } from '@/lib/explicit-tool-approvals';
+
+function emptyFinishStream(): ReadableStream<UIMessageChunk> {
+  return new ReadableStream<UIMessageChunk>({
+    start(controller) {
+      controller.enqueue({ type: 'finish-step' });
+      controller.enqueue({ type: 'finish', finishReason: 'stop' });
+      controller.close();
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Side-channel callback interface (non-chat events forwarded to the store)
@@ -17,7 +31,9 @@ import { useAgentStore } from '@/store/agentStore';
 export interface SideChannelCallbacks {
   onReady: () => void;
   onShutdown: () => void;
-  onError: (error: string) => void;
+  onError: (error: string, data?: Record<string, unknown>) => void;
+  onRequestStart: (requestId: string) => void;
+  onRequestSuccess: (requestId: string) => void;
   onProcessing: () => void;
   onProcessingDone: () => void;
   onUndoComplete: () => void;
@@ -37,6 +53,7 @@ export interface SideChannelCallbacks {
   }>) => void;
   onToolCallPanel: (tool: string, args: Record<string, unknown>) => void;
   onToolOutputPanel: (tool: string, toolCallId: string, output: string, success: boolean) => void;
+  onToolStateChange: (state: ToolStateChangeEventData) => void;
   onStreaming: () => void;
   onToolRunning: (toolName: string, description?: string) => void;
   onInterrupted: () => void;
@@ -115,7 +132,11 @@ function createSSEParserStream(sessionId: string): TransformStream<string, Agent
 }
 
 /** Transform AgentEvent objects into UIMessageChunk objects for the Vercel AI SDK. */
-function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformStream<AgentEvent, UIMessageChunk> {
+function createEventToChunkStream(
+  sideChannel: SideChannelCallbacks,
+  requestId: string,
+  sessionId: string,
+): TransformStream<AgentEvent, UIMessageChunk> {
   let textPartId: string | null = null;
 
   function endTextPart(controller: TransformStreamDefaultController<UIMessageChunk>) {
@@ -277,6 +298,19 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           if (jobUrl && tcId) {
             useAgentStore.getState().setJobUrl(tcId, jobUrl);
           }
+          if (tcId) {
+            sideChannel.onToolStateChange({
+              tool: toolName,
+              tool_call_id: tcId,
+              state,
+              jobName: (event.data?.jobName as string) || undefined,
+              jobUrl,
+              outputDir: (event.data?.outputDir as string) || undefined,
+              trackioSpaceId,
+              trackioProject,
+              namespace: (event.data?.namespace as string) || undefined,
+            });
+          }
           if (trackioSpaceId && tcId) {
             useAgentStore.getState().setTrackioDashboard(tcId, trackioSpaceId, trackioProject);
           }
@@ -305,6 +339,7 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           endTextPart(controller);
           controller.enqueue({ type: 'finish-step' });
           controller.enqueue({ type: 'finish', finishReason: 'stop' });
+          sideChannel.onRequestSuccess(requestId);
           sideChannel.onProcessingDone();
           break;
 
@@ -313,7 +348,11 @@ function createEventToChunkStream(sideChannel: SideChannelCallbacks): TransformS
           endTextPart(controller);
           controller.enqueue({ type: 'finish-step' });
           controller.enqueue({ type: 'finish', finishReason: 'error' });
-          sideChannel.onError(errorMsg);
+          sideChannel.onError(errorMsg, {
+            ...(event.data ?? {}),
+            request_id: event.data?.request_id ?? requestId,
+            session_id: event.data?.session_id ?? sessionId,
+          });
           sideChannel.onProcessingDone();
           break;
         }
@@ -360,6 +399,8 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
     } & ChatRequestOptions,
   ): Promise<ReadableStream<UIMessageChunk>> {
     const sessionId = this.sessionId;
+    const requestId = options.messageId || `request-${Date.now()}`;
+    this.sideChannel.onRequestStart(requestId);
 
     // Detect: is this an approval continuation or a new user message?
     // After addToolApprovalResponse, the SDK calls sendMessages again.
@@ -374,16 +415,22 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       // Approval continuation — extract approval decisions
       const approvals = approvedParts.map((p) => {
         if (p.type !== 'dynamic-tool') return null;
-        const approved = p.approval?.approved ?? true;
+        const explicitDecision = consumeExplicitApprovalDecision(sessionId, p.toolCallId);
+        if (!explicitDecision) return null;
+        const approved = explicitDecision.approved;
         const editedScript = useAgentStore.getState().getEditedScript(p.toolCallId);
         return {
           tool_call_id: p.toolCallId,
           approved,
-          feedback: approved ? null : (p.approval?.reason || 'Rejected by user'),
-          edited_script: editedScript ?? null,
-          namespace: null,
+          feedback: approved ? null : (explicitDecision.feedback || 'Rejected by user'),
+          edited_script: editedScript ?? explicitDecision.edited_script ?? null,
+          namespace: explicitDecision.namespace ?? null,
         };
       }).filter(Boolean);
+      if (approvals.length === 0) {
+        logger.warn('Ignoring approval continuation without explicit user approval');
+        return emptyFinishStream();
+      }
       body = { approvals };
     } else {
       // Normal user message
@@ -394,7 +441,21 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
             .map(p => p.text)
             .join('')
         : '';
-      body = { text };
+      const cloudProvider = useSessionStore
+        .getState()
+        .sessions.find((session) => session.id === sessionId)?.cloudProvider ?? 'hf-jobs';
+      const session = useSessionStore
+        .getState()
+        .sessions.find((candidate) => candidate.id === sessionId);
+      body = {
+        text,
+        request_id: requestId,
+        ...buildGcloudChatRequestMetadata({
+          cloudProvider,
+          trainingGoal: session?.trainingGoal,
+          outputPolicy: session?.outputPolicy,
+        }),
+      };
     }
 
     // POST to SSE endpoint
@@ -432,7 +493,7 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
     return response.body
       .pipeThrough(new TextDecoderStream())
       .pipeThrough(createSSEParserStream(sessionId))
-      .pipeThrough(createEventToChunkStream(this.sideChannel));
+      .pipeThrough(createEventToChunkStream(this.sideChannel, requestId, sessionId));
   }
 
   async reconnectToStream(): Promise<ReadableStream<UIMessageChunk> | null> {
@@ -454,11 +515,12 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       if (!response.ok || !response.body) return null;
 
       this.sideChannel.onProcessing();
+      const requestId = `reconnect-${Date.now()}`;
 
       return response.body
         .pipeThrough(new TextDecoderStream())
         .pipeThrough(createSSEParserStream(this.sessionId))
-        .pipeThrough(createEventToChunkStream(this.sideChannel));
+        .pipeThrough(createEventToChunkStream(this.sideChannel, requestId, this.sessionId));
     } catch {
       return null;
     }

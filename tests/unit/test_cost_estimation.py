@@ -56,3 +56,61 @@ async def test_estimate_sandbox_cost_is_zero_for_existing_or_cpu_basic():
     assert existing.billable is False
     assert cpu.estimated_cost_usd == 0.0
     assert cpu.billable is False
+
+
+@pytest.mark.asyncio
+async def test_estimate_gcp_vertex_job_cost_blocks_missing_duration():
+    estimate = await cost_estimation.estimate_gcp_vertex_job_cost(
+        {"operation": "run", "machine_type": "n1-standard-8"}
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.billable is True
+    assert "max_run_hours" in estimate.block_reason
+    assert estimate.label == "gcp_vertex_jobs"
+
+
+@pytest.mark.asyncio
+async def test_estimate_gcp_vertex_job_cost_for_known_machine_and_duration():
+    estimate = await cost_estimation.estimate_gcp_vertex_job_cost(
+        {
+            "operation": "run",
+            "machine_type": "n1-standard-8",
+            "max_run_hours": 2,
+        }
+    )
+
+    assert estimate.estimated_cost_usd is not None
+    assert estimate.estimated_cost_usd > 0
+    assert estimate.billable is True
+
+
+@pytest.mark.asyncio
+async def test_estimate_gcp_vertex_job_cost_blocks_unknown_machine():
+    estimate = await cost_estimation.estimate_gcp_vertex_job_cost(
+        {
+            "operation": "run",
+            "machine_type": "future-mega-box",
+            "max_run_hours": 1,
+        }
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.billable is True
+    assert "No conservative Vertex AI price" in estimate.block_reason
+
+
+@pytest.mark.asyncio
+async def test_estimate_tool_cost_routes_gcp_vertex_jobs():
+    estimate = await cost_estimation.estimate_tool_cost(
+        "gcp_vertex_jobs",
+        {
+            "operation": "run",
+            "machine_type": "n1-standard-4",
+            "max_run_hours": 1,
+        },
+    )
+
+    assert estimate.estimated_cost_usd is not None
+    assert estimate.estimated_cost_usd > 0
+    assert estimate.billable is True

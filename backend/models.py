@@ -5,6 +5,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+CloudProviderId = Literal["hf-jobs", "gcp-vertex"]
+TrainingGoal = Literal["smoke-test", "production", "agent-decide"]
+OutputPolicy = Literal["cloud-private", "hf-hub", "cloud-and-hf-hub"]
+DatasetSourceFormat = Literal["csv", "json", "jsonl", "pdf", "docx", "xlsx", "md"]
+
 
 class OpType(str, Enum):
     """Operation types matching agent/core/agent_loop.py."""
@@ -36,6 +41,7 @@ class ToolApproval(BaseModel):
 
     tool_call_id: str
     approved: bool
+    approval_id: str | None = None
     feedback: str | None = None
     edited_script: str | None = None
     namespace: str | None = None
@@ -56,6 +62,9 @@ class SubmitRequest(BaseModel):
     # or runaway client could otherwise attach megabytes that then ride along
     # in every subsequent turn until /api/compact is called.
     text: str = Field(..., min_length=1, max_length=100_000)
+    cloud_provider: CloudProviderId | None = None
+    training_goal: TrainingGoal | None = None
+    output_policy: OutputPolicy | None = None
 
 
 class TruncateRequest(BaseModel):
@@ -70,6 +79,9 @@ class SessionResponse(BaseModel):
     session_id: str
     ready: bool = True
     model: str | None = None
+    cloud_provider: CloudProviderId = "hf-jobs"
+    training_goal: TrainingGoal = "agent-decide"
+    output_policy: OutputPolicy = "cloud-and-hf-hub"
 
 
 class PendingApprovalTool(BaseModel):
@@ -78,6 +90,12 @@ class PendingApprovalTool(BaseModel):
     tool: str
     tool_call_id: str
     arguments: dict[str, Any] = {}
+    approval_id: str | None = None
+    operation: str | None = None
+    provider: str | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+    status: str | None = None
 
 
 class SessionAutoApprovalInfo(BaseModel):
@@ -87,6 +105,29 @@ class SessionAutoApprovalInfo(BaseModel):
     cost_cap_usd: float | None = None
     estimated_spend_usd: float = 0.0
     remaining_usd: float | None = None
+
+
+class UploadedDatasetInfo(BaseModel):
+    """Minimal uploaded dataset metadata for session UI and planning context."""
+
+    upload_id: str
+    filename: str
+    format: DatasetSourceFormat
+    source_format: DatasetSourceFormat
+    source: str = "session-upload"
+    uploaded_at: str | None = None
+    normalized_row_count: int
+    normalized_format: Literal["jsonl"] = "jsonl"
+    status: Literal["ready", "failed"] = "ready"
+    supports_training: bool = True
+    size_bytes: int | None = None
+    config_name: str
+    repo_id: str
+    repo_type: Literal["dataset"] = "dataset"
+    normalized_path_in_repo: str
+    raw_path_in_repo: str
+    hub_url: str
+    load_dataset_snippet: str
 
 
 class SessionInfo(BaseModel):
@@ -100,11 +141,15 @@ class SessionInfo(BaseModel):
     user_id: str = "dev"
     pending_approval: list[PendingApprovalTool] | None = None
     model: str | None = None
+    cloud_provider: CloudProviderId = "hf-jobs"
+    training_goal: TrainingGoal = "agent-decide"
+    output_policy: OutputPolicy = "cloud-and-hf-hub"
     title: str | None = None
     notification_destinations: list[str] = Field(default_factory=list)
     auto_approval: SessionAutoApprovalInfo = Field(
         default_factory=SessionAutoApprovalInfo
     )
+    uploaded_datasets: list[UploadedDatasetInfo] = Field(default_factory=list)
 
 
 class SessionNotificationsRequest(BaseModel):
@@ -131,8 +176,16 @@ class DatasetUploadResponse(BaseModel):
     config_name: str
     filename: str
     path_in_repo: str
+    raw_path_in_repo: str
+    normalized_path_in_repo: str
+    normalized_format: Literal["jsonl"]
+    normalized_row_count: int
+    source_format: DatasetSourceFormat
+    source: str = "session-upload"
+    uploaded_at: str
+    supports_training: bool
     size_bytes: int
-    format: Literal["csv", "json", "jsonl"]
+    format: DatasetSourceFormat
     hub_url: str
     load_dataset_snippet: str
 
@@ -152,5 +205,5 @@ class LLMHealthResponse(BaseModel):
     model: str
     error: str | None = None
     error_type: str | None = (
-        None  # "auth" | "credits" | "rate_limit" | "network" | "unknown"
+        None  # "quota" | "billing" | "auth" | "rate_limit" | "network" | "empty_response" | "unknown"
     )

@@ -209,7 +209,7 @@ export default function WelcomeScreen() {
         return;
       }
       const data = await response.json();
-      createSession(data.session_id, data.model);
+      createSession(data.session_id, data.model, data.cloud_provider);
       setPlan([]);
       clearPanel();
     } catch {

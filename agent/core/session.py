@@ -102,6 +102,9 @@ class Session:
         self.hf_token: Optional[str] = hf_token
         self.user_id: Optional[str] = user_id
         self.hf_username: Optional[str] = hf_username
+        self.cloud_provider: str = "hf-jobs"
+        self.training_goal: str = "agent-decide"
+        self.output_policy: str = "cloud-and-hf-hub"
         self.local_mode = local_mode
         self.persistence_store = persistence_store
         self.tool_router = tool_router
@@ -136,6 +139,7 @@ class Session:
         self.auto_approval_enabled: bool = False
         self.auto_approval_cost_cap_usd: float | None = None
         self.auto_approval_estimated_spend_usd: float = 0.0
+        self.uploaded_datasets: list[dict[str, Any]] = []
 
         # Session trajectory logging
         self.logged_events: list[dict] = []

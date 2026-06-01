@@ -30,6 +30,13 @@ HF_TOKEN=<your-hugging-face-token>
 GITHUB_TOKEN=<github-personal-access-token>
 ML_INTERN_DEFAULT_MODEL_ID=moonshotai/Kimi-K2.6
 ML_INTERN_KPIS_DISABLED=1
+
+# Optional: enable Google Cloud Vertex AI training
+GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
+GOOGLE_CLOUD_REGION=us-central1
+GCS_BUCKET=<your-training-bucket-name>
+VERTEX_AI_STAGING_BUCKET=gs://<your-training-bucket-name>/vertex-staging
+VERTEX_AI_OUTPUT_DIR=gs://<your-training-bucket-name>/vertex-outputs
 ```
 
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
@@ -230,6 +237,70 @@ Edit `configs/cli_agent_config.json` or `configs/frontend_agent_config.json`:
 ```
 
 Note: Environment variables like `${YOUR_TOKEN}` are auto-substituted from `.env`.
+
+## Google Cloud Vertex AI Training
+
+Liga ML can run training on either Hugging Face Jobs or Google Cloud Vertex AI. Hugging Face remains the common model registry: whether a model is trained on HF compute or Vertex AI, the final successful model should be pushed back to Hugging Face Hub.
+
+For production Cloud Run and Vertex AI setup, see [Google Cloud deployment](docs/google-cloud-deployment.md) and [GCloud merge readiness](docs/gcloud-merge-readiness.md). For the senior fine-tuning planner readiness checklist, see [Senior Fine-Tuning Planner merge readiness](docs/senior-finetune-planner-readiness.md). Local validation helpers live at [`scripts/check_gcp_readiness.py`](scripts/check_gcp_readiness.py) and [`scripts/gcloud_vertex_dry_run.py`](scripts/gcloud_vertex_dry_run.py).
+
+### Workflow
+
+```mermaid
+flowchart TD
+  user["User prompt"] --> agent["Liga ML Agent"]
+  agent --> choice{"Training backend"}
+  choice -->|"Hugging Face"| hfJobs["hf_jobs"]
+  choice -->|"Google Cloud"| vertexJobs["gcp_vertex_jobs"]
+  hfJobs --> hfCompute["HF Jobs"]
+  vertexJobs --> vertexAI["Vertex AI Custom Training"]
+  vertexAI --> gcs["GCS checkpoints and outputs"]
+  hfCompute --> hfHub["Hugging Face Hub final model"]
+  gcs --> hfHub
+```
+
+### Required GCP Configuration
+
+Set these on Cloud Run, or locally in `.env` for development:
+
+```bash
+GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
+GOOGLE_CLOUD_REGION=us-central1
+GCS_BUCKET=<your-training-bucket-name>
+VERTEX_AI_STAGING_BUCKET=gs://<your-training-bucket-name>/vertex-staging
+VERTEX_AI_OUTPUT_DIR=gs://<your-training-bucket-name>/vertex-outputs
+```
+
+For Cloud Run, prefer an attached service account instead of a JSON key. The service account needs:
+
+```text
+roles/aiplatform.user
+roles/storage.objectAdmin
+roles/logging.viewer
+roles/artifactregistry.reader
+```
+
+If Vertex jobs run as a separate service account, also grant:
+
+```text
+roles/iam.serviceAccountUser
+```
+
+Enable these APIs in the GCP project:
+
+```text
+Vertex AI API
+Cloud Storage API
+Cloud Logging API
+Artifact Registry API
+Cloud Build API
+```
+
+### Example Prompt
+
+```text
+Fine-tune a model for Indian GST notice classification using Google Cloud Vertex AI. Save checkpoints to GCS and push the final model to Hugging Face Hub.
+```
 
 ## License
 

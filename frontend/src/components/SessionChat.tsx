@@ -82,7 +82,13 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
       if (!text.trim() || busy) return;
 
       updateSession(sessionId, { isProcessing: true, activityStatus: { type: 'thinking' } });
-      sendMessage({ text: text.trim(), metadata: { createdAt: new Date().toISOString() } });
+      sendMessage({
+        text: text.trim(),
+        metadata: {
+          createdAt: new Date().toISOString(),
+          cloudProvider: sessionMeta?.cloudProvider ?? 'hf-jobs',
+        },
+      });
 
       // Auto-title the session from the first user message
       const isFirstMessage = messages.filter((m) => m.role === 'user').length === 0;
@@ -101,7 +107,7 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
           });
       }
     },
-    [sessionId, sendMessage, messages, updateSessionTitle, busy, updateSession],
+    [sessionId, sendMessage, messages, updateSessionTitle, busy, updateSession, sessionMeta?.cloudProvider],
   );
 
   // Don't render UI for background sessions — hooks still run

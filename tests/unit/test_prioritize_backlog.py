@@ -590,6 +590,8 @@ def test_append_published_issue_section_adds_local_link():
 async def test_async_main_fails_early_when_issue_publish_token_missing(monkeypatch):
     mod = _load()
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(mod, "resolve_model", lambda *_args, **_kwargs: "test-model")
+    monkeypatch.setattr(mod, "resolve_hf_token", lambda *_args, **_kwargs: None)
 
     def fail_collect(*_args, **_kwargs):
         raise AssertionError("collection should not run without a GitHub token")
@@ -718,4 +720,4 @@ def test_cli_defaults_without_live_network_or_llm():
     assert args.github_report_label == mod.DEFAULT_GITHUB_REPORT_LABEL
     assert args.output_dir is None
     assert out.name == "20260504T123000Z"
-    assert "scratch/backlog-prioritization" in str(out)
+    assert "scratch/backlog-prioritization" in str(out).replace("\\", "/")

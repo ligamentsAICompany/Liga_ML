@@ -733,7 +733,7 @@ def _make_tool_handler(sandbox_tool_name: str):
     async def handler(args: dict[str, Any], session: Any = None) -> tuple[str, bool]:
         sb, error = await get_active_or_preloaded_sandbox(session)
         if error:
-            return error, False
+            return _sandbox_unavailable_guidance(error), False
         if not sb:
             return "Sandbox is still starting. Please retry shortly.", False
 
@@ -762,6 +762,17 @@ def _make_tool_handler(sandbox_tool_name: str):
     return handler
 
 
+def _sandbox_unavailable_guidance(error: str) -> str:
+    return (
+        f"{error}\n\n"
+        "Sandbox is unavailable. If the user asked for Google Cloud / Vertex AI "
+        "CPU execution, do not retry write/bash/read/edit and do not call "
+        "sandbox_create. Call gcp_vertex_jobs directly with an inline `script` "
+        "or `command` instead. For a tiny smoke test, use image `python:3.12-slim` "
+        "and machine_type `n1-standard-4`."
+    )
+
+
 def get_sandbox_tools():
     """Return all 5 sandbox ToolSpecs (sandbox_create + 4 operation tools)."""
     from agent.core.tools import ToolSpec
@@ -784,7 +795,10 @@ def get_sandbox_tools():
         description = (
             "Uses the session's active sandbox. A private cpu-basic sandbox is "
             "started automatically for normal CPU work; call sandbox_create only "
-            "for GPU or other non-default hardware.\n\n" + spec["description"]
+            "for GPU or other non-default hardware. If sandbox creation is "
+            "rate-limited/unavailable and the task is Google Cloud / Vertex AI "
+            "CPU execution, skip sandbox tools and call gcp_vertex_jobs directly "
+            "with an inline script or command.\n\n" + spec["description"]
         )
         tools.append(
             ToolSpec(

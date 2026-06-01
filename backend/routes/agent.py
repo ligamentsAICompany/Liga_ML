@@ -7,6 +7,7 @@ dependency. In dev mode (no OAUTH_CLIENT_ID), auth is bypassed automatically.
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 from dependencies import (
@@ -28,6 +29,7 @@ from starlette.datastructures import FormData, UploadFile
 from dataset_uploads import (
     MAX_DATASET_UPLOAD_BYTES,
     dataset_context_note,
+    dataset_session_metadata,
     push_dataset_upload_to_hub,
 )
 from models import (
@@ -51,6 +53,7 @@ from session_manager import (
 
 import user_quotas
 
+from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
@@ -127,10 +130,39 @@ def _available_models() -> list[dict[str, Any]]:
 
 
 AVAILABLE_MODELS = _available_models()
+VALID_CLOUD_PROVIDERS = {"hf-jobs", "gcp-vertex"}
+VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
+VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
 
 
 def _is_premium_model(model_id: str) -> bool:
     return model_id in PREMIUM_MODEL_IDS
+
+
+def _cloud_provider_or_default(value: Any) -> str:
+    if value in VALID_CLOUD_PROVIDERS:
+        return str(value)
+    return "hf-jobs"
+
+
+def _training_goal_or_default(value: Any) -> str:
+    if value in VALID_TRAINING_GOALS:
+        return str(value)
+    return "agent-decide"
+
+
+def _output_policy_or_default(value: Any) -> str:
+    if value in VALID_OUTPUT_POLICIES:
+        return str(value)
+    return "cloud-and-hf-hub"
+
+
+def _output_policy_for_provider(value: Any, cloud_provider: str) -> str:
+    if value in VALID_OUTPUT_POLICIES:
+        return str(value)
+    if cloud_provider == "gcp-vertex":
+        return "cloud-private"
+    return "cloud-and-hf-hub"
 
 
 async def _model_override_for_new_session(
@@ -346,8 +378,10 @@ async def llm_health_check() -> LLMHealthResponse:
             or "quota" in err_str
             or "insufficient" in err_str
             or "billing" in err_str
+            or "spending limit" in err_str
+            or "monthly spending" in err_str
         ):
-            error_type = "credits"
+            error_type = "quota"
         elif "429" in err_str or "rate" in err_str:
             error_type = "rate_limit"
         elif "timeout" in err_str or "connect" in err_str or "network" in err_str:
@@ -360,6 +394,24 @@ async def llm_health_check() -> LLMHealthResponse:
             error=str(e)[:500],
             error_type=error_type,
         )
+
+
+@router.get("/health/providers")
+async def provider_health() -> dict[str, Any]:
+    """Return non-secret readiness for training providers."""
+    hf_token_configured = bool(
+        os.environ.get("HF_TOKEN") or os.environ.get("HF_ADMIN_TOKEN")
+    )
+    return {
+        "hf_jobs": {
+            "configured": hf_token_configured,
+            "hf_token_configured": hf_token_configured,
+            "notes": []
+            if hf_token_configured
+            else ["HF_TOKEN or user OAuth token is required to run HF Jobs."],
+        },
+        "gcp_vertex": build_gcp_vertex_readiness_snapshot(),
+    }
 
 
 @router.get("/config/model")
@@ -460,12 +512,20 @@ async def create_session(
 
     # Optional model override. Empty body falls back to the config default.
     model: str | None = None
+    cloud_provider = "hf-jobs"
+    training_goal = "agent-decide"
+    output_policy = "cloud-and-hf-hub"
     try:
         body = await request.json()
     except Exception:
         body = None
     if isinstance(body, dict):
         model = body.get("model")
+        cloud_provider = _cloud_provider_or_default(body.get("cloud_provider"))
+        training_goal = _training_goal_or_default(body.get("training_goal"))
+        output_policy = _output_policy_for_provider(
+            body.get("output_policy"), cloud_provider
+        )
 
     valid_ids = {m["id"] for m in AVAILABLE_MODELS}
     if model and model not in valid_ids:
@@ -482,6 +542,9 @@ async def create_session(
             hf_token=hf_token,
             model=model,
             is_pro=user.get("plan") == "pro",
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -490,6 +553,9 @@ async def create_session(
         session_id=session_id,
         ready=True,
         model=model or session_manager.config.model_name,
+        cloud_provider=cloud_provider,
+        training_goal=training_goal,
+        output_policy=output_policy,
     )
 
 
@@ -512,6 +578,11 @@ async def restore_session_summary(
     hf_token = resolve_hf_request_token(request)
 
     model = body.get("model")
+    cloud_provider = _cloud_provider_or_default(body.get("cloud_provider"))
+    training_goal = _training_goal_or_default(body.get("training_goal"))
+    output_policy = _output_policy_for_provider(
+        body.get("output_policy"), cloud_provider
+    )
     valid_ids = {m["id"] for m in AVAILABLE_MODELS}
     if model and model not in valid_ids:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
@@ -525,6 +596,9 @@ async def restore_session_summary(
             hf_token=hf_token,
             model=model,
             is_pro=user.get("plan") == "pro",
+            cloud_provider=cloud_provider,
+            training_goal=training_goal,
+            output_policy=output_policy,
         )
     except SessionCapacityError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -545,6 +619,9 @@ async def restore_session_summary(
         session_id=session_id,
         ready=True,
         model=model or session_manager.config.model_name,
+        cloud_provider=cloud_provider,
+        training_goal=training_goal,
+        output_policy=output_policy,
     )
 
 
@@ -586,6 +663,39 @@ async def set_session_model(
         f"(by {user.get('username', 'unknown')})"
     )
     return {"session_id": session_id, "model": model_id}
+
+
+@router.post("/session/{session_id}/cloud-provider")
+async def set_session_cloud_provider(
+    session_id: str,
+    body: dict,
+    request: Request,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Switch the active training provider for a single session."""
+    await _check_session_access(session_id, user, request)
+    cloud_provider = body.get("cloud_provider")
+    if cloud_provider not in VALID_CLOUD_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Unknown cloud provider")
+    training_goal = _training_goal_or_default(body.get("training_goal"))
+    output_policy = _output_policy_for_provider(
+        body.get("output_policy"), cloud_provider
+    )
+    success = await session_manager.update_session_cloud_provider(
+        session_id, cloud_provider, training_goal, output_policy
+    )
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found")
+    logger.info(
+        f"Session {session_id} cloud provider → {cloud_provider} "
+        f"(by {user.get('username', 'unknown')})"
+    )
+    return {
+        "session_id": session_id,
+        "cloud_provider": cloud_provider,
+        "training_goal": training_goal,
+        "output_policy": output_policy,
+    }
 
 
 @router.post("/session/{session_id}/notifications")
@@ -659,6 +769,11 @@ async def upload_session_dataset(
         )
         agent_session.session.context_manager.add_message(
             Message(role="user", content=dataset_context_note(uploaded))
+        )
+        if not hasattr(agent_session.session, "uploaded_datasets"):
+            agent_session.session.uploaded_datasets = []
+        agent_session.session.uploaded_datasets.append(
+            dataset_session_metadata(uploaded)
         )
         await session_manager.persist_session_snapshot(agent_session)
         logger.info(
@@ -808,7 +923,13 @@ async def submit_input(
     except ValidationError as exc:
         raise RequestValidationError(exc.errors()) from exc
     await _enforce_premium_model_quota(user, agent_session)
-    success = await session_manager.submit_user_input(body.session_id, body.text)
+    success = await session_manager.submit_user_input(
+        body.session_id,
+        body.text,
+        body.cloud_provider,
+        body.training_goal,
+        body.output_policy,
+    )
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return {"status": "submitted", "session_id": body.session_id}
@@ -824,6 +945,7 @@ async def submit_approval(
         {
             "tool_call_id": a.tool_call_id,
             "approved": a.approved,
+            "approval_id": a.approval_id,
             "feedback": a.feedback,
             "edited_script": a.edited_script,
             "namespace": a.namespace,
@@ -858,6 +980,23 @@ async def chat_sse(
     # Submit the operation
     text = body.get("text")
     approvals = body.get("approvals")
+    cloud_provider = (
+        _cloud_provider_or_default(body.get("cloud_provider"))
+        if "cloud_provider" in body
+        else None
+    )
+    training_goal = (
+        _training_goal_or_default(body.get("training_goal"))
+        if "training_goal" in body
+        else None
+    )
+    output_policy = (
+        _output_policy_for_provider(
+            body.get("output_policy"), cloud_provider or "hf-jobs"
+        )
+        if "output_policy" in body or cloud_provider == "gcp-vertex"
+        else None
+    )
 
     # Gate user-message sends against the daily premium-model quota. Approvals are
     # continuations of an in-progress turn — the session was already charged
@@ -875,6 +1014,7 @@ async def chat_sse(
                 {
                     "tool_call_id": a["tool_call_id"],
                     "approved": a["approved"],
+                    "approval_id": a.get("approval_id"),
                     "feedback": a.get("feedback"),
                     "edited_script": a.get("edited_script"),
                     "namespace": a.get("namespace"),
@@ -883,7 +1023,9 @@ async def chat_sse(
             ]
             success = await session_manager.submit_approval(session_id, formatted)
         elif text is not None:
-            success = await session_manager.submit_user_input(session_id, text)
+            success = await session_manager.submit_user_input(
+                session_id, text, cloud_provider, training_goal, output_policy
+            )
         else:
             broadcaster.unsubscribe(sub_id)
             raise HTTPException(

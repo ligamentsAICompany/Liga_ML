@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 # modules see local Mongo settings during startup.
 load_dotenv(Path(__file__).parent.parent / ".env")
 
+from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot  # noqa: E402
 from routes.agent import router as agent_router  # noqa: E402
 from routes.auth import router as auth_router  # noqa: E402
 from session_manager import session_manager  # noqa: E402
@@ -30,6 +31,19 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     logger.info("Starting HF Agent backend...")
+    try:
+        gcp_readiness = build_gcp_vertex_readiness_snapshot()
+        logger.info(
+            "GCP Vertex readiness: configured=%s missing_env=%s region=%s "
+            "bucket=%s credentials_detected=%s",
+            gcp_readiness.get("configured"),
+            gcp_readiness.get("missing_env"),
+            gcp_readiness.get("region"),
+            gcp_readiness.get("bucket"),
+            gcp_readiness.get("credentials_detected"),
+        )
+    except Exception as e:
+        logger.warning("GCP Vertex readiness logging skipped: %s", e)
     await session_manager.start()
     # Start in-process hourly KPI rollup. Replaces an external cron so the
     # rollup lives next to the data and reuses the Space's HF token.

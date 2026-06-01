@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, gcloud]
 
 permissions:
   contents: read
@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ruff:
-    name: Ruff
+  backend:
+    name: Backend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        run: uv sync --all-extras
 
       - name: Run Ruff
         run: uv run ruff check .
@@ -39,25 +39,54 @@ jobs:
       - name: Check formatting
         run: uv run ruff format --check .
 
-  tests:
-    name: Tests
+      - name: Run tests
+        run: uv run pytest -q
+
+  frontend:
+    name: Frontend
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
 
-      - name: Install dependencies
-        run: uv sync --locked --extra dev
+      - name: Run frontend lint
+        working-directory: frontend
+        run: npm run lint
 
-      - name: Run tests
-        run: uv run pytest
+      - name: Run frontend build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Run training result parser tests
+        working-directory: frontend
+        run: npm run test:training-result
+
+      - name: Run cloud provider tests
+        working-directory: frontend
+        run: npm run test:cloud-providers
+
+      - name: Run dataset upload UI tests
+        working-directory: frontend
+        run: npm run test:dataset-upload-ui
+
+      - name: Run output policy tests
+        working-directory: frontend
+        run: npm run test:output-policy
+
+      - name: Run training planner panel tests
+        working-directory: frontend
+        run: npm run test:training-planner-panel
+
+      - name: Run dataset discovery panel tests
+        working-directory: frontend
+        run: npm run test:dataset-discovery-panel

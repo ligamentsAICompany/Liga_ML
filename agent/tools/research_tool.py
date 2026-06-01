@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # At MAX, the loop is force-stopped and whatever content exists is returned.
 _RESEARCH_CONTEXT_WARN = 170_000  # 85% of 200k
 _RESEARCH_CONTEXT_MAX = 190_000
+_RESEARCH_WALL_CLOCK_MAX_SECONDS = 12 * 60
 
 # Tools the research agent can use (read-only subset)
 RESEARCH_TOOL_NAMES = {
@@ -306,8 +307,56 @@ async def research_handler(
     _tool_uses = 0
     _total_tokens = 0
     _warned_context = False
+    _started_at = time.monotonic()
 
     await _log("Starting research sub-agent...")
+
+    async def _summarize_without_tools(
+        reason: str, instruction: str
+    ) -> tuple[str, bool]:
+        logger.warning(reason)
+        await _log(instruction)
+        messages.append(
+            Message(
+                role="user",
+                content=(
+                    f"[SYSTEM: {instruction}] Summarize your findings NOW. "
+                    "Do NOT call any more tools."
+                ),
+            )
+        )
+        try:
+            _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
+            _t0 = time.monotonic()
+            response = await acompletion(
+                messages=_msgs,
+                tools=None,
+                stream=False,
+                timeout=120,
+                **llm_params,
+            )
+            # Telemetry is best-effort; a logging blip must never mask a
+            # valid LLM response.
+            try:
+                await telemetry.record_llm_call(
+                    session,
+                    model=research_model,
+                    response=response,
+                    latency_ms=int((time.monotonic() - _t0) * 1000),
+                    finish_reason=response.choices[0].finish_reason
+                    if response.choices
+                    else None,
+                    kind="research",
+                )
+            except Exception as _telem_err:
+                logger.debug("research telemetry failed: %s", _telem_err)
+            content = response.choices[0].message.content or ""
+            return (
+                content or "Research limit reached — no summary produced.",
+                bool(content),
+            )
+        except Exception:
+            return "Research limit reached and summary call failed.", False
 
     # Run the research loop — context budget is the real limiter
     max_iterations = 60
@@ -323,56 +372,19 @@ async def research_handler(
 
         # ── Context budget: warn at 75%, hard-stop at 95% ──
         if _total_tokens >= _RESEARCH_CONTEXT_MAX:
-            logger.warning(
-                "Research sub-agent hit context max (%d tokens) — forcing summary",
-                _total_tokens,
+            return await _summarize_without_tools(
+                "Research sub-agent hit context max (%d tokens) — forcing summary"
+                % _total_tokens,
+                f"CONTEXT LIMIT REACHED: {_total_tokens} tokens used — forcing wrap-up",
             )
-            await _log(
-                f"Context limit reached ({_total_tokens} tokens) — forcing wrap-up"
+
+        elapsed_seconds = time.monotonic() - _started_at
+        if elapsed_seconds >= _RESEARCH_WALL_CLOCK_MAX_SECONDS:
+            return await _summarize_without_tools(
+                "Research sub-agent hit wall-clock limit after %.1fs — forcing summary"
+                % elapsed_seconds,
+                "WALL-CLOCK LIMIT REACHED: research time budget exhausted — forcing wrap-up",
             )
-            # Ask for a final summary with no tools
-            messages.append(
-                Message(
-                    role="user",
-                    content=(
-                        "[SYSTEM: CONTEXT LIMIT REACHED] You have used all available context. "
-                        "Summarize your findings NOW. Do NOT call any more tools."
-                    ),
-                )
-            )
-            try:
-                _msgs, _ = with_prompt_caching(messages, None, llm_params.get("model"))
-                _t0 = time.monotonic()
-                response = await acompletion(
-                    messages=_msgs,
-                    tools=None,  # no tools — force text response
-                    stream=False,
-                    timeout=120,
-                    **llm_params,
-                )
-                # Telemetry is best-effort; a logging blip must never mask a
-                # valid LLM response (the surrounding except would convert it
-                # to "summary call failed").
-                try:
-                    await telemetry.record_llm_call(
-                        session,
-                        model=research_model,
-                        response=response,
-                        latency_ms=int((time.monotonic() - _t0) * 1000),
-                        finish_reason=response.choices[0].finish_reason
-                        if response.choices
-                        else None,
-                        kind="research",
-                    )
-                except Exception as _telem_err:
-                    logger.debug("research telemetry failed: %s", _telem_err)
-                content = response.choices[0].message.content or ""
-                return (
-                    content or "Research context exhausted — no summary produced.",
-                    bool(content),
-                )
-            except Exception:
-                return "Research context exhausted and summary call failed.", False
 
         if not _warned_context and _total_tokens >= _RESEARCH_CONTEXT_WARN:
             _warned_context = True

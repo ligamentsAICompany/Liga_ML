@@ -12,15 +12,23 @@ import { loadBackendMessages } from '@/lib/backend-message-store';
 import { loadMessages } from '@/lib/chat-message-store';
 import { uiMessagesToLLMMessages } from '@/lib/convert-llm-messages';
 import { logger } from '@/utils/logger';
+import type { CloudProviderId } from '@/types/agent';
 
 interface Props {
   sessionId: string;
 }
 
 export default function ExpiredBanner({ sessionId }: Props) {
-  const { renameSession, deleteSession, updateSessionModel } = useSessionStore();
+  const {
+    sessions,
+    renameSession,
+    deleteSession,
+    updateSessionModel,
+    updateSessionCloudProvider,
+  } = useSessionStore();
   const [busy, setBusy] = useState<'catch-up' | 'start-over' | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const cloudProvider = sessions.find((session) => session.id === sessionId)?.cloudProvider ?? 'hf-jobs';
 
   const handleCatchUp = useCallback(async () => {
     setBusy('catch-up');
@@ -41,7 +49,7 @@ export default function ExpiredBanner({ sessionId }: Props) {
 
       const res = await apiFetch('/api/session/restore-summary', {
         method: 'POST',
-        body: JSON.stringify({ messages }),
+        body: JSON.stringify({ messages, cloud_provider: cloudProvider }),
       });
       if (!res.ok) throw new Error(`restore-summary failed: ${res.status}`);
       const data = await res.json();
@@ -51,12 +59,16 @@ export default function ExpiredBanner({ sessionId }: Props) {
       useAgentStore.getState().clearSessionState(sessionId);
       renameSession(sessionId, newId);
       if (data.model) updateSessionModel(newId, data.model);
+      const restoredProvider = data.cloud_provider as CloudProviderId | undefined;
+      if (restoredProvider === 'hf-jobs' || restoredProvider === 'gcp-vertex') {
+        updateSessionCloudProvider(newId, restoredProvider);
+      }
     } catch (e) {
       logger.warn('Catch-up failed:', e);
       setError("Couldn't catch up — try starting over.");
       setBusy(null);
     }
-  }, [sessionId, renameSession, updateSessionModel]);
+  }, [sessionId, cloudProvider, renameSession, updateSessionModel, updateSessionCloudProvider]);
 
   const handleStartOver = useCallback(() => {
     setBusy('start-over');
