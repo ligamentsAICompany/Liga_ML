@@ -1,0 +1,20 @@
+services:
+  liga-ml:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: liga-ml:hf-gcloud
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      HOST: 0.0.0.0
+      SESSION_STORE_PATH: /tmp/liga-ml-sessions
+    ports:
+      - "8080:8080"
+    # For local Application Default Credentials only. Prefer Cloud Run service
+    # account identity in production; never bake credential files into images.
+    # volumes:
+    #   - ${APPDATA}/gcloud/application_default_credentials.json:/var/secrets/google/application_default_credentials.json:ro
+    # environment:
+    #   GOOGLE_APPLICATION_CREDENTIALS: /var/secrets/google/application_default_credentials.json

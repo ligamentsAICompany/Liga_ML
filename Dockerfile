@@ -33,6 +33,8 @@ RUN uv sync --no-dev --frozen --no-install-project
 COPY agent/ ./agent/
 COPY backend/ ./backend/
 COPY configs/ ./configs/
+COPY docs/ ./docs/
+COPY scripts/ ./scripts/
 
 # Install the local package now that package sources are present.
 RUN uv sync --no-dev --frozen
@@ -40,9 +42,10 @@ RUN uv sync --no-dev --frozen
 # Copy built frontend
 COPY --from=frontend-builder /app/frontend/dist ./static/
 
-# Create directories and set ownership
-RUN mkdir -p /app/session_logs && \
-    chown -R user:user /app
+# Create writable directories and set ownership. Cloud Run storage is ephemeral;
+# durable sessions should use MongoDB when configured.
+RUN mkdir -p /tmp/liga-ml-sessions && \
+    chown -R user:user /app /tmp/liga-ml-sessions
 
 # Switch to non-root user
 USER user
@@ -51,11 +54,17 @@ USER user
 ENV HOME=/home/user \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
+    HOST=0.0.0.0 \
+    PORT=8080 \
+    SESSION_STORE_PATH=/tmp/liga-ml-sessions \
     PATH="/app/.venv/bin:$PATH"
 
-# Cloud Run provides PORT at runtime. The app also falls back to 7860 for local/HF Spaces use.
+# Cloud Run provides PORT at runtime. The app also falls back to 8080 for local Docker use.
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/api/health" || exit 1
 
 # Run the application from backend directory
 WORKDIR /app/backend
-CMD ["bash", "start.sh"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
