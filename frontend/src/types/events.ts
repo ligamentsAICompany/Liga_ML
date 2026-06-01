@@ -55,6 +55,18 @@ export interface ToolLogEventData {
   log: string;
 }
 
+export interface ToolStateChangeEventData {
+  tool: string;
+  tool_call_id: string;
+  state: string;
+  jobName?: string;
+  jobUrl?: string;
+  outputDir?: string;
+  trackioSpaceId?: string;
+  trackioProject?: string;
+  namespace?: string;
+}
+
 export interface PlanUpdateEventData {
   plan: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
 }
@@ -85,4 +97,13 @@ export interface CompactedEventData {
 
 export interface ErrorEventData {
   error: string;
+  error_type?: 'quota' | 'billing' | 'auth' | 'rate_limit' | 'network' | 'empty_response' | 'unknown' | string;
+  model?: string;
+  provider?: string | null;
+  session_id?: string;
+  request_id?: string;
+  turn_id?: string | number;
+  timestamp?: string;
+  transient?: boolean;
+  active?: boolean;
 }

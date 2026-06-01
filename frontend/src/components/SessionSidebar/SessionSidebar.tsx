@@ -63,7 +63,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         return;
       }
       const data = await response.json();
-      createSession(data.session_id, data.model);
+      createSession(data.session_id, data.model, data.cloud_provider);
       setPlan([]);
       clearPanel();
       onClose?.();
@@ -107,7 +107,7 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
         const response = await apiFetch('/api/session', { method: 'POST' });
         if (response.ok) {
           const data = await response.json();
-          createSession(data.session_id, data.model);
+          createSession(data.session_id, data.model, data.cloud_provider);
           setPlan([]);
           clearPanel();
         }

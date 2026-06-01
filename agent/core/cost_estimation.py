@@ -15,6 +15,24 @@ JOBS_PRICE_CACHE_TTL_S = 6 * 60 * 60
 DEFAULT_JOB_TIMEOUT_HOURS = 0.5
 DEFAULT_SANDBOX_RESERVATION_HOURS = 1.0
 
+GCP_VERTEX_MACHINE_PRICE_USD_PER_HOUR: dict[str, float] = {
+    "e2-standard-4": 0.20,
+    "e2-standard-8": 0.40,
+    "n1-standard-4": 0.25,
+    "n1-standard-8": 0.50,
+    "n1-standard-16": 1.00,
+    "n1-highmem-8": 0.75,
+    "n1-highmem-16": 1.50,
+    "a2-highgpu-1g": 4.50,
+}
+
+GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR: dict[str, float] = {
+    "NVIDIA_TESLA_T4": 0.60,
+    "NVIDIA_L4": 0.90,
+    "NVIDIA_TESLA_V100": 2.50,
+    "NVIDIA_TESLA_A100": 3.70,
+}
+
 # Static fallback prices are intentionally conservative enough for a budget
 # guard. The live /api/jobs/hardware catalog wins whenever it is reachable.
 HF_JOBS_PRICE_USD_PER_HOUR: dict[str, float] = {
@@ -272,6 +290,121 @@ async def estimate_sandbox_cost(
     )
 
 
+def _parse_positive_hours(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        hours = float(value)
+        return hours if hours > 0 else None
+    if isinstance(value, str):
+        if re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", value):
+            parsed = float(value)
+        else:
+            parsed = parse_timeout_hours(value, default_hours=0)
+        return parsed if parsed and parsed > 0 else None
+    return None
+
+
+async def estimate_gcp_vertex_job_cost(args: dict[str, Any]) -> CostEstimate:
+    operation = str(args.get("operation") or "").strip().lower()
+    if operation != "run":
+        return CostEstimate(
+            estimated_cost_usd=0.0,
+            billable=False,
+            label="gcp_vertex_jobs",
+        )
+
+    max_run_hours = (
+        _parse_positive_hours(args.get("max_run_hours"))
+        or _parse_positive_hours(args.get("timeout_hours"))
+        or _parse_positive_hours(args.get("expected_run_hours"))
+    )
+    if max_run_hours is None and args.get("timeout") not in (None, ""):
+        max_run_hours = parse_timeout_hours(args.get("timeout"), default_hours=0)
+    if max_run_hours is None or max_run_hours <= 0:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason=(
+                "Vertex AI jobs are billable and need max_run_hours for safe "
+                "auto-approval cost estimation."
+            ),
+            label="gcp_vertex_jobs",
+        )
+
+    machine_type = str(args.get("machine_type") or "n1-standard-8")
+    machine_price = GCP_VERTEX_MACHINE_PRICE_USD_PER_HOUR.get(machine_type)
+    if machine_price is None:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason=(
+                f"No conservative Vertex AI price is available for machine_type "
+                f"'{machine_type}'."
+            ),
+            label="gcp_vertex_jobs",
+        )
+
+    accelerator_total = 0.0
+    accelerator_type = args.get("accelerator_type")
+    if accelerator_type:
+        accelerator_type = str(accelerator_type)
+        accelerator_price = GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR.get(
+            accelerator_type
+        )
+        if accelerator_price is None:
+            return CostEstimate(
+                estimated_cost_usd=None,
+                billable=True,
+                block_reason=(
+                    "No conservative Vertex AI price is available for "
+                    f"accelerator_type '{accelerator_type}'."
+                ),
+                label="gcp_vertex_jobs",
+            )
+        try:
+            accelerator_count = int(args.get("accelerator_count") or 1)
+        except (TypeError, ValueError):
+            return CostEstimate(
+                estimated_cost_usd=None,
+                billable=True,
+                block_reason="Could not parse Vertex AI accelerator_count.",
+                label="gcp_vertex_jobs",
+            )
+        if accelerator_count <= 0:
+            return CostEstimate(
+                estimated_cost_usd=None,
+                billable=True,
+                block_reason="Vertex AI accelerator_count must be positive.",
+                label="gcp_vertex_jobs",
+            )
+        accelerator_total = accelerator_price * accelerator_count
+
+    try:
+        replica_count = int(args.get("replica_count") or 1)
+    except (TypeError, ValueError):
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason="Could not parse Vertex AI replica_count.",
+            label="gcp_vertex_jobs",
+        )
+    if replica_count <= 0:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason="Vertex AI replica_count must be positive.",
+            label="gcp_vertex_jobs",
+        )
+
+    hourly_total = (machine_price + accelerator_total) * replica_count
+    return CostEstimate(
+        estimated_cost_usd=round(hourly_total * max_run_hours, 4),
+        billable=True,
+        label="gcp_vertex_jobs",
+    )
+
+
 async def estimate_tool_cost(
     tool_name: str, args: dict[str, Any], *, session: Any = None
 ) -> CostEstimate:
@@ -279,4 +412,6 @@ async def estimate_tool_cost(
         return await estimate_sandbox_cost(args, session=session)
     if tool_name == "hf_jobs":
         return await estimate_hf_job_cost(args)
+    if tool_name == "gcp_vertex_jobs":
+        return await estimate_gcp_vertex_job_cost(args)
     return CostEstimate(estimated_cost_usd=0.0, billable=False)

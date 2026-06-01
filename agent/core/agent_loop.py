@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,52 @@ def _no_tool_incomplete_plan_prompt(items: list[dict[str, str]]) -> str:
         "Continue from the next unfinished item and make at least one tool call "
         "now. If you genuinely cannot continue, first use tools to inspect the "
         "state or verify the blocker."
+    )
+
+
+def _uploaded_dataset_instruction(session: Session) -> str | None:
+    uploads = [
+        upload
+        for upload in (getattr(session, "uploaded_datasets", []) or [])
+        if isinstance(upload, dict)
+    ]
+    if not uploads:
+        return None
+    latest = uploads[-1]
+    required_fields = ("config_name", "repo_id", "normalized_row_count")
+    missing_fields = [
+        field for field in required_fields if latest.get(field) in {None, ""}
+    ]
+    supports_training = latest.get("supports_training", True)
+    named = ", ".join(
+        str(upload.get("filename"))
+        for upload in uploads
+        if isinstance(upload.get("filename"), str)
+    )
+    incomplete_note = ""
+    if missing_fields or supports_training is False or latest.get("status") == "failed":
+        missing = (
+            ", ".join(missing_fields) if missing_fields else "training-ready status"
+        )
+        incomplete_note = (
+            " The uploaded dataset metadata is incomplete or not training-ready "
+            f"({missing}); explain the missing dataset requirements and ask for "
+            "the missing dataset details before launching training."
+        )
+    return (
+        "The user has uploaded data for this session. For fine-tuning or "
+        "training requests, first inspect and use the uploaded normalized "
+        "dataset config. Prefer the latest upload unless the user mentions one "
+        f"by name. Latest upload: filename={latest.get('filename')}, "
+        f"source_format={latest.get('source_format')}, "
+        f"dataset_config={latest.get('config_name')}, "
+        f"normalized_rows={latest.get('normalized_row_count')}, "
+        f"repo_id={latest.get('repo_id')}. "
+        "Use the normalized dataset config for training. Do not ask for a "
+        "local file path. Do not ask the user to upload again unless the "
+        "dataset load fails."
+        + incomplete_note
+        + (f" Available uploads: {named}." if named else "")
     )
 
 
@@ -159,6 +206,9 @@ def _validate_tool_args(tool_args: dict) -> tuple[bool, str | None]:
 
 
 _IMMEDIATE_HF_JOB_RUNS = {"run", "uv"}
+_IMMEDIATE_GCP_VERTEX_JOB_RUNS = {"run"}
+_APPROVAL_REQUIRED_GCP_VERTEX_OPS = {"run", "cancel"}
+_APPROVAL_TTL_MINUTES = 30
 
 
 @dataclass(frozen=True)
@@ -180,12 +230,29 @@ def _is_immediate_hf_job_run(tool_name: str, tool_args: dict) -> bool:
     return tool_name == "hf_jobs" and _operation(tool_args) in _IMMEDIATE_HF_JOB_RUNS
 
 
+def _is_immediate_gcp_vertex_job_run(tool_name: str, tool_args: dict) -> bool:
+    return (
+        tool_name == "gcp_vertex_jobs"
+        and _operation(tool_args) in _IMMEDIATE_GCP_VERTEX_JOB_RUNS
+    )
+
+
+def _is_gcp_vertex_cancel(tool_name: str, tool_args: dict) -> bool:
+    return tool_name == "gcp_vertex_jobs" and _operation(tool_args) == "cancel"
+
+
+def _is_immediate_cloud_job_run(tool_name: str, tool_args: dict) -> bool:
+    return _is_immediate_hf_job_run(
+        tool_name, tool_args
+    ) or _is_immediate_gcp_vertex_job_run(tool_name, tool_args)
+
+
 def _is_scheduled_hf_job_run(tool_name: str, tool_args: dict) -> bool:
     return tool_name == "hf_jobs" and is_scheduled_operation(_operation(tool_args))
 
 
 def _is_budgeted_auto_approval_target(tool_name: str, tool_args: dict) -> bool:
-    return tool_name == "sandbox_create" or _is_immediate_hf_job_run(
+    return tool_name == "sandbox_create" or _is_immediate_cloud_job_run(
         tool_name, tool_args
     )
 
@@ -228,6 +295,9 @@ def _base_needs_approval(
 
         return True
 
+    if tool_name == "gcp_vertex_jobs":
+        return _operation(tool_args) in _APPROVAL_REQUIRED_GCP_VERTEX_OPS
+
     # Check for file upload operations (hf_private_repos or other tools)
     if tool_name == "hf_private_repos":
         operation = tool_args.get("operation", "")
@@ -265,6 +335,8 @@ def _needs_approval(
 ) -> bool:
     """Legacy sync approval predicate used by tests and CLI display helpers."""
     if _is_scheduled_hf_job_run(tool_name, tool_args):
+        return True
+    if _is_gcp_vertex_cancel(tool_name, tool_args):
         return True
     if config and config.yolo_mode:
         return False
@@ -329,12 +401,84 @@ async def _approval_decision(
             block_reason="Scheduled HF jobs always require manual approval.",
         )
 
+    if _is_gcp_vertex_cancel(tool_name, tool_args):
+        return ApprovalDecision(
+            requires_approval=True,
+            auto_approval_blocked=_effective_yolo_enabled(session, config),
+            block_reason="Vertex AI job cancellation always requires manual approval.",
+        )
+
     yolo_enabled = _effective_yolo_enabled(session, config)
+    session_yolo_enabled = _session_auto_approval_enabled(session)
     budgeted_target = _is_budgeted_auto_approval_target(tool_name, tool_args)
+    if _is_immediate_gcp_vertex_job_run(tool_name, tool_args):
+        estimate = await estimate_tool_cost(tool_name, tool_args, session=session)
+        remaining = _remaining_budget_after_reservations(session, reserved_spend_usd)
+        if not session_yolo_enabled:
+            return ApprovalDecision(
+                requires_approval=True,
+                auto_approval_blocked=yolo_enabled,
+                block_reason=(
+                    "Vertex AI run requires manual approval unless session "
+                    "auto-approval with a cost cap is enabled."
+                ),
+                estimated_cost_usd=estimate.estimated_cost_usd,
+                remaining_cap_usd=remaining,
+                billable=estimate.billable,
+            )
+        reason = _budget_block_reason(estimate, remaining_cap_usd=remaining)
+        if reason:
+            return ApprovalDecision(
+                requires_approval=True,
+                auto_approval_blocked=True,
+                block_reason=reason,
+                estimated_cost_usd=estimate.estimated_cost_usd,
+                remaining_cap_usd=remaining,
+                billable=estimate.billable,
+            )
+        return ApprovalDecision(
+            requires_approval=False,
+            auto_approved=base_requires_approval,
+            estimated_cost_usd=estimate.estimated_cost_usd,
+            remaining_cap_usd=remaining,
+            billable=estimate.billable,
+        )
+
+    if _is_immediate_hf_job_run(tool_name, tool_args):
+        estimate = await estimate_tool_cost(tool_name, tool_args, session=session)
+        remaining = _remaining_budget_after_reservations(session, reserved_spend_usd)
+        if not session_yolo_enabled:
+            return ApprovalDecision(
+                requires_approval=True,
+                auto_approval_blocked=yolo_enabled,
+                block_reason=(
+                    "HF Jobs run requires manual approval unless session "
+                    "auto-approval with a cost cap is enabled."
+                ),
+                estimated_cost_usd=estimate.estimated_cost_usd,
+                remaining_cap_usd=remaining,
+                billable=estimate.billable,
+            )
+        reason = _budget_block_reason(estimate, remaining_cap_usd=remaining)
+        if reason:
+            return ApprovalDecision(
+                requires_approval=True,
+                auto_approval_blocked=True,
+                block_reason=reason,
+                estimated_cost_usd=estimate.estimated_cost_usd,
+                remaining_cap_usd=remaining,
+                billable=estimate.billable,
+            )
+        return ApprovalDecision(
+            requires_approval=False,
+            auto_approved=base_requires_approval,
+            estimated_cost_usd=estimate.estimated_cost_usd,
+            remaining_cap_usd=remaining,
+            billable=estimate.billable,
+        )
 
     # Cost caps are a session-scoped web policy. Legacy config.yolo_mode
     # remains uncapped for CLI/headless, except for scheduled jobs above.
-    session_yolo_enabled = _session_auto_approval_enabled(session)
     if yolo_enabled and budgeted_target and session_yolo_enabled:
         estimate = await estimate_tool_cost(tool_name, tool_args, session=session)
         remaining = _remaining_budget_after_reservations(session, reserved_spend_usd)
@@ -380,6 +524,112 @@ def _record_estimated_spend(session: Session, decision: ApprovalDecision) -> Non
             + float(decision.estimated_cost_usd),
             4,
         )
+
+
+def _approval_metadata(
+    session: Session, tool_name: str, tool_args: dict[str, Any]
+) -> dict[str, Any] | None:
+    if tool_name not in {"hf_jobs", "gcp_vertex_jobs"}:
+        return None
+    metadata: dict[str, Any] = {
+        "provider": "hf-jobs" if tool_name == "hf_jobs" else "gcp-vertex",
+        "training_goal": getattr(session, "training_goal", None),
+        "output_policy": getattr(session, "output_policy", None),
+    }
+    for source_key, target_key in (
+        ("model_name", "model"),
+        ("model", "model"),
+        ("hub_model_id", "hub_model_id"),
+        ("dataset_name", "dataset"),
+        ("dataset_repo", "dataset"),
+        ("dataset_repo_id", "dataset"),
+        ("dataset_config", "dataset_config"),
+        ("dataset_split", "dataset_split"),
+        ("hardware_flavor", "hardware"),
+        ("hardware", "hardware"),
+    ):
+        value = tool_args.get(source_key)
+        if value not in {None, ""} and target_key not in metadata:
+            metadata[target_key] = value
+    upload = _latest_uploaded_dataset(session)
+    if upload:
+        metadata.setdefault("dataset", upload.get("repo_id"))
+        metadata.setdefault("dataset_config", upload.get("config_name"))
+        metadata.setdefault("dataset_rows", upload.get("normalized_row_count"))
+    return {key: value for key, value in metadata.items() if value not in {None, ""}}
+
+
+def _approval_record(
+    tc: ToolCall, tool_name: str, tool_args: dict[str, Any]
+) -> dict[str, Any]:
+    operation = normalize_tool_operation(tool_args.get("operation"))
+    created_at = datetime.now(UTC)
+    return {
+        "approval_id": tc.id,
+        "tool_call_id": tc.id,
+        "tool": tool_name,
+        "operation": operation,
+        "provider": "gcp-vertex"
+        if tool_name == "gcp_vertex_jobs"
+        else "hf-jobs"
+        if tool_name == "hf_jobs"
+        else None,
+        "created_at": created_at.isoformat(),
+        "expires_at": (
+            created_at + timedelta(minutes=_APPROVAL_TTL_MINUTES)
+        ).isoformat(),
+        "status": "pending",
+    }
+
+
+def _pending_approval_records(session: Session) -> dict[str, dict[str, Any]]:
+    pending = session.pending_approval or {}
+    records = pending.get("approvals") or []
+    return {
+        str(record.get("tool_call_id")): record
+        for record in records
+        if isinstance(record, dict) and record.get("tool_call_id")
+    }
+
+
+def _is_expired_approval_record(record: dict[str, Any]) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(str(record.get("expires_at")))
+    except (TypeError, ValueError):
+        return False
+    return datetime.now(UTC) > expires_at
+
+
+def _looks_like_typed_approval(text: str | None) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {"approve", "approved", "yes", "y", "ok", "go", "run it"}
+
+
+async def _explain_typed_approval_not_launched(session: Session) -> str:
+    records = list(_pending_approval_records(session).values())
+    active_ids = [
+        str(record.get("approval_id") or record.get("tool_call_id"))
+        for record in records
+        if not _is_expired_approval_record(record)
+    ]
+    suffix = f" Active approval ID: {active_ids[0]}." if len(active_ids) == 1 else ""
+    message = (
+        "I did not launch the pending job from a typed approval. Use the approval "
+        "card so the exact tool call, provider, output policy, runtime, and cost "
+        f"match the pending request.{suffix}"
+    )
+    await _emit_visible_assistant_message(session, message)
+    await session.send_event(
+        Event(
+            event_type="error",
+            data={
+                "error": message,
+                "error_type": "approval_recovery",
+                "active": True,
+            },
+        )
+    )
+    return message
 
 
 async def _record_manual_approved_spend_if_needed(
@@ -587,6 +837,226 @@ def _friendly_error_message(error: Exception) -> str | None:
         )
 
     return None
+
+
+def _llm_error_type(error: Exception) -> str:
+    """Classify provider failures for structured UI handling."""
+
+    err_str = str(error).lower()
+    quota_billing_patterns = (
+        "quota",
+        "billing",
+        "credit",
+        "insufficient",
+        "spending limit",
+        "monthly spending",
+        "exceeded your monthly",
+    )
+    if any(
+        pattern in err_str
+        for pattern in (
+            "401",
+            "403",
+            "authentication",
+            "unauthorized",
+            "forbidden",
+            "invalid x-api-key",
+            "invalid api key",
+            "api key",
+            "permission",
+        )
+    ):
+        if any(pattern in err_str for pattern in quota_billing_patterns):
+            return "quota"
+        return "auth"
+    if any(pattern in err_str for pattern in quota_billing_patterns):
+        return "quota"
+    if _is_rate_limit_error(error):
+        return "rate_limit"
+    if any(
+        pattern in err_str
+        for pattern in (
+            "timeout",
+            "timed out",
+            "network",
+            "connection",
+            "eof",
+            "broken pipe",
+            "service unavailable",
+            "bad gateway",
+        )
+    ):
+        return "network"
+    return "unknown"
+
+
+def _llm_failure_message(
+    error: Exception,
+    *,
+    model_name: str,
+    include_traceback: bool = False,
+) -> tuple[str, str]:
+    """Return (error_type, visible message) for failed LLM calls."""
+
+    error_type = _llm_error_type(error)
+    raw = str(error).strip()
+    if error_type == "quota":
+        message = (
+            "The selected model provider rejected the request because of quota, "
+            "billing, or credits. Switch to another model, or fix the provider "
+            "quota/billing state, then retry.\n\n"
+            f"Model: {model_name}\nProvider error: {raw}"
+        )
+    elif error_type == "auth":
+        message = (
+            "The selected model provider rejected the request because credentials "
+            "or permissions are missing or invalid. Switch to a configured model "
+            "or update the provider credentials, then retry.\n\n"
+            f"Model: {model_name}\nProvider error: {raw}"
+        )
+    elif error_type == "rate_limit":
+        message = (
+            "The selected model provider rate-limited this request. Wait a bit, "
+            "switch to another model, or retry with a shorter request.\n\n"
+            f"Model: {model_name}\nProvider error: {raw}"
+        )
+    elif error_type == "network":
+        message = (
+            "The selected model provider could not be reached reliably. Retry, "
+            "or switch models if the provider stays unavailable.\n\n"
+            f"Model: {model_name}\nProvider error: {raw}"
+        )
+    else:
+        friendly = _friendly_error_message(error)
+        if friendly:
+            message = friendly
+        else:
+            message = (
+                "The selected model failed before returning a usable response. "
+                "No tool was launched. Switch models or retry after checking the "
+                "provider status.\n\n"
+                f"Model: {model_name}\nError: {raw}"
+            )
+            if include_traceback:
+                import traceback
+
+                message += "\n\n" + traceback.format_exc()
+    return error_type, message
+
+
+def _empty_llm_response_message(*, model_name: str, finish_reason: str | None) -> str:
+    reason = f" Finish reason: {finish_reason}." if finish_reason else ""
+    return (
+        "The selected model returned an empty response with no tool calls, so I "
+        "stopped instead of showing a blank assistant message. Switch to another "
+        "model or retry the request; if it repeats, the provider may be having "
+        f"issues.\n\nModel: {model_name}.{reason}"
+    )
+
+
+_HF_TRAINING_INTENT_TERMS = (
+    "train",
+    "training",
+    "fine-tune",
+    "finetune",
+    "fine tune",
+    "sft",
+    "model adaptation",
+)
+
+
+def _last_tool_name(session: Session) -> str | None:
+    for item in reversed(session.context_manager.items):
+        if getattr(item, "role", None) == "tool":
+            name = getattr(item, "name", None)
+            return str(name) if name else None
+    return None
+
+
+def _latest_uploaded_dataset(session: Session) -> dict[str, Any] | None:
+    uploads = [
+        upload
+        for upload in (getattr(session, "uploaded_datasets", []) or [])
+        if isinstance(upload, dict)
+    ]
+    return uploads[-1] if uploads else None
+
+
+def _has_training_intent(text: str | None) -> bool:
+    haystack = (text or "").lower()
+    return any(term in haystack for term in _HF_TRAINING_INTENT_TERMS)
+
+
+def _should_emit_hf_planner_fallback(session: Session, text: str | None) -> bool:
+    if getattr(session, "cloud_provider", "hf-jobs") != "hf-jobs":
+        return False
+    if _last_tool_name(session) != "training_planner":
+        return False
+    if not _has_training_intent(text):
+        return False
+    return _latest_uploaded_dataset(session) is not None
+
+
+def _hf_planner_fallback_message(session: Session) -> str:
+    upload = _latest_uploaded_dataset(session) or {}
+    dataset_parts = []
+    if upload.get("repo_id"):
+        dataset_parts.append(f"repo `{upload.get('repo_id')}`")
+    if upload.get("config_name"):
+        dataset_parts.append(f"config `{upload.get('config_name')}`")
+    if upload.get("normalized_row_count") is not None:
+        dataset_parts.append(f"{upload.get('normalized_row_count')} normalized rows")
+    dataset = ", ".join(dataset_parts) or "the uploaded normalized dataset"
+    return (
+        "I prepared the Hugging Face training plan, but the model stopped before "
+        "launching the Hugging Face Jobs preflight. I can continue with the planned "
+        f"Hugging Face fine-tuning workflow using {dataset}.\n\n"
+        f"Preflight context: provider `hf-jobs`, training goal "
+        f"`{getattr(session, 'training_goal', 'agent-decide')}`, output policy "
+        f"`{getattr(session, 'output_policy', 'cloud-and-hf-hub')}`. The next "
+        "approval-gated step is `hf_jobs`; before any job launches, I will show "
+        "the `hf_jobs` approval card and wait for explicit approval."
+    )
+
+
+async def _emit_visible_error(
+    session: Session,
+    message: str,
+    *,
+    error_type: str,
+    model_name: str | None = None,
+) -> None:
+    """Emit an assistant-visible message and a structured error event."""
+
+    assistant_msg = Message(role="assistant", content=message)
+    session.context_manager.add_message(assistant_msg)
+    await session.send_event(
+        Event(event_type="assistant_message", data={"content": message})
+    )
+    await session.send_event(
+        Event(
+            event_type="error",
+            data={
+                "error": message,
+                "error_type": error_type,
+                "model": model_name or session.config.model_name,
+                "session_id": session.session_id,
+                "turn_id": session.turn_count,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "transient": error_type
+                in {"rate_limit", "network", "empty_response", "unknown"},
+                "active": True,
+            },
+        )
+    )
+
+
+async def _emit_visible_assistant_message(session: Session, message: str) -> None:
+    assistant_msg = Message(role="assistant", content=message)
+    session.context_manager.add_message(assistant_msg)
+    await session.send_event(
+        Event(event_type="assistant_message", data={"content": message})
+    )
 
 
 async def _compact_and_notify(session: Session) -> None:
@@ -1174,6 +1644,9 @@ class Handlers:
         # Clear any stale cancellation flag from a previous run
         session.reset_cancel()
 
+        if text and session.pending_approval and _looks_like_typed_approval(text):
+            return await _explain_typed_approval_not_launched(session)
+
         # If there's a pending approval and the user sent a new message,
         # abandon the pending tools so the LLM context stays valid.
         if text and session.pending_approval:
@@ -1343,6 +1816,25 @@ class Handlers:
 
                 # If no tool calls, add assistant message and we're done
                 if not tool_calls:
+                    if not content:
+                        if _should_emit_hf_planner_fallback(session, text):
+                            fallback_msg = _hf_planner_fallback_message(session)
+                            await _emit_visible_assistant_message(session, fallback_msg)
+                            final_response = fallback_msg
+                            break
+                        error_msg = _empty_llm_response_message(
+                            model_name=session.config.model_name,
+                            finish_reason=finish_reason,
+                        )
+                        await _emit_visible_error(
+                            session,
+                            error_msg,
+                            error_type="empty_response",
+                            model_name=session.config.model_name,
+                        )
+                        errored = True
+                        break
+
                     unfinished_plan = _unfinished_plan_items(session)
                     if (
                         unfinished_plan
@@ -1557,9 +2049,21 @@ class Handlers:
                             return (tc, name, args, err, False)
                         if decision.billable:
                             _record_estimated_spend(session, decision)
-                        out, ok = await session.tool_router.call_tool(
-                            name, args, session=session, tool_call_id=tc.id
-                        )
+                        try:
+                            out, ok = await session.tool_router.call_tool(
+                                name, args, session=session, tool_call_id=tc.id
+                            )
+                        except Exception as exc:
+                            logger.exception(
+                                "Tool call %s failed without returning an error",
+                                name,
+                            )
+                            out = (
+                                f"Tool error: {type(exc).__name__}: {exc}. "
+                                "Continue with the available successful tool outputs "
+                                "or retry this tool only if it is required."
+                            )
+                            ok = False
                         return (tc, name, args, out, ok)
 
                     gather_task = asyncio.ensure_future(
@@ -1629,6 +2133,7 @@ class Handlers:
                     # Prepare batch approval data
                     tools_data = []
                     blocked_payloads = []
+                    approval_records = []
                     for tc, tool_name, tool_args, decision in approval_required_tools:
                         # Resolve sandbox file paths for hf_jobs scripts so the
                         # frontend can display & edit the actual file content.
@@ -1649,6 +2154,12 @@ class Handlers:
                             "arguments": tool_args,
                             "tool_call_id": tc.id,
                         }
+                        approval_record = _approval_record(tc, tool_name, tool_args)
+                        approval_records.append(approval_record)
+                        tool_payload.update(approval_record)
+                        metadata = _approval_metadata(session, tool_name, tool_args)
+                        if metadata:
+                            tool_payload["metadata"] = metadata
                         if decision.auto_approval_blocked:
                             tool_payload.update(
                                 {
@@ -1682,6 +2193,7 @@ class Handlers:
                     # Store all approval-requiring tools (ToolCall objects for execution)
                     session.pending_approval = {
                         "tool_calls": [tc for tc, _, _, _ in approval_required_tools],
+                        "approvals": approval_records,
                     }
 
                     # Return early - wait for EXEC_APPROVAL operation
@@ -1711,17 +2223,16 @@ class Handlers:
                 continue
 
             except Exception as e:
-                import traceback
-
-                error_msg = _friendly_error_message(e)
-                if error_msg is None:
-                    error_msg = str(e) + "\n" + traceback.format_exc()
-
-                await session.send_event(
-                    Event(
-                        event_type="error",
-                        data={"error": error_msg},
-                    )
+                error_type, error_msg = _llm_failure_message(
+                    e,
+                    model_name=session.config.model_name,
+                    include_traceback=True,
+                )
+                await _emit_visible_error(
+                    session,
+                    error_msg,
+                    error_type=error_type,
+                    model_name=session.config.model_name,
                 )
                 errored = True
                 break
@@ -1807,6 +2318,7 @@ class Handlers:
 
         # Create a map of tool_call_id -> approval decision
         approval_map = {a["tool_call_id"]: a for a in approvals}
+        approval_records = _pending_approval_records(session)
         for a in approvals:
             if a.get("edited_script"):
                 logger.info(
@@ -1845,8 +2357,38 @@ class Handlers:
                 continue
 
             approval_decision = approval_map.get(tc.id, {"approved": False})
+            approval_record = approval_records.get(tc.id)
+            if approval_record and _is_expired_approval_record(approval_record):
+                rejected_tasks.append(
+                    (
+                        tc,
+                        tool_name,
+                        {
+                            "approved": False,
+                            "feedback": (
+                                "Original approval expired. Regenerate the preflight "
+                                "before launching this job."
+                            ),
+                        },
+                    )
+                )
+                continue
 
             if approval_decision.get("approved", False):
+                if approval_decision.get("approval_id") not in (None, tc.id):
+                    rejected_tasks.append(
+                        (
+                            tc,
+                            tool_name,
+                            {
+                                "approved": False,
+                                "feedback": (
+                                    "Approval ID did not match the active pending job."
+                                ),
+                            },
+                        )
+                    )
+                    continue
                 edited_script = approval_decision.get("edited_script")
                 was_edited = False
                 if edited_script and "script" in tool_args:
@@ -2060,6 +2602,69 @@ async def process_submission(session: Session, submission) -> bool:
 
     if op.op_type == OpType.USER_INPUT:
         text = op.data.get("text", "") if op.data else ""
+        cloud_provider = op.data.get("cloud_provider") if op.data else None
+        training_goal = op.data.get("training_goal") if op.data else None
+        output_policy = op.data.get("output_policy") if op.data else None
+        if cloud_provider in {"hf-jobs", "gcp-vertex"}:
+            session.cloud_provider = cloud_provider
+            if training_goal in {"smoke-test", "production", "agent-decide"}:
+                session.training_goal = training_goal
+            else:
+                training_goal = getattr(session, "training_goal", "agent-decide")
+            if output_policy in {
+                "cloud-private",
+                "hf-hub",
+                "cloud-and-hf-hub",
+            }:
+                session.output_policy = output_policy
+            else:
+                output_policy = getattr(session, "output_policy", "cloud-and-hf-hub")
+            if cloud_provider == "gcp-vertex":
+                provider_instruction = (
+                    "User selected Google Cloud Vertex AI training backend. "
+                    "Use gcp_vertex_jobs for fine-tuning/training. Use uploaded "
+                    "dataset context and normalized dataset config if present. "
+                    "Before launch, respect "
+                    f"training_goal={training_goal} and output_policy={output_policy}. "
+                    "If output_policy=cloud-private, do not push final model to "
+                    "Hugging Face Hub. If output_policy=hf-hub, push final model "
+                    "to Hugging Face Hub. If output_policy=cloud-and-hf-hub, save "
+                    "to GCS and push to Hugging Face Hub. For sensitive domains "
+                    "(medical, finance, legal, insurance, government, or internal "
+                    "company data), recommend cloud-private unless user explicitly "
+                    "chooses otherwise. gcp_vertex_jobs run and cancel operations "
+                    "are approval-gated and billable; do not launch them without "
+                    "approval. For non-training requests, use the normal best-fit "
+                    "tools."
+                )
+            else:
+                provider_instruction = (
+                    "The frontend training provider selector for this session is "
+                    "set to Hugging Face Jobs. For training, fine-tuning, SFT, "
+                    "model adaptation, cloud compute, or model training job "
+                    "requests, prefer hf_jobs unless the user explicitly asks "
+                    "for another backend. Use uploaded dataset context from this "
+                    "session when one is available. Before launch, respect "
+                    f"training_goal={training_goal} and output_policy={output_policy}. "
+                    "After a training_planner recommendation, continue to a "
+                    "Hugging Face Jobs preflight and the approval-gated hf_jobs "
+                    "step; do not stop after planning unless a real clarification "
+                    "is required. hf_jobs run operations are approval-gated and "
+                    "billable; do not launch them without approval. Do not route "
+                    "to gcp_vertex_jobs or aws_sagemaker_jobs unless the user "
+                    "changes provider. Do not use Kaggle."
+                )
+            session.context_manager.add_message(
+                Message(
+                    role="user",
+                    content=f"[SYSTEM: {provider_instruction}]",
+                )
+            )
+        upload_instruction = _uploaded_dataset_instruction(session)
+        if upload_instruction:
+            session.context_manager.add_message(
+                Message(role="user", content=f"[SYSTEM: {upload_instruction}]")
+            )
         await Handlers.run_agent(session, text)
         return True
 

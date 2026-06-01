@@ -11,6 +11,11 @@ import { useAgentStore, type ResearchAgentState } from '@/store/agentStore';
 import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
 import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
+import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
+import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
+import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import type { OutputPolicy, TrainingGoal } from '@/types/agent';
 import type { UIMessage } from 'ai';
 
 // ---------------------------------------------------------------------------
@@ -19,6 +24,17 @@ import type { UIMessage } from 'ai';
 type DynamicToolPart = Extract<UIMessage['parts'][number], { type: 'dynamic-tool' }>;
 
 type ToolPartState = DynamicToolPart['state'];
+const SECRET_KEY_PATTERN = /token|secret|password|credential|private_key/i;
+
+function maskSensitiveParameters(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskSensitiveParameters);
+  if (!value || typeof value !== 'object') return value;
+  const masked: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    masked[key] = SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : maskSensitiveParameters(entry);
+  }
+  return masked;
+}
 
 /** Check if a tool part was cancelled (output-error with cancellation message). */
 function isCancelledTool(tool: DynamicToolPart): boolean {
@@ -481,6 +497,30 @@ function statusColor(state: ToolPartState): string {
   }
 }
 
+function createPreflightPanel(
+  toolName: string,
+  output: unknown,
+  input?: Record<string, unknown>,
+) {
+  if (toolName === 'training_planner') {
+    const panel = createTrainingPlannerPanel(output ?? input ?? {});
+    return {
+      title: 'Training Planner',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(input ? { input: { content: JSON.stringify(input, null, 2), language: 'json' } } : {}),
+    };
+  }
+  if (toolName === 'dataset_discovery') {
+    const panel = createDatasetDiscoveryPanel(output ?? input ?? {});
+    return {
+      title: 'Dataset Discovery',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(input ? { input: { content: JSON.stringify(input, null, 2), language: 'json' } } : {}),
+    };
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Inline approval UI (per-tool)
 // ---------------------------------------------------------------------------
@@ -512,6 +552,16 @@ function InlineApproval({
         { title: scriptLabel, script: { content: scriptContent, language: 'python' }, parameters: { tool_call_id: toolCallId } },
         'script',
         true,
+      );
+      setRightPanelOpen(true);
+      setLeftSidebarOpen(false);
+    } else if (toolName === 'gcp_vertex_jobs' && args) {
+      const vertexPanel = createVertexRunPanel(args);
+      if (!vertexPanel) return;
+      setPanel(
+        { ...vertexPanel.data, parameters: maskSensitiveParameters({ ...args, tool_call_id: toolCallId }) as Record<string, unknown> },
+        vertexPanel.view,
+        vertexPanel.editable,
       );
       setRightPanelOpen(true);
       setLeftSidebarOpen(false);
@@ -635,6 +685,54 @@ function InlineApproval({
         );
       })()}
 
+      {toolName === 'gcp_vertex_jobs' && args && (() => {
+        const operation = String(args.operation || '').toLowerCase();
+        if (operation !== 'run' && operation !== 'cancel') return null;
+        const maxRunHours = args.max_run_hours ?? args.timeout_hours;
+        const trainingGoal = args.training_goal as TrainingGoal | undefined;
+        const outputPolicy = args.output_policy as OutputPolicy | undefined;
+        return (
+          <Box sx={{ mb: 1.5 }}>
+            <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.75rem', mb: 0.5 }}>
+              {operation === 'cancel'
+                ? 'Cancel this Vertex AI job only after manual approval.'
+                : 'Launch a billable Vertex AI job only after manual approval.'}
+            </Typography>
+            {maxRunHours !== undefined && maxRunHours !== null && (
+              <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.8 }}>
+                Max runtime for approval guardrails:{' '}
+                <Box component="span" sx={{ color: 'var(--text)', fontWeight: 500 }}>
+                  {String(maxRunHours)} hour{Number(maxRunHours) === 1 ? '' : 's'}
+                </Box>
+              </Typography>
+            )}
+            {operation === 'run' && (
+              <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.8 }}>
+                Training goal:{' '}
+                <Box component="span" sx={{ color: 'var(--text)', fontWeight: 500 }}>
+                  {trainingGoalLabel(trainingGoal)}
+                </Box>
+                {' · '}Storage destination:{' '}
+                <Box component="span" sx={{ color: 'var(--text)', fontWeight: 500 }}>
+                  {storageDestinationLabel(outputPolicy)}
+                </Box>
+              </Typography>
+            )}
+            {autoApproval?.estimatedCostUsd !== undefined && autoApproval.estimatedCostUsd !== null && (
+              <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.8 }}>
+                Estimated cost:{' '}
+                <Box component="span" sx={{ color: 'var(--accent-yellow)', fontWeight: 500 }}>
+                  ${autoApproval.estimatedCostUsd.toFixed(2)}
+                </Box>
+                {autoApproval.remainingCapUsd !== undefined && autoApproval.remainingCapUsd !== null && (
+                  <> · Remaining auto-approval cap: ${autoApproval.remainingCapUsd.toFixed(2)}</>
+                )}
+              </Typography>
+            )}
+          </Box>
+        );
+      })()}
+
       <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
         <TextField
           fullWidth
@@ -720,7 +818,7 @@ function InlineApproval({
 const EMPTY_AGENTS: Record<string, ResearchAgentState> = {};
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
-  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
+  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getJobRuntimeState, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
   const researchAgents = useAgentStore(s => {
     const activeId = s.activeSessionId;
     return (activeId && s.sessionStates[activeId]?.researchAgents) || EMPTY_AGENTS;
@@ -813,6 +911,12 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     for (const t of tools) {
       if (t.toolName === 'research') {
         displayMap[t.toolCallId] = 'research';
+      } else if (t.toolName === 'gcp_vertex_jobs') {
+        displayMap[t.toolCallId] = 'Vertex AI Job';
+      } else if (t.toolName === 'training_planner') {
+        displayMap[t.toolCallId] = 'Training Planner';
+      } else if (t.toolName === 'dataset_discovery') {
+        displayMap[t.toolCallId] = 'Dataset Discovery';
       }
     }
     return { scriptLabelMap: scriptMap, toolDisplayMap: displayMap };
@@ -913,9 +1017,58 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         return;
       }
 
-      const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
+      if (tool.toolName === 'gcp_vertex_jobs' && args) {
+        const vertexPanel = createVertexRunPanel(args);
+        const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
+        const runtimeState = getJobRuntimeState(tool.toolCallId);
+        const stateMarkdown = buildVertexStateMarkdown(runtimeState || {});
+        const outputContent = appendTrainingResultSummary([jobOutput ? String(jobOutput) : '', stateMarkdown]
+          .filter(Boolean)
+          .join('\n\n'));
+
+        if (vertexPanel) {
+          setPanel(
+            {
+              ...vertexPanel.data,
+              ...(outputContent
+                ? { output: { content: outputContent, language: 'markdown' } }
+                : vertexPanel.data.output
+                  ? { output: vertexPanel.data.output }
+                  : {}),
+              parameters: { ...args, tool_call_id: tool.toolCallId },
+            },
+            outputContent && tool.state === 'output-error' ? 'output' : vertexPanel.view,
+            false,
+          );
+          setRightPanelOpen(true);
+          setLeftSidebarOpen(false);
+          return;
+        }
+
+        if (outputContent) {
+          setPanel(
+            {
+              title: displayName,
+              output: { content: outputContent, language: 'markdown' },
+              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+            },
+            'output',
+          );
+          setRightPanelOpen(true);
+          setLeftSidebarOpen(false);
+          return;
+        }
+      }
 
       const outputText = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
+      const planningPanel = createPreflightPanel(tool.toolName, outputText, args);
+      if (planningPanel) {
+        setPanel(planningPanel, 'output');
+        setRightPanelOpen(true);
+        return;
+      }
+
+      const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
 
       const hasCompleted = tool.state === 'output-available' || tool.state === 'output-error' || tool.state === 'output-denied';
 
@@ -952,7 +1105,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       }
     },
-    [toolDisplayMap, setPanel, getEditedScript, setRightPanelOpen, setLeftSidebarOpen],
+    [toolDisplayMap, setPanel, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
   );
 
   // ── Panel click handler ───────────────────────────────────────────
@@ -1008,6 +1161,18 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     return {
       jobUrl: urlMatch?.[1],
       jobStatus: statusMatch?.[1]?.trim(),
+    };
+  }
+
+  function parseVertexMeta(output: unknown): { jobUrl?: string; jobName?: string; outputDir?: string } {
+    if (typeof output !== 'string') return {};
+    const urlMatch = output.match(/\*\*Console:\*\*\s*(https:\/\/[^\s\n]+)/);
+    const jobMatch = output.match(/\*\*Job:\*\*\s*([^\n]+)/);
+    const outputDirMatch = output.match(/\*\*Output dir:\*\*\s*([^\n]+)/);
+    return {
+      jobUrl: urlMatch?.[1],
+      jobName: jobMatch?.[1]?.trim(),
+      outputDir: outputDirMatch?.[1]?.trim(),
     };
   }
 
@@ -1108,12 +1273,17 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             : hasError ? 'error'
             : statusLabel(displayState as ToolPartState);
 
-          // Parse job metadata from hf_jobs output and store
-          const jobUrlFromStore = tool.toolName === 'hf_jobs' ? getJobUrl(tool.toolCallId) : undefined;
+          // Parse job metadata from job outputs and state-change side channels.
+          const isJobTool = tool.toolName === 'hf_jobs' || tool.toolName === 'gcp_vertex_jobs';
+          const jobUrlFromStore = isJobTool ? getJobUrl(tool.toolCallId) : undefined;
           const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
+          const vertexRuntimeState = tool.toolName === 'gcp_vertex_jobs' ? getJobRuntimeState(tool.toolCallId) : undefined;
 
           const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
             ? parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
+            : {};
+          const vertexMetaFromOutput = tool.toolName === 'gcp_vertex_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
+            ? parseVertexMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
 
           // Store job status if we just parsed it and don't have it stored yet
@@ -1124,8 +1294,11 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           // Combine job URL and status from store (persisted) with output metadata (freshly parsed)
           // Prefer stored values to ensure they persist across renders
           const jobMeta = {
-            jobUrl: jobUrlFromStore || jobMetaFromOutput.jobUrl,
+            jobUrl: jobUrlFromStore || vertexRuntimeState?.jobUrl || vertexMetaFromOutput.jobUrl || jobMetaFromOutput.jobUrl,
             jobStatus: jobStatusFromStore || jobMetaFromOutput.jobStatus,
+            jobName: vertexRuntimeState?.jobName || vertexMetaFromOutput.jobName,
+            outputDir: vertexRuntimeState?.outputDir || vertexMetaFromOutput.outputDir,
+            vertexState: vertexRuntimeState?.state,
           };
 
           return (
@@ -1153,6 +1326,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                     hasError
                       ? 'output-error'
                       : ((tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
+                        || (tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState && ['failed', 'cancelled', 'expired'].some((stateName) => jobMeta.vertexState?.toLowerCase().includes(stateName)))
                         ? 'output-error'
                         : displayState as ToolPartState)
                   }
@@ -1189,7 +1363,11 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                         : researchChipLabel(agentState.stats, liveElapsed))
                     : null;
                   const chipLabel = researchLabel || label;
-                  if (!chipLabel || (tool.toolName === 'hf_jobs' && jobMeta.jobStatus)) return null;
+                  if (
+                    !chipLabel ||
+                    (tool.toolName === 'hf_jobs' && jobMeta.jobStatus) ||
+                    (tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState)
+                  ) return null;
 
                   return (
                     <Chip
@@ -1236,8 +1414,31 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   />
                 )}
 
-                {/* View on HF link — single place, shown whenever URL is available */}
-                {tool.toolName === 'hf_jobs' && jobMeta.jobUrl && (
+                {tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState && (
+                  <Chip
+                    label={jobMeta.vertexState.replace(/^JOB_STATE_/, '').toLowerCase()}
+                    size="small"
+                    sx={{
+                      height: 20,
+                      fontSize: '0.65rem',
+                      fontWeight: 600,
+                      bgcolor: ['failed', 'cancelled', 'expired'].some((stateName) => jobMeta.vertexState?.toLowerCase().includes(stateName))
+                        ? 'rgba(224,90,79,0.12)'
+                        : jobMeta.vertexState.toLowerCase().includes('succeeded')
+                          ? 'rgba(47,204,113,0.12)'
+                          : 'rgba(255,193,59,0.12)',
+                      color: ['failed', 'cancelled', 'expired'].some((stateName) => jobMeta.vertexState?.toLowerCase().includes(stateName))
+                        ? 'var(--accent-red)'
+                        : jobMeta.vertexState.toLowerCase().includes('succeeded')
+                          ? 'var(--accent-green)'
+                          : 'var(--accent-yellow)',
+                      letterSpacing: '0.03em',
+                    }}
+                  />
+                )}
+
+                {/* Job link — single place, shown whenever URL is available */}
+                {isJobTool && jobMeta.jobUrl && (
                   <Link
                     href={jobMeta.jobUrl}
                     target="_blank"
@@ -1255,7 +1456,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                     }}
                   >
                     <LaunchIcon sx={{ fontSize: 12 }} />
-                    View on HF
+                    {tool.toolName === 'gcp_vertex_jobs' ? 'View on Vertex' : 'View on HF'}
                   </Link>
                 )}
 
@@ -1269,8 +1470,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 <ResearchSteps steps={researchAgents[tool.toolCallId].steps} />
               )}
 
-              {/* Trackio dashboard embed — shown for hf_jobs / sandbox_create runs that declared a trackio space */}
-              {(tool.toolName === 'hf_jobs' || tool.toolName === 'sandbox_create')
+              {/* Trackio dashboard embed — shown for job/sandbox runs that declared a trackio space */}
+              {(tool.toolName === 'hf_jobs' || tool.toolName === 'gcp_vertex_jobs' || tool.toolName === 'sandbox_create')
                 && !isPending
                 && !isRejected
                 && !cancelled

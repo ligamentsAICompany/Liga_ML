@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useChat } from '@ai-sdk/react';
 import { type UIMessage, lastAssistantMessageIsCompleteWithApprovalResponses } from 'ai';
 import { SSEChatTransport, type SideChannelCallbacks } from '@/lib/sse-chat-transport';
+import { registerExplicitToolApprovals } from '@/lib/explicit-tool-approvals';
 import { loadMessages, saveMessages } from '@/lib/chat-message-store';
 import { saveBackendMessages } from '@/lib/backend-message-store';
 import { saveResearch, loadResearch, clearResearch, RESEARCH_MAX_STEPS } from '@/lib/research-store';
@@ -20,6 +21,11 @@ import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
+import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
+import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import { shouldMarkModelUnavailable, normalizeLlmErrorType } from '@/lib/llm-error-recovery';
+import type { ToolStateChangeEventData } from '@/types/events';
 
 interface UseAgentChatOptions {
   sessionId: string;
@@ -29,6 +35,34 @@ interface UseAgentChatOptions {
   onSessionDead?: (sessionId: string) => void;
 }
 
+const STREAMABLE_TOOLS = new Set(['hf_jobs', 'gcp_vertex_jobs', 'sandbox', 'bash']);
+
+function appendPanelOutput(existing: string, next: string): string {
+  if (!existing) return next;
+  if (!next) return existing;
+  return `${existing}\n${next}`;
+}
+
+function createPreflightPanelData(toolName: string, output: unknown, args?: Record<string, unknown>) {
+  if (toolName === 'training_planner') {
+    const panel = createTrainingPlannerPanel(output ?? args ?? {});
+    return {
+      title: 'Training Planner',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+    };
+  }
+  if (toolName === 'dataset_discovery') {
+    const panel = createDatasetDiscoveryPanel(output ?? args ?? {});
+    return {
+      title: 'Dataset Discovery',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+    };
+  }
+  return null;
+}
+
 export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionDead }: UseAgentChatOptions) {
   const callbacksRef = useRef({ onReady, onError, onSessionDead });
   callbacksRef.current = { onReady, onError, onSessionDead };
@@ -36,7 +70,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
 
-  const { setNeedsAttention, updateSessionYolo } = useSessionStore();
+  const { setNeedsAttention, updateSessionYolo, markSessionModelUnavailable } = useSessionStore();
 
   // Helper: update this session's state (mirrors to globals if active)
   const updateSession = useAgentStore.getState().updateSession;
@@ -58,8 +92,36 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           useAgentStore.getState().setConnected(false);
         }
       },
-      onError: (error: string) => {
+      onRequestStart: (requestId: string) => {
+        useAgentStore.getState().clearLlmErrorForNewRequest(sessionId, requestId);
+      },
+      onRequestSuccess: (requestId: string) => {
+        useAgentStore.getState().clearLlmErrorForSuccessfulRequest(sessionId, requestId);
+      },
+      onError: (error: string, data?: Record<string, unknown>) => {
         updateSession(sessionId, { isProcessing: false });
+        const errorType = typeof data?.error_type === 'string' ? data.error_type : null;
+        const model = typeof data?.model === 'string' ? data.model : null;
+        if (errorType || model) {
+          const record = useAgentStore.getState().reportLlmHealthError({
+            error,
+            errorType,
+            model,
+            provider: typeof data?.provider === 'string' ? data.provider : null,
+            sessionId: typeof data?.session_id === 'string' ? data.session_id : sessionId,
+            requestId: typeof data?.request_id === 'string' ? data.request_id : null,
+            turnId: typeof data?.turn_id === 'string' || typeof data?.turn_id === 'number' ? data.turn_id : null,
+            timestamp: typeof data?.timestamp === 'string' ? data.timestamp : undefined,
+          });
+          if (record.model && shouldMarkModelUnavailable(normalizeLlmErrorType(record.errorType))) {
+            markSessionModelUnavailable(sessionId, record.model, {
+              model: record.model,
+              errorType: record.errorType,
+              message: record.message,
+              timestamp: record.timestamp,
+            });
+          }
+        }
         callbacksRef.current.onError?.(error);
       },
       onProcessing: () => {
@@ -145,25 +207,33 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           return;
         }
 
-        const STREAMABLE_TOOLS = new Set(['hf_jobs', 'sandbox', 'bash']);
         if (!STREAMABLE_TOOLS.has(tool)) return;
 
         const sessState = useAgentStore.getState().getSessionState(sessionId);
         const existingOutput = sessState.panelData?.output?.content || '';
 
-        const newContent = existingOutput
-          ? existingOutput + '\n' + log
-          : log;
+        const rawNewContent = appendPanelOutput(existingOutput, log);
+        const newContent = tool === 'gcp_vertex_jobs'
+          ? appendTrainingResultSummary(rawNewContent)
+          : rawNewContent;
 
         if (!sessState.panelData) {
-          const title = tool === 'bash' ? 'Sandbox' : tool === 'sandbox' ? 'Sandbox' : 'Job Output';
+          const title = tool === 'bash' || tool === 'sandbox'
+            ? 'Sandbox'
+            : tool === 'gcp_vertex_jobs'
+              ? 'Vertex AI Job Output'
+              : 'Job Output';
+          const language = tool === 'gcp_vertex_jobs' ? 'markdown' : 'text';
           updateSession(sessionId, {
-            panelData: { title, output: { content: newContent, language: 'text' } },
+            panelData: { title, output: { content: newContent, language } },
             panelView: 'output',
           });
         } else {
+          const language = tool === 'gcp_vertex_jobs'
+            ? 'markdown'
+            : sessState.panelData.output?.language || 'text';
           updateSession(sessionId, {
-            panelData: { ...sessState.panelData, output: { content: newContent, language: 'text' } },
+            panelData: { ...sessState.panelData, output: { content: newContent, language } },
             panelView: 'output',
           });
         }
@@ -214,6 +284,15 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             panelView: 'script' as const,
             panelEditable: true,
           };
+        } else if (firstTool.tool === 'gcp_vertex_jobs') {
+          const vertexPanel = createVertexRunPanel(firstTool.arguments as Record<string, unknown>);
+          if (vertexPanel) {
+            panelUpdate = {
+              panelData: vertexPanel.data,
+              panelView: vertexPanel.view,
+              panelEditable: vertexPanel.editable,
+            };
+          }
         } else if (firstTool.tool === 'hf_repo_files' && args.content) {
           const filename = args.path || 'file';
           panelUpdate = {
@@ -222,6 +301,11 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
               script: { content: args.content, language: filename.endsWith('.py') ? 'python' : 'text' },
               parameters: firstTool.arguments as Record<string, unknown>,
             },
+          };
+        } else if (firstTool.tool === 'training_planner' || firstTool.tool === 'dataset_discovery') {
+          panelUpdate = {
+            panelData: createPreflightPanelData(firstTool.tool, null, firstTool.arguments as Record<string, unknown>),
+            panelView: 'output' as const,
           };
         } else {
           panelUpdate = {
@@ -253,6 +337,18 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             useLayoutStore.getState().setRightPanelOpen(true);
             useLayoutStore.getState().setLeftSidebarOpen(false);
           }
+        } else if (toolName === 'gcp_vertex_jobs') {
+          const vertexPanel = createVertexRunPanel(args);
+          if (!vertexPanel) return;
+          updateSession(sessionId, {
+            panelData: vertexPanel.data,
+            panelView: vertexPanel.view,
+            panelEditable: vertexPanel.editable,
+          });
+          if (isActiveRef.current) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+            useLayoutStore.getState().setLeftSidebarOpen(false);
+          }
         } else if (toolName === 'hf_repo_files' && args.operation === 'upload' && args.content) {
           updateSession(sessionId, {
             panelData: {
@@ -260,6 +356,15 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
               script: { content: String(args.content), language: String(args.path || '').endsWith('.py') ? 'python' : 'text' },
               parameters: args,
             },
+          });
+          if (isActiveRef.current) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+            useLayoutStore.getState().setLeftSidebarOpen(false);
+          }
+        } else if (toolName === 'training_planner' || toolName === 'dataset_discovery') {
+          updateSession(sessionId, {
+            panelData: createPreflightPanelData(toolName, null, args),
+            panelView: 'output',
           });
           if (isActiveRef.current) {
             useLayoutStore.getState().setRightPanelOpen(true);
@@ -284,10 +389,73 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
               : { title: 'Output', output: { content: output, language: 'markdown' } },
             panelView: !success ? 'output' : sessState.panelView,
           });
+        } else if (toolName === 'gcp_vertex_jobs' && output) {
+          const content = appendTrainingResultSummary(output);
+          updateSession(sessionId, {
+            panelData: sessState.panelData
+              ? { ...sessState.panelData, output: { content, language: 'markdown' } }
+              : { title: 'Vertex AI Job Output', output: { content, language: 'markdown' } },
+            panelView: !success ? 'output' : sessState.panelView,
+            panelEditable: false,
+          });
+          if (isActiveRef.current && !useLayoutStore.getState().isRightPanelOpen) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+          }
+        } else if ((toolName === 'training_planner' || toolName === 'dataset_discovery') && output) {
+          updateSession(sessionId, {
+            panelData: createPreflightPanelData(toolName, output),
+            panelView: 'output',
+            panelEditable: false,
+          });
+          if (isActiveRef.current && !useLayoutStore.getState().isRightPanelOpen) {
+            useLayoutStore.getState().setRightPanelOpen(true);
+          }
         } else if (toolName === 'bash') {
           if (!success) {
             updateSession(sessionId, { panelView: 'output' });
           }
+        }
+      },
+      onToolStateChange: (state: ToolStateChangeEventData) => {
+        if (state.tool !== 'gcp_vertex_jobs' || !state.tool_call_id) return;
+
+        const store = useAgentStore.getState();
+        store.setJobRuntimeState(state.tool_call_id, {
+          tool: state.tool,
+          state: state.state,
+          jobName: state.jobName,
+          jobUrl: state.jobUrl,
+          outputDir: state.outputDir,
+        });
+        if (state.jobUrl) {
+          store.setJobUrl(state.tool_call_id, state.jobUrl);
+        }
+
+        const sessState = store.getSessionState(sessionId);
+        const stateMarkdown = buildVertexStateMarkdown({
+          state: state.state,
+          jobName: state.jobName,
+          jobUrl: state.jobUrl,
+          outputDir: state.outputDir,
+        });
+        if (!stateMarkdown) return;
+
+        const existingOutput = sessState.panelData?.output?.content || '';
+        const rawContent = existingOutput.includes('## Vertex AI Job State')
+          ? existingOutput.replace(/## Vertex AI Job State[\s\S]*$/m, stateMarkdown)
+          : appendPanelOutput(existingOutput, stateMarkdown);
+        const content = appendTrainingResultSummary(rawContent);
+
+        updateSession(sessionId, {
+          panelData: sessState.panelData
+            ? { ...sessState.panelData, output: { content, language: 'markdown' } }
+            : { title: 'Vertex AI Job Output', output: { content, language: 'markdown' } },
+          panelView: sessState.panelData?.script ? sessState.panelView : 'output',
+          panelEditable: false,
+        });
+
+        if (isActiveRef.current && !useLayoutStore.getState().isRightPanelOpen) {
+          useLayoutStore.getState().setRightPanelOpen(true);
         }
       },
       onStreaming: () => {
@@ -557,6 +725,20 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           } else if (et === 'tool_state_change') {
             const state = event.data?.state as string;
             const toolName = event.data?.tool as string;
+            const toolCallId = event.data?.tool_call_id as string;
+            if (toolCallId) {
+              sideChannel.onToolStateChange({
+                tool: toolName,
+                tool_call_id: toolCallId,
+                state,
+                jobName: event.data?.jobName as string | undefined,
+                jobUrl: event.data?.jobUrl as string | undefined,
+                outputDir: event.data?.outputDir as string | undefined,
+                trackioSpaceId: event.data?.trackioSpaceId as string | undefined,
+                trackioProject: event.data?.trackioProject as string | undefined,
+                namespace: event.data?.namespace as string | undefined,
+              });
+            }
             if (state === 'running' && toolName) sideChannel.onToolRunning(toolName);
           } else if (et === 'turn_complete' || et === 'error' || et === 'interrupted') {
             sideChannel.onProcessingDone();
@@ -728,6 +910,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           useAgentStore.getState().setEditedScript(a.tool_call_id, a.edited_script);
         }
       }
+      registerExplicitToolApprovals(sessionId, approvals);
 
       // Update SDK tool state — this triggers sendMessages() via the transport
       for (const a of approvals) {

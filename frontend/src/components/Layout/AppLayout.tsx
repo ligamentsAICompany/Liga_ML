@@ -7,6 +7,7 @@ import {
   IconButton,
   Alert,
   AlertTitle,
+  Button,
   Snackbar,
   useMediaQuery,
   useTheme,
@@ -24,12 +25,16 @@ import CodePanel from '@/components/CodePanel/CodePanel';
 import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
 import { apiFetch } from '@/utils/api';
+import {
+  LLM_ERROR_SELECT_MODEL_ACTION,
+  shouldReportLlmHealthErrorForActiveModel,
+} from '@/lib/llm-error-recovery';
 
 const DRAWER_WIDTH = 260;
 
 export default function AppLayout() {
   const { sessions, activeSessionId, markExpired } = useSessionStore();
-  const { isConnected, llmHealthError, setLlmHealthError, user } = useAgentStore();
+  const { isConnected, llmHealthError, setLlmHealthError, reportLlmHealthError, user } = useAgentStore();
   const {
     isLeftSidebarOpen,
     isRightPanelOpen,
@@ -87,10 +92,16 @@ export default function AppLayout() {
         const res = await apiFetch('/api/health/llm');
         const data = await res.json();
         if (!cancelled && data.status === 'error') {
-          setLlmHealthError({
+          const { activeSessionId: currentSessionId, sessions: currentSessions } = useSessionStore.getState();
+          const activeModel = currentSessions.find((session) => session.id === currentSessionId)?.model;
+          if (!shouldReportLlmHealthErrorForActiveModel({ model: data.model }, activeModel)) {
+            return;
+          }
+          reportLlmHealthError({
             error: data.error || 'Unknown LLM error',
             errorType: data.error_type || 'unknown',
             model: data.model,
+            provider: data.provider,
           });
         } else if (!cancelled) {
           setLlmHealthError(null);
@@ -169,8 +180,8 @@ export default function AppLayout() {
 
   // -- LLM error toast helper --------------------------------------------
   const llmErrorTitle = llmHealthError
-    ? llmHealthError.errorType === 'credits'
-      ? 'API Credits Exhausted'
+    ? llmHealthError.errorType === 'quota' || llmHealthError.errorType === 'billing'
+      ? 'Provider Quota Exhausted'
       : llmHealthError.errorType === 'auth'
       ? 'Invalid API Key'
       : llmHealthError.errorType === 'rate_limit'
@@ -179,6 +190,14 @@ export default function AppLayout() {
       ? 'LLM Provider Unreachable'
       : 'LLM Error'
     : '';
+  const activeSessionModel = sessions.find((session) => session.id === activeSessionId)?.model;
+  const shouldShowLlmHealthError = Boolean(
+    llmHealthError
+      && shouldReportLlmHealthErrorForActiveModel(
+        { model: llmHealthError.model },
+        activeSessionModel,
+      ),
+  );
 
   // -- Welcome screen: no sessions at all ---------------------------------
   if (!hasAnySessions) {
@@ -434,7 +453,7 @@ export default function AppLayout() {
         </Alert>
       </Snackbar>
       <Snackbar
-        open={!!llmHealthError}
+        open={shouldShowLlmHealthError}
         anchorOrigin={{ vertical: 'top', horizontal: 'center' }}
         onClose={() => setLlmHealthError(null)}
       >
@@ -448,9 +467,31 @@ export default function AppLayout() {
             {llmErrorTitle}
           </AlertTitle>
           {llmHealthError && (
-            <Typography variant="body2" sx={{ fontSize: '0.78rem', opacity: 0.9 }}>
-              {llmHealthError.model} — {llmHealthError.error.slice(0, 150)}
-            </Typography>
+            <>
+              <Typography variant="body2" sx={{ fontSize: '0.78rem', opacity: 0.9 }}>
+                {llmHealthError.message}
+              </Typography>
+              <Typography variant="caption" sx={{ display: 'block', mt: 0.5, opacity: 0.78 }}>
+                Failed model: {llmHealthError.model}
+                {llmHealthError.requestId ? ` · Request: ${llmHealthError.requestId}` : ''}
+              </Typography>
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('liga-open-model-selector'));
+                  setLlmHealthError(null);
+                }}
+                sx={{
+                  mt: 1,
+                  color: 'inherit',
+                  borderColor: 'rgba(255,255,255,0.6)',
+                  textTransform: 'none',
+                }}
+              >
+                {LLM_ERROR_SELECT_MODEL_ACTION}
+              </Button>
+            </>
           )}
         </Alert>
       </Snackbar>

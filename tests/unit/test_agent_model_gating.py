@@ -98,6 +98,92 @@ async def test_switching_to_premium_model_is_allowed_for_authenticated_user(
 
 
 @pytest.mark.asyncio
+async def test_switching_cloud_provider_persists_for_session(monkeypatch):
+    updated = []
+
+    async def fake_check_session_access(session_id, user, request=None):
+        assert session_id == "s1"
+        assert user["user_id"] == "u1"
+        return SimpleNamespace(user_id="u1")
+
+    async def fake_update_session_cloud_provider(
+        session_id,
+        cloud_provider,
+        training_goal=None,
+        output_policy=None,
+    ):
+        updated.append((session_id, cloud_provider))
+        return True
+
+    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    monkeypatch.setattr(
+        agent.session_manager,
+        "update_session_cloud_provider",
+        fake_update_session_cloud_provider,
+    )
+
+    response = await agent.set_session_cloud_provider(
+        "s1",
+        {"cloud_provider": "gcp-vertex"},
+        request=None,
+        user={"user_id": "u1", "plan": "free"},
+    )
+
+    assert response == {
+        "session_id": "s1",
+        "cloud_provider": "gcp-vertex",
+        "training_goal": "agent-decide",
+        "output_policy": "cloud-private",
+    }
+    assert updated == [("s1", "gcp-vertex")]
+
+
+@pytest.mark.asyncio
+async def test_switching_cloud_provider_persists_gcloud_preflight_options(monkeypatch):
+    updated = []
+
+    async def fake_check_session_access(session_id, user, request=None):
+        assert session_id == "s1"
+        assert user["user_id"] == "u1"
+        return SimpleNamespace(user_id="u1")
+
+    async def fake_update_session_cloud_provider(
+        session_id,
+        cloud_provider,
+        training_goal=None,
+        output_policy=None,
+    ):
+        updated.append((session_id, cloud_provider, training_goal, output_policy))
+        return True
+
+    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    monkeypatch.setattr(
+        agent.session_manager,
+        "update_session_cloud_provider",
+        fake_update_session_cloud_provider,
+    )
+
+    response = await agent.set_session_cloud_provider(
+        "s1",
+        {
+            "cloud_provider": "gcp-vertex",
+            "training_goal": "smoke-test",
+            "output_policy": "cloud-private",
+        },
+        request=None,
+        user={"user_id": "u1", "plan": "free"},
+    )
+
+    assert response == {
+        "session_id": "s1",
+        "cloud_provider": "gcp-vertex",
+        "training_goal": "smoke-test",
+        "output_policy": "cloud-private",
+    }
+    assert updated == [("s1", "gcp-vertex", "smoke-test", "cloud-private")]
+
+
+@pytest.mark.asyncio
 async def test_premium_quota_charges_gpt55(monkeypatch):
     persisted = []
 

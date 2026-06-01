@@ -17,6 +17,13 @@
  */
 import { create } from 'zustand';
 import type { User } from '@/types/agent';
+import {
+  buildLlmErrorRecord,
+  clearLlmErrorOnNewPrompt,
+  clearLlmErrorOnSuccessfulRequest,
+  type LLMErrorInput,
+  type LLMErrorRecord,
+} from '@/lib/llm-error-recovery';
 
 export interface PlanItem {
   id: string;
@@ -39,11 +46,7 @@ export interface PanelData {
 
 export type PanelView = 'script' | 'output';
 
-export interface LLMHealthError {
-  error: string;
-  errorType: 'auth' | 'credits' | 'rate_limit' | 'network' | 'unknown';
-  model: string;
-}
+export type LLMHealthError = LLMErrorRecord;
 
 export interface JobsUpgradeState {
   message: string;
@@ -54,6 +57,14 @@ export interface ToolBudgetBlockState {
   reason?: string | null;
   estimatedCostUsd?: number | null;
   remainingCapUsd?: number | null;
+}
+
+export interface JobRuntimeState {
+  tool?: string;
+  state?: string;
+  jobName?: string;
+  jobUrl?: string;
+  outputDir?: string;
 }
 
 export type ActivityStatus =
@@ -139,6 +150,9 @@ interface AgentStore {
   // Job statuses (tool_call_id -> job status) for HF jobs
   jobStatuses: Record<string, string>;
 
+  // Runtime job metadata emitted by long-running backends such as Vertex AI.
+  jobRuntimeStates: Record<string, JobRuntimeState>;
+
   // Trackio dashboard config per tool call (tool_call_id -> {spaceId, project?})
   // Set by hf_jobs / sandbox_create tools when the agent declares trackio_space_id;
   // the UI uses it to embed the live dashboard via an iframe.
@@ -173,6 +187,9 @@ interface AgentStore {
   setActivityStatus: (status: ActivityStatus) => void;
   setUser: (user: User | null) => void;
   setLlmHealthError: (error: LLMHealthError | null) => void;
+  reportLlmHealthError: (error: LLMErrorInput) => LLMHealthError;
+  clearLlmErrorForNewRequest: (sessionId: string, requestId: string) => void;
+  clearLlmErrorForSuccessfulRequest: (sessionId: string, requestId?: string | null) => void;
   setClaudeQuotaExhausted: (exhausted: boolean) => void;
   setJobsUpgradeRequired: (state: JobsUpgradeState | null) => void;
 
@@ -194,6 +211,9 @@ interface AgentStore {
 
   setJobStatus: (toolCallId: string, status: string) => void;
   getJobStatus: (toolCallId: string) => string | undefined;
+
+  setJobRuntimeState: (toolCallId: string, patch: JobRuntimeState) => void;
+  getJobRuntimeState: (toolCallId: string) => JobRuntimeState | undefined;
 
   setTrackioDashboard: (toolCallId: string, spaceId: string, project?: string) => void;
   getTrackioDashboard: (toolCallId: string) => { spaceId: string; project?: string } | undefined;
@@ -306,6 +326,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   editedScripts: {},
   jobUrls: {},
   jobStatuses: {},
+  jobRuntimeStates: {},
   trackioDashboards: loadTrackioDashboards(),
   toolErrors: loadToolErrors(),
   rejectedTools: loadRejectedTools(),
@@ -407,6 +428,17 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   setActivityStatus: (status) => set({ activityStatus: status }),
   setUser: (user) => set({ user }),
   setLlmHealthError: (error) => set({ llmHealthError: error }),
+  reportLlmHealthError: (error) => {
+    const record = buildLlmErrorRecord(error);
+    set({ llmHealthError: record });
+    return record;
+  },
+  clearLlmErrorForNewRequest: (sessionId, requestId) => set((state) => ({
+    llmHealthError: clearLlmErrorOnNewPrompt(state.llmHealthError, sessionId, requestId),
+  })),
+  clearLlmErrorForSuccessfulRequest: (sessionId, requestId) => set((state) => ({
+    llmHealthError: clearLlmErrorOnSuccessfulRequest(state.llmHealthError, sessionId, requestId),
+  })),
   setClaudeQuotaExhausted: (exhausted) => set({ claudeQuotaExhausted: exhausted }),
   setJobsUpgradeRequired: (state) => set({ jobsUpgradeRequired: state }),
 
@@ -493,6 +525,20 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   },
 
   getJobStatus: (toolCallId) => get().jobStatuses[toolCallId],
+
+  setJobRuntimeState: (toolCallId, patch) => {
+    set((state) => ({
+      jobRuntimeStates: {
+        ...state.jobRuntimeStates,
+        [toolCallId]: {
+          ...state.jobRuntimeStates[toolCallId],
+          ...patch,
+        },
+      },
+    }));
+  },
+
+  getJobRuntimeState: (toolCallId) => get().jobRuntimeStates[toolCallId],
 
   // ── Trackio Dashboards ──────────────────────────────────────────────
 

@@ -94,3 +94,40 @@ def test_different_args_does_not_fire():
         _tool("c3", "bash", "ok"),
     ]
     assert check_for_doom_loop(msgs) is None
+
+
+def test_vertex_cooldown_countdown_results_still_fire():
+    """Cooldown messages with changing seconds are still the same stuck action."""
+
+    args = (
+        '{"operation":"logs","job_name":'
+        '"projects/test-project/locations/us-central1/customJobs/123"}'
+    )
+    msgs = [
+        _assistant("c1", "gcp_vertex_jobs", args),
+        _tool(
+            "c1",
+            "gcp_vertex_jobs",
+            "Vertex job monitoring is rate-limited for this active job.\n"
+            "Please wait about 97 seconds before calling again.",
+        ),
+        _assistant("c2", "gcp_vertex_jobs", args),
+        _tool(
+            "c2",
+            "gcp_vertex_jobs",
+            "Vertex job monitoring is rate-limited for this active job.\n"
+            "Please wait about 95 seconds before calling again.",
+        ),
+        _assistant("c3", "gcp_vertex_jobs", args),
+        _tool(
+            "c3",
+            "gcp_vertex_jobs",
+            "Vertex job monitoring is rate-limited for this active job.\n"
+            "Please wait about 93 seconds before calling again.",
+        ),
+    ]
+
+    prompt = check_for_doom_loop(msgs)
+    assert prompt is not None
+    assert "REPETITION GUARD" in prompt
+    assert "gcp_vertex_jobs" in prompt

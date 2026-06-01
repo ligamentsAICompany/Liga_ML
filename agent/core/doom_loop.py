@@ -8,6 +8,7 @@ and injects a corrective prompt to break the cycle.
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 
 from litellm import Message
@@ -53,7 +54,18 @@ def _hash_args(args_str: str) -> str:
     semantically-identical tool calls produce the same hash regardless of key
     order or whitespace.
     """
-    return hashlib.md5(_normalize_args(args_str).encode()).hexdigest()[:12]
+    return hashlib.md5(_normalize_for_hash(args_str).encode()).hexdigest()[:12]
+
+
+def _normalize_for_hash(value: str) -> str:
+    normalized = _normalize_args(value)
+    if normalized.startswith("Vertex job monitoring is rate-limited"):
+        normalized = re.sub(
+            r"Please wait about \d+ seconds",
+            "Please wait about <cooldown> seconds",
+            normalized,
+        )
+    return normalized
 
 
 def extract_recent_tool_signatures(
