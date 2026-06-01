@@ -27,11 +27,26 @@ const VERTEX_SUMMARY_FIELDS = [
   ['Trackio Space', 'trackio_space_id'],
 ] as const;
 const TRAINING_RESULT_HEADING = '## Liga Training Result';
+const SECRET_KEY_PATTERN = /token|secret|password|credential|private_key/i;
 
 function valueToString(value: unknown): string | null {
   if (value === undefined || value === null || value === '') return null;
   if (Array.isArray(value)) return value.map(String).join(' ');
   return String(value);
+}
+
+function maskSensitiveParameters(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskSensitiveParameters);
+  if (!value || typeof value !== 'object') return value;
+  const masked: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (SECRET_KEY_PATTERN.test(key)) {
+      masked[key] = '[REDACTED]';
+    } else {
+      masked[key] = maskSensitiveParameters(entry);
+    }
+  }
+  return masked;
 }
 
 function summaryValue(label: string, value: unknown): string | null {
@@ -166,7 +181,7 @@ export function createVertexRunPanel(args: Record<string, unknown>): {
       data: {
         title: 'Vertex AI Script',
         script: { content: args.script, language: 'python' },
-        parameters: args,
+        parameters: maskSensitiveParameters(args) as Record<string, unknown>,
       },
       view: 'script',
       editable: false,
@@ -185,7 +200,7 @@ export function createVertexRunPanel(args: Record<string, unknown>): {
           ].join('\n\n'),
           language: 'markdown',
         },
-        parameters: args,
+        parameters: maskSensitiveParameters(args) as Record<string, unknown>,
       },
       view: 'output',
       editable: false,
@@ -197,7 +212,7 @@ export function createVertexRunPanel(args: Record<string, unknown>): {
       data: {
         title: 'Vertex AI Command',
         script: { content: args.command.map(String).join(' '), language: 'bash' },
-        parameters: args,
+        parameters: maskSensitiveParameters(args) as Record<string, unknown>,
       },
       view: 'script',
       editable: false,

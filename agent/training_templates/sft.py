@@ -20,11 +20,13 @@ DEFAULT_PACKAGES = [
     "peft>=0.13,<1",
     "huggingface_hub>=0.25,<2",
     "google-cloud-storage>=2.18,<4",
+    "google-cloud-secret-manager>=2.20,<3",
     "trackio",
     "sentencepiece",
 ]
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
+VALID_TRACKIO_MODES = {"disabled", "reuse-existing", "create-if-allowed"}
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,7 @@ class SftTemplateConfig:
     learning_rate: float = 2e-4
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 8
+    trackio_mode: str = "disabled"
     trackio_project: str | None = None
     trackio_space_id: str | None = None
     run_name: str | None = None
@@ -69,6 +72,10 @@ def build_sft_training_script(config: SftTemplateConfig) -> str:
         raise ValueError(
             "output_policy must be one of: cloud-private, hf-hub, cloud-and-hf-hub"
         )
+    if config.trackio_mode not in VALID_TRACKIO_MODES:
+        raise ValueError(
+            "trackio_mode must be one of: disabled, reuse-existing, create-if-allowed"
+        )
     push_to_hub = config.output_policy in {"hf-hub", "cloud-and-hf-hub"}
     if push_to_hub and not config.hub_model_id.strip():
         raise ValueError("hub_model_id is required.")
@@ -91,6 +98,7 @@ def build_sft_training_script(config: SftTemplateConfig) -> str:
         "learning_rate": config.learning_rate,
         "per_device_train_batch_size": config.per_device_train_batch_size,
         "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "trackio_mode": config.trackio_mode,
         "trackio_project": config.trackio_project,
         "trackio_space_id": config.trackio_space_id,
         "run_name": config.run_name,
@@ -118,6 +126,22 @@ TRAINING_GOAL = CONFIG["training_goal"]
 OUTPUT_POLICY = CONFIG["output_policy"]
 PUSH_TO_HUB = OUTPUT_POLICY in {{"hf-hub", "cloud-and-hf-hub"}}
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+HF_TOKEN_SECRET_RESOURCE = os.environ.get("HF_TOKEN_SECRET_RESOURCE", "").strip()
+if not HF_TOKEN and HF_TOKEN_SECRET_RESOURCE:
+    try:
+        from google.cloud import secretmanager
+
+        secret_client = secretmanager.SecretManagerServiceClient()
+        secret_payload = secret_client.access_secret_version(
+            request={{"name": HF_TOKEN_SECRET_RESOURCE}}
+        ).payload.data.decode("utf-8")
+        HF_TOKEN = secret_payload.strip()
+    except Exception as exc:
+        print(
+            "Warning: HF_TOKEN_SECRET_RESOURCE could not be read; continuing without injected HF token. "
+            f"{{type(exc).__name__}}: {{exc}}",
+            flush=True,
+        )
 if PUSH_TO_HUB and not HF_TOKEN:
     raise RuntimeError(
         "HF_TOKEN or HUGGINGFACE_HUB_TOKEN is required to push the final model to Hugging Face Hub."
@@ -135,6 +159,13 @@ OUTPUT_DIR = (
 )
 RESULT_FILE_NAME = "liga_training_result.json"
 REQUIRED_PACKAGES = {packages_source}
+TRACKIO_MODE = (
+    os.environ.get("TRACKIO_MODE")
+    or CONFIG.get("trackio_mode")
+    or "disabled"
+).strip().lower()
+TRACKIO_WARNING = ""
+TRACKIO_ENABLED = False
 
 
 def install_dependencies() -> None:
@@ -186,6 +217,42 @@ def first_gs_uri(*values):
         if value and value.startswith("gs://"):
             return value
     return ""
+
+
+def _trackio_failure_message(exc):
+    text = str(exc)
+    lowered = text.lower()
+    if "429" in lowered or "too many requests" in lowered or "rate limit" in lowered:
+        return "Trackio Space creation failed with 429; continuing training without Trackio."
+    return "Trackio disabled or unavailable; continuing training without Trackio."
+
+
+def configure_trackio():
+    global TRACKIO_WARNING
+    trackio_project = CONFIG.get("trackio_project") or os.environ.get("TRACKIO_PROJECT")
+    trackio_space_id = CONFIG.get("trackio_space_id") or os.environ.get("TRACKIO_SPACE_ID")
+    mode = TRACKIO_MODE if TRACKIO_MODE in {{"disabled", "reuse-existing", "create-if-allowed"}} else "disabled"
+    if mode == "disabled":
+        TRACKIO_WARNING = "Trackio disabled for this run."
+        return False, trackio_project, trackio_space_id
+    if mode == "reuse-existing":
+        if not trackio_space_id:
+            TRACKIO_WARNING = "Trackio reuse-existing requested but TRACKIO_SPACE_ID was not provided; continuing without Trackio."
+            print("Warning: " + TRACKIO_WARNING, flush=True)
+            return False, trackio_project, trackio_space_id
+        try:
+            api = HfApi(token=HF_TOKEN)
+            api.repo_info(repo_id=trackio_space_id, repo_type="space")
+        except Exception as exc:
+            TRACKIO_WARNING = _trackio_failure_message(exc)
+            print("Warning: " + TRACKIO_WARNING, flush=True)
+            return False, trackio_project, trackio_space_id
+        return True, trackio_project, trackio_space_id
+    if mode == "create-if-allowed" and (trackio_project or trackio_space_id):
+        return True, trackio_project, trackio_space_id
+    TRACKIO_WARNING = "Trackio create-if-allowed requested without TRACKIO_PROJECT or TRACKIO_SPACE_ID; continuing without Trackio."
+    print("Warning: " + TRACKIO_WARNING, flush=True)
+    return False, trackio_project, trackio_space_id
 
 
 def _string_value(example, key):
@@ -318,6 +385,9 @@ def write_result(final_dir, status, gcs_output_dir, eval_metrics, train_rows, ev
         "eval": eval_metrics,
         "train_rows": train_rows,
         "eval_rows": eval_rows,
+        "trackio_enabled": TRACKIO_ENABLED,
+        "trackio_mode": TRACKIO_MODE,
+        "trackio_warning": TRACKIO_WARNING,
     }}
     final_dir.mkdir(parents=True, exist_ok=True)
     result_path = final_dir / RESULT_FILE_NAME
@@ -326,14 +396,14 @@ def write_result(final_dir, status, gcs_output_dir, eval_metrics, train_rows, ev
 
 
 def main() -> None:
+    global TRACKIO_ENABLED, TRACKIO_WARNING
     train_dataset, eval_dataset = prepare_datasets()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, token=HF_TOKEN)
 
-    trackio_project = CONFIG.get("trackio_project") or os.environ.get("TRACKIO_PROJECT")
-    trackio_space_id = CONFIG.get("trackio_space_id") or os.environ.get("TRACKIO_SPACE_ID")
+    TRACKIO_ENABLED, trackio_project, trackio_space_id = configure_trackio()
     training_kwargs = dict(
         output_dir=OUTPUT_DIR,
         num_train_epochs=int(CONFIG["num_train_epochs"]),
@@ -346,8 +416,9 @@ def main() -> None:
         save_strategy="epoch",
         fp16=True,
         gradient_checkpointing=True,
+        optim="adafactor",
         disable_tqdm=True,
-        report_to=["trackio"] if (trackio_project or trackio_space_id) else [],
+        report_to=["trackio"] if TRACKIO_ENABLED else [],
         remove_unused_columns=False,
         push_to_hub=PUSH_TO_HUB,
         packing=False,
@@ -366,16 +437,30 @@ def main() -> None:
         training_kwargs["eval_strategy"] = "steps"
         training_kwargs["eval_steps"] = 10
 
-    training_args = SFTConfig(**training_kwargs)
+    def build_trainer():
+        training_args = SFTConfig(**training_kwargs)
+        return SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+        )
 
-    trainer = SFTTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-    )
-    trainer.train()
+    try:
+        trainer = build_trainer()
+        trainer.train()
+    except Exception as exc:
+        if not TRACKIO_ENABLED or "trackio" not in str(exc).lower() and "space" not in str(exc).lower() and "429" not in str(exc):
+            raise
+        TRACKIO_WARNING = _trackio_failure_message(exc)
+        print("Warning: " + TRACKIO_WARNING, flush=True)
+        TRACKIO_ENABLED = False
+        training_kwargs["report_to"] = []
+        training_kwargs.pop("project", None)
+        training_kwargs.pop("trackio_space_id", None)
+        trainer = build_trainer()
+        trainer.train()
 
     final_dir = Path(OUTPUT_DIR) / "final"
     trainer.save_model(str(final_dir))
@@ -442,6 +527,8 @@ def main() -> None:
     print(f"LIGA_GCS_OUTPUT_DIR={{gcs_output_dir}}", flush=True)
     print(f"LIGA_EVAL_RESULT_JSON={{eval_json}}", flush=True)
     print(f"LIGA_RESULT_FILE={{RESULT_FILE_NAME}}", flush=True)
+    print(f"LIGA_TRACKIO_ENABLED={{str(TRACKIO_ENABLED).lower()}}", flush=True)
+    print(f"LIGA_TRACKIO_WARNING={{TRACKIO_WARNING}}", flush=True)
 
 
 if __name__ == "__main__":

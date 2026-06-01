@@ -73,11 +73,14 @@ def test_sensitive_domains_default_to_cloud_private():
         assert default_output_policy_for_domain(domain, "gcp-vertex") == "cloud-private"
 
 
-def test_general_domains_default_to_cloud_and_hf_hub():
+def test_gcp_vertex_defaults_to_cloud_private_even_for_general_domains():
     assert (
         default_output_policy_for_domain("customer_support", "gcp-vertex")
-        == "cloud-and-hf-hub"
+        == "cloud-private"
     )
+
+
+def test_general_hf_domains_default_to_cloud_and_hf_hub():
     assert default_output_policy_for_domain("general", "hf-jobs") == "cloud-and-hf-hub"
 
 

@@ -98,6 +98,7 @@ class TrainingPlannerTool:
             budget_preference=str(params.get("budget_preference") or "balanced"),
             user_model_preference=params.get("user_model_preference"),
             intent_hint=params.get("intent_hint"),
+            full_dataset_approved=params.get("full_dataset_approved") is True,
         )
         return {
             "formatted": format_training_plan(plan),
@@ -174,6 +175,10 @@ TRAINING_PLANNER_TOOL_SPEC = {
             "intent_hint": {
                 "type": "string",
                 "description": "Optional short user-intent text to help agent-decide choose smoke-test or production.",
+            },
+            "full_dataset_approved": {
+                "type": "boolean",
+                "description": "Set true only after explicit approval to plan full-dataset cloud training. Otherwise GCloud production plans use capped pilot samples.",
             },
         },
         "required": ["operation"],

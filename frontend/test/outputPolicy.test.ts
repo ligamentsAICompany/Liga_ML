@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
@@ -68,4 +69,12 @@ test('detects whether output policy requires Hub or provider storage', () => {
   assert.equal(outputPolicyRequiresCloudStorage('cloud-private'), true);
   assert.equal(outputPolicyRequiresCloudStorage('hf-hub'), false);
   assert.equal(outputPolicyRequiresCloudStorage('cloud-and-hf-hub'), true);
+});
+
+test('vertex panel source masks secret-like parameters before storing panel data', () => {
+  const source = readFileSync('src/lib/vertex-job-panel.ts', 'utf8');
+
+  assert.match(source, /SECRET_KEY_PATTERN/);
+  assert.match(source, /maskSensitiveParameters/);
+  assert.doesNotMatch(source, /HF_TOKEN.*parameters: args/);
 });

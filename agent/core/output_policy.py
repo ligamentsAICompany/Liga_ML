@@ -102,7 +102,9 @@ def is_sensitive_domain(domain: str | None) -> bool:
 
 
 def default_output_policy_for_domain(domain: str | None, provider: str) -> str:
-    del provider  # Defaults are domain-driven; provider changes the destination label.
+    normalized_provider = (provider or "").strip().lower()
+    if normalized_provider == "gcp-vertex":
+        return OUTPUT_POLICY_CLOUD_PRIVATE
     if is_sensitive_domain(domain):
         return OUTPUT_POLICY_CLOUD_PRIVATE
     return OUTPUT_POLICY_CLOUD_AND_HF_HUB

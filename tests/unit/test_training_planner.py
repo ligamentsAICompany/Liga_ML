@@ -33,7 +33,8 @@ def test_production_returns_stronger_model_and_hardware_settings():
         "meta-llama/Llama-3.2-3B-Instruct",
         "mistralai/Mistral-7B-Instruct-v0.3",
     }
-    assert plan.training_args["max_train_samples"] is None
+    assert plan.training_args["max_train_samples"] == 500
+    assert plan.training_args["max_eval_samples"] == 50
     assert 1 <= plan.training_args["num_train_epochs"] <= 3
     assert plan.training_args["max_length"] >= 1024
     assert plan.recommended_hardware["machine_type"] == "n1-standard-16"
@@ -183,3 +184,34 @@ def test_missing_dataset_summary_requires_dataset_discovery():
     combined = " ".join(plan.risks + plan.reasoning).lower()
     assert "dataset discovery" in combined
     assert "before final training plan" in combined
+
+
+def test_gcp_large_dataset_uses_capped_production_pilot_without_full_approval():
+    plan = recommend_training_plan(
+        provider="gcp-vertex",
+        domain="manufacturing",
+        training_goal="production",
+        dataset_summary={"rows": 199_867},
+        budget_preference="low",
+        intent_hint="Use a Llama model to fine-tune on hardware dataset using GCloud",
+    )
+
+    assert plan.output_policy == "cloud-private"
+    assert plan.training_args["max_train_samples"] == 100
+    assert plan.training_args["max_eval_samples"] == 20
+    assert any(
+        "Full dataset training requires separate approval" in risk
+        for risk in plan.risks
+    )
+
+
+def test_gcp_full_dataset_approval_allows_uncapped_plan():
+    plan = recommend_training_plan(
+        provider="gcp-vertex",
+        domain="manufacturing",
+        training_goal="production",
+        dataset_summary={"rows": 20_000},
+        full_dataset_approved=True,
+    )
+
+    assert plan.training_args["max_train_samples"] is None

@@ -6,6 +6,7 @@ from typing import Any
 
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
+VALID_TRACKIO_MODES = {"disabled", "reuse-existing", "create-if-allowed"}
 
 
 def _is_positive_number(value: Any) -> bool:
@@ -28,12 +29,24 @@ def _validate_positive_field(
         errors.append(f"{field} must be positive{suffix}")
 
 
+def _optional_int(params: dict[str, Any], field: str) -> int | None:
+    value = params.get(field)
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
     """Return human-readable validation errors for an SFT template request."""
 
     errors: list[str] = []
     output_policy = str(params.get("output_policy") or "cloud-and-hf-hub").strip()
     training_goal = str(params.get("training_goal") or "agent-decide").strip()
+    trackio_mode = str(params.get("trackio_mode") or "disabled").strip()
 
     if training_goal not in VALID_TRAINING_GOALS:
         errors.append(
@@ -42,6 +55,10 @@ def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
     if output_policy not in VALID_OUTPUT_POLICIES:
         errors.append(
             "output_policy must be one of: cloud-private, hf-hub, cloud-and-hf-hub"
+        )
+    if trackio_mode not in VALID_TRACKIO_MODES:
+        errors.append(
+            "trackio_mode must be one of: disabled, reuse-existing, create-if-allowed"
         )
 
     required_fields = ["dataset_name", "model_name"]
@@ -109,6 +126,21 @@ def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
     if params.get("flash_attention") or params.get("use_flash_attention"):
         errors.append(
             "flash attention is not allowed for the stable Vertex SFT template"
+        )
+
+    dataset_rows = _optional_int(params, "dataset_rows") or _optional_int(
+        params, "dataset_num_rows"
+    )
+    max_train_samples = _optional_int(params, "max_train_samples")
+    if (
+        dataset_rows is not None
+        and dataset_rows > 10_000
+        and max_train_samples is None
+        and params.get("full_dataset_approved") is True
+        and not params.get("max_run_hours")
+    ):
+        errors.append(
+            "full_dataset_approved=True for datasets over 10,000 rows requires max_run_hours for explicit cost-bounded approval"
         )
 
     submitted_text = " ".join(

@@ -41,6 +41,7 @@ class ToolApproval(BaseModel):
 
     tool_call_id: str
     approved: bool
+    approval_id: str | None = None
     feedback: str | None = None
     edited_script: str | None = None
     namespace: str | None = None
@@ -89,6 +90,12 @@ class PendingApprovalTool(BaseModel):
     tool: str
     tool_call_id: str
     arguments: dict[str, Any] = {}
+    approval_id: str | None = None
+    operation: str | None = None
+    provider: str | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+    status: str | None = None
 
 
 class SessionAutoApprovalInfo(BaseModel):

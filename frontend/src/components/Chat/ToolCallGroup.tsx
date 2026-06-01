@@ -24,6 +24,17 @@ import type { UIMessage } from 'ai';
 type DynamicToolPart = Extract<UIMessage['parts'][number], { type: 'dynamic-tool' }>;
 
 type ToolPartState = DynamicToolPart['state'];
+const SECRET_KEY_PATTERN = /token|secret|password|credential|private_key/i;
+
+function maskSensitiveParameters(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskSensitiveParameters);
+  if (!value || typeof value !== 'object') return value;
+  const masked: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    masked[key] = SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : maskSensitiveParameters(entry);
+  }
+  return masked;
+}
 
 /** Check if a tool part was cancelled (output-error with cancellation message). */
 function isCancelledTool(tool: DynamicToolPart): boolean {
@@ -548,7 +559,7 @@ function InlineApproval({
       const vertexPanel = createVertexRunPanel(args);
       if (!vertexPanel) return;
       setPanel(
-        { ...vertexPanel.data, parameters: { ...args, tool_call_id: toolCallId } },
+        { ...vertexPanel.data, parameters: maskSensitiveParameters({ ...args, tool_call_id: toolCallId }) as Record<string, unknown> },
         vertexPanel.view,
         vertexPanel.editable,
       );

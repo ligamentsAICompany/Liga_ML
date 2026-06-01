@@ -133,7 +133,7 @@ async def test_switching_cloud_provider_persists_for_session(monkeypatch):
         "session_id": "s1",
         "cloud_provider": "gcp-vertex",
         "training_goal": "agent-decide",
-        "output_policy": "cloud-and-hf-hub",
+        "output_policy": "cloud-private",
     }
     assert updated == [("s1", "gcp-vertex")]
 

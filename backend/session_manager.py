@@ -212,10 +212,18 @@ class SessionManager:
     def _serialize_pending_approval(self, session: Session) -> list[dict[str, Any]]:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
+        records = {
+            str(record.get("tool_call_id")): record
+            for record in (pending.get("approvals") or [])
+            if isinstance(record, dict) and record.get("tool_call_id")
+        }
         serialized: list[dict[str, Any]] = []
         for tc in tool_calls:
             if hasattr(tc, "model_dump"):
-                serialized.append(tc.model_dump(mode="json"))
+                raw = tc.model_dump(mode="json")
+                if record := records.get(str(getattr(tc, "id", ""))):
+                    raw.update(record)
+                serialized.append(raw)
             elif isinstance(tc, dict):
                 serialized.append(tc)
         return serialized
@@ -229,6 +237,11 @@ class SessionManager:
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
+        records = {
+            str(record.get("tool_call_id")): record
+            for record in (pending.get("approvals") or [])
+            if isinstance(record, dict) and record.get("tool_call_id")
+        }
         if not tool_calls:
             return None
         result: list[dict[str, Any]] = []
@@ -237,13 +250,15 @@ class SessionManager:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError, TypeError):
                 args = {}
-            result.append(
-                {
-                    "tool": getattr(tc.function, "name", None),
-                    "tool_call_id": getattr(tc, "id", None),
-                    "arguments": args,
-                }
-            )
+            tool_call_id = getattr(tc, "id", None)
+            payload = {
+                "tool": getattr(tc.function, "name", None),
+                "tool_call_id": tool_call_id,
+                "arguments": args,
+            }
+            if record := records.get(str(tool_call_id)):
+                payload.update(record)
+            result.append(payload)
         return result
 
     def _restore_pending_approval(
@@ -255,10 +270,27 @@ class SessionManager:
         from litellm import ChatCompletionMessageToolCall as ToolCall
 
         restored = []
+        records = []
         for raw in pending_approval:
             try:
                 if "function" in raw:
                     restored.append(ToolCall(**raw))
+                    records.append(
+                        {
+                            key: raw.get(key)
+                            for key in (
+                                "approval_id",
+                                "tool_call_id",
+                                "tool",
+                                "operation",
+                                "provider",
+                                "created_at",
+                                "expires_at",
+                                "status",
+                            )
+                            if raw.get(key) is not None
+                        }
+                    )
                 else:
                     restored.append(
                         ToolCall(
@@ -270,9 +302,27 @@ class SessionManager:
                             },
                         )
                     )
+                    records.append(
+                        {
+                            key: raw.get(key)
+                            for key in (
+                                "approval_id",
+                                "tool_call_id",
+                                "tool",
+                                "operation",
+                                "provider",
+                                "created_at",
+                                "expires_at",
+                                "status",
+                            )
+                            if raw.get(key) is not None
+                        }
+                    )
             except Exception as e:
                 logger.warning("Dropping malformed pending approval: %s", e)
-        session.pending_approval = {"tool_calls": restored} if restored else None
+        session.pending_approval = (
+            {"tool_calls": restored, "approvals": records} if restored else None
+        )
 
     @staticmethod
     def _pending_docs_for_api(
@@ -293,6 +343,12 @@ class SessionManager:
                         "tool": function.get("name"),
                         "tool_call_id": raw.get("id"),
                         "arguments": args,
+                        "approval_id": raw.get("approval_id"),
+                        "operation": raw.get("operation"),
+                        "provider": raw.get("provider"),
+                        "created_at": raw.get("created_at"),
+                        "expires_at": raw.get("expires_at"),
+                        "status": raw.get("status"),
                     }
                 )
             elif {"tool", "tool_call_id"}.issubset(raw):
@@ -301,6 +357,12 @@ class SessionManager:
                         "tool": raw.get("tool"),
                         "tool_call_id": raw.get("tool_call_id"),
                         "arguments": raw.get("arguments") or {},
+                        "approval_id": raw.get("approval_id"),
+                        "operation": raw.get("operation"),
+                        "provider": raw.get("provider"),
+                        "created_at": raw.get("created_at"),
+                        "expires_at": raw.get("expires_at"),
+                        "status": raw.get("status"),
                     }
                 )
         return result or None

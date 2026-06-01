@@ -30,6 +30,7 @@ def test_sft_template_generates_safe_vertex_training_script():
     assert "packing=False" in script
     assert "max_length=1024" in script
     assert "gradient_checkpointing=True" in script
+    assert 'optim="adafactor"' in script
     assert "disable_tqdm=True" in script
     assert "logging_first_step=True" in script
     assert "push_to_hub=PUSH_TO_HUB" in script
@@ -189,3 +190,48 @@ def test_sft_template_result_json_includes_output_policy_for_default_behavior():
     assert '"output_policy": OUTPUT_POLICY' in script
     assert "LIGA_FINAL_MODEL_URL=https://huggingface.co/{HUB_MODEL_ID}" in script
     assert "upload_folder_to_gcs(final_dir, gcs_output_dir)" in script
+
+
+def test_sft_template_defaults_trackio_disabled_and_non_fatal():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="example/dataset",
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            hub_model_id="",
+            output_policy="cloud-private",
+            trackio_project="unsafe-create",
+            trackio_space_id="owner/new-space",
+        )
+    )
+
+    ast.parse(script)
+    assert '"trackio_mode": "disabled"' in script
+    assert "TRACKIO_MODE = (" in script
+    assert 'report_to=["trackio"] if TRACKIO_ENABLED else []' in script
+    assert (
+        "Trackio disabled or unavailable; continuing training without Trackio."
+        in script
+    )
+    assert (
+        "Trackio Space creation failed with 429; continuing training without Trackio."
+        in script
+    )
+    assert '"trackio_enabled": TRACKIO_ENABLED' in script
+    assert "LIGA_TRACKIO_ENABLED=" in script
+
+
+def test_sft_template_reuse_existing_verifies_space_before_enabling_trackio():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="example/dataset",
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            hub_model_id="",
+            output_policy="cloud-private",
+            trackio_mode="reuse-existing",
+            trackio_space_id="owner/existing-space",
+        )
+    )
+
+    assert '"trackio_mode": "reuse-existing"' in script
+    assert 'api.repo_info(repo_id=trackio_space_id, repo_type="space")' in script
+    assert "reuse-existing requested but TRACKIO_SPACE_ID was not provided" in script

@@ -46,6 +46,11 @@ TERMINAL_JOB_STATES = {
 }
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
+DEFAULT_PILOT_MAX_TRAIN_SAMPLES = 500
+DEFAULT_PILOT_MAX_EVAL_SAMPLES = 50
+LOW_BUDGET_PILOT_MAX_TRAIN_SAMPLES = 100
+LOW_BUDGET_PILOT_MAX_EVAL_SAMPLES = 20
+LARGE_DATASET_ROW_THRESHOLD = 10_000
 
 
 def _slug(value: str) -> str:
@@ -99,6 +104,53 @@ def _default_output_dir(bucket: str) -> str:
 
 def _env_list(env: dict[str, Any]) -> list[dict[str, str]]:
     return [{"name": str(k), "value": str(v)} for k, v in sorted(env.items())]
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _pilot_caps(args: dict[str, Any]) -> tuple[int, int]:
+    budget = str(args.get("budget_preference") or "").strip().lower()
+    machine = str(args.get("machine_type") or "").strip().lower()
+    if budget == "low" or "standard-8" in machine:
+        return LOW_BUDGET_PILOT_MAX_TRAIN_SAMPLES, LOW_BUDGET_PILOT_MAX_EVAL_SAMPLES
+    return DEFAULT_PILOT_MAX_TRAIN_SAMPLES, DEFAULT_PILOT_MAX_EVAL_SAMPLES
+
+
+def _apply_dataset_scale_guardrails(args: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    dataset_rows = _optional_int(args.get("dataset_rows")) or _optional_int(
+        args.get("dataset_num_rows")
+    )
+    if dataset_rows is None or dataset_rows <= LARGE_DATASET_ROW_THRESHOLD:
+        return args, ""
+    if args.get("full_dataset_approved") is True:
+        return args, (
+            f"Dataset has about {dataset_rows:,} rows; full-dataset training was "
+            "explicitly approved for this cost-bounded Vertex run."
+        )
+    if _optional_int(args.get("max_train_samples")) is not None:
+        return args, (
+            f"Dataset has about {dataset_rows:,} rows; using caller-provided "
+            f"sample cap max_train_samples={args.get('max_train_samples')}."
+        )
+
+    train_cap, eval_cap = _pilot_caps(args)
+    capped = {**args, "max_train_samples": train_cap}
+    if _optional_int(capped.get("max_eval_samples")) is None:
+        capped["max_eval_samples"] = eval_cap
+    return capped, (
+        f"Dataset has about {dataset_rows:,} rows; for this production pilot the "
+        f"Vertex SFT template is capped at max_train_samples={train_cap} and "
+        f"max_eval_samples={capped['max_eval_samples']}. Full dataset training "
+        "requires a separate explicit approval."
+    )
 
 
 def _script_command(script: str, script_args: list[str] | None = None) -> list[str]:
@@ -194,7 +246,8 @@ class GcpVertexJobsTool:
         command = args.get("command")
         template = str(args.get("template") or "").strip().lower()
         training_goal = str(args.get("training_goal") or "agent-decide").strip()
-        output_policy = str(args.get("output_policy") or "cloud-and-hf-hub").strip()
+        output_policy = str(args.get("output_policy") or "cloud-private").strip()
+        trackio_mode = str(args.get("trackio_mode") or "disabled").strip()
         if training_goal not in VALID_TRAINING_GOALS:
             return self._error(
                 "training_goal must be one of: smoke-test, production, agent-decide"
@@ -204,6 +257,7 @@ class GcpVertexJobsTool:
                 "output_policy must be one of: cloud-private, hf-hub, cloud-and-hf-hub"
             )
         hf_model_target = ""
+        scale_warning = ""
         if template:
             if script or command:
                 return self._error(
@@ -213,10 +267,16 @@ class GcpVertexJobsTool:
                 return self._error(
                     f"Unsupported template: {template}. Available templates: sft."
                 )
+            args = {
+                **args,
+                "output_policy": output_policy,
+                "trackio_mode": trackio_mode,
+            }
             validation_errors = validate_sft_template_request(args)
             if validation_errors:
                 return self._error("; ".join(validation_errors))
             try:
+                args, scale_warning = _apply_dataset_scale_guardrails(args)
                 template_config = SftTemplateConfig(
                     dataset_name=str(args.get("dataset_name") or ""),
                     dataset_config=args.get("dataset_config"),
@@ -242,6 +302,7 @@ class GcpVertexJobsTool:
                     gradient_accumulation_steps=int(
                         args.get("gradient_accumulation_steps") or 8
                     ),
+                    trackio_mode=trackio_mode,
                     trackio_project=args.get("trackio_project"),
                     trackio_space_id=args.get("trackio_space_id"),
                     run_name=args.get("run_name"),
@@ -278,6 +339,7 @@ class GcpVertexJobsTool:
             machine_spec["accelerator_count"] = int(args.get("accelerator_count") or 1)
 
         env = {str(k): str(v) for k, v in (args.get("env") or {}).items()}
+        env.setdefault("TRACKIO_MODE", trackio_mode)
         if args.get("trackio_project"):
             env.setdefault("TRACKIO_PROJECT", str(args["trackio_project"]))
         if args.get("trackio_space_id"):
@@ -288,7 +350,17 @@ class GcpVertexJobsTool:
         env.setdefault("LIGA_ML_OUTPUT_POLICY", output_policy)
         env.setdefault("GOOGLE_CLOUD_PROJECT", config["project"])
         env.setdefault("GOOGLE_CLOUD_REGION", config["region"])
-        if self.session is not None and getattr(self.session, "hf_token", None):
+        if secret_resource := (
+            args.get("hf_token_secret_resource")
+            or os.environ.get("HF_TOKEN_SECRET_RESOURCE")
+        ):
+            env.setdefault("HF_TOKEN_SECRET_RESOURCE", str(secret_resource))
+        elif (
+            self.session is not None
+            and getattr(self.session, "hf_token", None)
+            and str(args.get("allow_insecure_hf_token_env") or "").lower()
+            in {"1", "true", "yes"}
+        ):
             env.setdefault("HF_TOKEN", self.session.hf_token)
 
         worker_pool_specs = [
@@ -351,6 +423,9 @@ class GcpVertexJobsTool:
             if hf_model_target
             else ""
         )
+        scale_warning_line = (
+            f"**Dataset scale guardrail:** {scale_warning}\n" if scale_warning else ""
+        )
         return {
             "formatted": (
                 "Vertex AI job submitted.\n\n"
@@ -361,6 +436,8 @@ class GcpVertexJobsTool:
                 f"**Output dir:** {output_dir}\n"
                 f"**Training goal:** {training_goal}\n"
                 f"**Output policy:** {output_policy}\n"
+                f"**Trackio mode:** {trackio_mode}\n"
+                f"{scale_warning_line}"
                 f"{hf_target_line}"
                 f"**Console:** {console_url}\n\n"
                 "Use `gcp_vertex_jobs` with `operation='inspect'` or `operation='logs'` "
@@ -384,10 +461,11 @@ class GcpVertexJobsTool:
             )
         client = self._job_service_client(config["region"])
         parent = f"projects/{config['project']}/locations/{config['region']}"
+        list_kwargs = {"parent": parent}
+        if args.get("filter"):
+            list_kwargs["filter"] = args.get("filter")
         jobs = await asyncio.to_thread(
-            lambda: list(
-                client.list_custom_jobs(parent=parent, filter=args.get("filter"))
-            )
+            lambda: list(client.list_custom_jobs(**list_kwargs))
         )
         lines = ["**Vertex AI jobs:**"]
         for job in jobs[: int(args.get("limit") or 20)]:
@@ -692,7 +770,7 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
                 "description": (
                     "Final model storage destination. cloud-private stores final artifacts in "
                     "GCS only and must not push to Hugging Face Hub. hf-hub pushes to Hub. "
-                    "cloud-and-hf-hub saves to GCS and pushes to Hub. Default: cloud-and-hf-hub."
+                    "cloud-and-hf-hub saves to GCS and pushes to Hub. Default for Vertex: cloud-private."
                 ),
             },
             "column_mapping": {
@@ -702,6 +780,18 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
             "max_train_samples": {
                 "type": "integer",
                 "description": "Optional cap for template='sft' smoke or small runs.",
+            },
+            "dataset_rows": {
+                "type": "integer",
+                "description": "Optional total dataset row count for scale guardrails. Datasets over 10,000 rows are pilot-capped unless full_dataset_approved=True.",
+            },
+            "dataset_num_rows": {
+                "type": "integer",
+                "description": "Alias for dataset_rows.",
+            },
+            "full_dataset_approved": {
+                "type": "boolean",
+                "description": "Set true only after explicit separate approval to train the full dataset when it exceeds 10,000 rows.",
             },
             "max_eval_samples": {
                 "type": "integer",
@@ -734,6 +824,19 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
             "trackio_project": {
                 "type": "string",
                 "description": "Trackio project name for template='sft'.",
+            },
+            "trackio_mode": {
+                "type": "string",
+                "enum": ["disabled", "reuse-existing", "create-if-allowed"],
+                "description": "Trackio behavior. Default: disabled for Vertex jobs. Space creation is allowed only with create-if-allowed.",
+            },
+            "hf_token_secret_resource": {
+                "type": "string",
+                "description": "Optional Secret Manager resource containing an HF token, e.g. projects/<project>/secrets/<secret>/versions/latest. Preferred over raw env tokens.",
+            },
+            "allow_insecure_hf_token_env": {
+                "type": "boolean",
+                "description": "Emergency compatibility escape hatch. If true, pass the session HF token as a raw Vertex env var; avoid for production.",
             },
             "trackio_space_id": {
                 "type": "string",

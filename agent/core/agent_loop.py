@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -208,6 +208,7 @@ def _validate_tool_args(tool_args: dict) -> tuple[bool, str | None]:
 _IMMEDIATE_HF_JOB_RUNS = {"run", "uv"}
 _IMMEDIATE_GCP_VERTEX_JOB_RUNS = {"run"}
 _APPROVAL_REQUIRED_GCP_VERTEX_OPS = {"run", "cancel"}
+_APPROVAL_TTL_MINUTES = 30
 
 
 @dataclass(frozen=True)
@@ -556,6 +557,79 @@ def _approval_metadata(
         metadata.setdefault("dataset_config", upload.get("config_name"))
         metadata.setdefault("dataset_rows", upload.get("normalized_row_count"))
     return {key: value for key, value in metadata.items() if value not in {None, ""}}
+
+
+def _approval_record(
+    tc: ToolCall, tool_name: str, tool_args: dict[str, Any]
+) -> dict[str, Any]:
+    operation = normalize_tool_operation(tool_args.get("operation"))
+    created_at = datetime.now(UTC)
+    return {
+        "approval_id": tc.id,
+        "tool_call_id": tc.id,
+        "tool": tool_name,
+        "operation": operation,
+        "provider": "gcp-vertex"
+        if tool_name == "gcp_vertex_jobs"
+        else "hf-jobs"
+        if tool_name == "hf_jobs"
+        else None,
+        "created_at": created_at.isoformat(),
+        "expires_at": (
+            created_at + timedelta(minutes=_APPROVAL_TTL_MINUTES)
+        ).isoformat(),
+        "status": "pending",
+    }
+
+
+def _pending_approval_records(session: Session) -> dict[str, dict[str, Any]]:
+    pending = session.pending_approval or {}
+    records = pending.get("approvals") or []
+    return {
+        str(record.get("tool_call_id")): record
+        for record in records
+        if isinstance(record, dict) and record.get("tool_call_id")
+    }
+
+
+def _is_expired_approval_record(record: dict[str, Any]) -> bool:
+    try:
+        expires_at = datetime.fromisoformat(str(record.get("expires_at")))
+    except (TypeError, ValueError):
+        return False
+    return datetime.now(UTC) > expires_at
+
+
+def _looks_like_typed_approval(text: str | None) -> bool:
+    normalized = (text or "").strip().lower()
+    return normalized in {"approve", "approved", "yes", "y", "ok", "go", "run it"}
+
+
+async def _explain_typed_approval_not_launched(session: Session) -> str:
+    records = list(_pending_approval_records(session).values())
+    active_ids = [
+        str(record.get("approval_id") or record.get("tool_call_id"))
+        for record in records
+        if not _is_expired_approval_record(record)
+    ]
+    suffix = f" Active approval ID: {active_ids[0]}." if len(active_ids) == 1 else ""
+    message = (
+        "I did not launch the pending job from a typed approval. Use the approval "
+        "card so the exact tool call, provider, output policy, runtime, and cost "
+        f"match the pending request.{suffix}"
+    )
+    await _emit_visible_assistant_message(session, message)
+    await session.send_event(
+        Event(
+            event_type="error",
+            data={
+                "error": message,
+                "error_type": "approval_recovery",
+                "active": True,
+            },
+        )
+    )
+    return message
 
 
 async def _record_manual_approved_spend_if_needed(
@@ -1570,6 +1644,9 @@ class Handlers:
         # Clear any stale cancellation flag from a previous run
         session.reset_cancel()
 
+        if text and session.pending_approval and _looks_like_typed_approval(text):
+            return await _explain_typed_approval_not_launched(session)
+
         # If there's a pending approval and the user sent a new message,
         # abandon the pending tools so the LLM context stays valid.
         if text and session.pending_approval:
@@ -2056,6 +2133,7 @@ class Handlers:
                     # Prepare batch approval data
                     tools_data = []
                     blocked_payloads = []
+                    approval_records = []
                     for tc, tool_name, tool_args, decision in approval_required_tools:
                         # Resolve sandbox file paths for hf_jobs scripts so the
                         # frontend can display & edit the actual file content.
@@ -2076,6 +2154,9 @@ class Handlers:
                             "arguments": tool_args,
                             "tool_call_id": tc.id,
                         }
+                        approval_record = _approval_record(tc, tool_name, tool_args)
+                        approval_records.append(approval_record)
+                        tool_payload.update(approval_record)
                         metadata = _approval_metadata(session, tool_name, tool_args)
                         if metadata:
                             tool_payload["metadata"] = metadata
@@ -2112,6 +2193,7 @@ class Handlers:
                     # Store all approval-requiring tools (ToolCall objects for execution)
                     session.pending_approval = {
                         "tool_calls": [tc for tc, _, _, _ in approval_required_tools],
+                        "approvals": approval_records,
                     }
 
                     # Return early - wait for EXEC_APPROVAL operation
@@ -2236,6 +2318,7 @@ class Handlers:
 
         # Create a map of tool_call_id -> approval decision
         approval_map = {a["tool_call_id"]: a for a in approvals}
+        approval_records = _pending_approval_records(session)
         for a in approvals:
             if a.get("edited_script"):
                 logger.info(
@@ -2274,8 +2357,38 @@ class Handlers:
                 continue
 
             approval_decision = approval_map.get(tc.id, {"approved": False})
+            approval_record = approval_records.get(tc.id)
+            if approval_record and _is_expired_approval_record(approval_record):
+                rejected_tasks.append(
+                    (
+                        tc,
+                        tool_name,
+                        {
+                            "approved": False,
+                            "feedback": (
+                                "Original approval expired. Regenerate the preflight "
+                                "before launching this job."
+                            ),
+                        },
+                    )
+                )
+                continue
 
             if approval_decision.get("approved", False):
+                if approval_decision.get("approval_id") not in (None, tc.id):
+                    rejected_tasks.append(
+                        (
+                            tc,
+                            tool_name,
+                            {
+                                "approved": False,
+                                "feedback": (
+                                    "Approval ID did not match the active pending job."
+                                ),
+                            },
+                        )
+                    )
+                    continue
                 edited_script = approval_decision.get("edited_script")
                 was_edited = False
                 if edited_script and "script" in tool_args:

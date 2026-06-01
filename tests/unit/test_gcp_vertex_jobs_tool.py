@@ -40,6 +40,7 @@ class FakeState:
 
 class FakeJobServiceClient:
     get_calls = 0
+    list_calls = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -53,6 +54,10 @@ class FakeJobServiceClient:
             create_time="created",
             update_time="updated",
         )
+
+    def list_custom_jobs(self, **kwargs):
+        FakeJobServiceClient.list_calls.append(kwargs)
+        return []
 
 
 class FakeLoggingClient:
@@ -108,7 +113,7 @@ async def test_run_command_submits_vertex_custom_job(monkeypatch):
     env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
     assert env["DATASET_ID"] == "ligaments/gst"
     assert env["AIP_MODEL_DIR"] == "gs://liga-training/outputs/gst-train"
-    assert env["HF_TOKEN"] == "hf-session-token"
+    assert "HF_TOKEN" not in env
     assert job.run_kwargs["sync"] is False
     assert session.events[0].data["tool"] == "gcp_vertex_jobs"
     assert session.events[0].data["state"] == "running"
@@ -160,6 +165,7 @@ async def test_run_sft_template_generates_vertex_training_script(monkeypatch):
             "dataset_config": "en",
             "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
             "hub_model_id": "ligaments-dev/medical-qwen2.5-0.5b-sft",
+            "output_policy": "cloud-and-hf-hub",
             "column_mapping": {
                 "user": "Question",
                 "assistant": ["Complex_CoT", "Response"],
@@ -181,9 +187,10 @@ async def test_run_sft_template_generates_vertex_training_script(monkeypatch):
     assert "FreedomIntelligence/medical-o1-reasoning-SFT" in decoded_script
     assert "packing=False" in decoded_script
     env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
+    assert env["TRACKIO_MODE"] == "disabled"
     assert env["TRACKIO_PROJECT"] == "medical-sft"
     assert env["TRACKIO_SPACE_ID"] == "ligaments-dev/ml-intern-trackio"
-    assert env["HF_TOKEN"] == "hf-session-token"
+    assert "HF_TOKEN" not in env
 
 
 @pytest.mark.asyncio
@@ -277,6 +284,92 @@ async def test_run_sft_template_accepts_training_goal_and_cloud_private_policy(
     assert '"output_policy": "cloud-private"' in decoded_script
     assert "push_to_hub=PUSH_TO_HUB" in decoded_script
     assert 'print("LIGA_FINAL_MODEL_URL=", flush=True)' in decoded_script
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_defaults_to_cloud_private_and_caps_large_dataset(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeCustomJob.instances = []
+
+    tool = GcpVertexJobsTool(custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "display_name": "hardware-llama-pilot",
+            "dataset_name": "ligaments-dev/hardware-upload",
+            "model_name": "meta-llama/Llama-3.2-3B-Instruct",
+            "dataset_rows": 199_867,
+        }
+    )
+
+    assert not result.get("isError")
+    assert "**Output policy:** cloud-private" in result["formatted"]
+    assert "max_train_samples=500" in result["formatted"]
+    worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
+    encoded_runner = worker_pool["container_spec"]["command"][-1]
+    encoded_script = re.search(r"b64decode\('([^']+)'\)", encoded_runner).group(1)
+    decoded_script = base64.b64decode(encoded_script).decode("utf-8")
+    assert '"output_policy": "cloud-private"' in decoded_script
+    assert '"max_train_samples": 500' in decoded_script
+    assert '"max_eval_samples": 50' in decoded_script
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_uses_secret_manager_resource_for_hf_token(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    monkeypatch.setenv(
+        "HF_TOKEN_SECRET_RESOURCE",
+        "projects/test-project/secrets/hf-token/versions/latest",
+    )
+    FakeCustomJob.instances = []
+
+    session = FakeSession()
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "dataset_name": "ligaments-dev/private-dataset",
+            "model_name": "meta-llama/Llama-3.2-3B-Instruct",
+            "output_policy": "cloud-private",
+        }
+    )
+
+    assert not result.get("isError")
+    worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
+    env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
+    assert env["HF_TOKEN_SECRET_RESOURCE"] == (
+        "projects/test-project/secrets/hf-token/versions/latest"
+    )
+    assert "HF_TOKEN" not in env
+    assert "hf-session-token" not in result["formatted"]
+
+
+@pytest.mark.asyncio
+async def test_ps_omits_filter_arg_when_not_provided(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeJobServiceClient.list_calls = []
+
+    tool = GcpVertexJobsTool(job_service_client_cls=FakeJobServiceClient)
+
+    result = await tool.execute({"operation": "ps"})
+
+    assert not result.get("isError")
+    assert "No Vertex AI custom jobs found." in result["formatted"]
+    assert FakeJobServiceClient.list_calls == [
+        {"parent": "projects/test-project/locations/us-central1"}
+    ]
 
 
 @pytest.mark.asyncio

@@ -168,33 +168,61 @@ def _choose_training_goal(
     return "production", reasoning
 
 
-def _production_training_args(dataset_rows: int | None, budget: str) -> dict[str, Any]:
+def _production_training_args(
+    dataset_rows: int | None,
+    budget: str,
+    provider: str,
+    *,
+    full_dataset_approved: bool = False,
+) -> dict[str, Any]:
+    if provider == "gcp-vertex" and not full_dataset_approved:
+        train_cap, eval_cap = (100, 20) if budget == "low" else (500, 50)
+        return {
+            "max_train_samples": train_cap,
+            "max_eval_samples": eval_cap,
+            "num_train_epochs": 1,
+            "max_length": 2048 if budget == "performance" else 1024,
+            "max_run_hours": 3 if budget == "performance" else 2,
+        }
+
     if dataset_rows is None:
         max_train_samples: int | None = None
+        max_eval_samples: int | None = None
         epochs = 2
     elif dataset_rows < 1_000:
         max_train_samples = None
+        max_eval_samples = None
         epochs = 3
     elif dataset_rows < 10_000:
         max_train_samples = None
+        max_eval_samples = None
         epochs = 2
     elif dataset_rows <= 50_000:
         max_train_samples = None
+        max_eval_samples = None
         epochs = 1
     else:
         max_train_samples = 50_000 if budget != "performance" else 100_000
+        max_eval_samples = None
         epochs = 1
 
     return {
         "max_train_samples": max_train_samples,
-        "max_eval_samples": None,
+        "max_eval_samples": max_eval_samples,
         "num_train_epochs": epochs,
         "max_length": 2048 if budget == "performance" else 1024,
         "max_run_hours": 4 if budget == "performance" else 2,
     }
 
 
-def _training_args(goal: str, dataset_rows: int | None, budget: str) -> dict[str, Any]:
+def _training_args(
+    goal: str,
+    dataset_rows: int | None,
+    budget: str,
+    provider: str,
+    *,
+    full_dataset_approved: bool = False,
+) -> dict[str, Any]:
     if goal == "smoke-test":
         return {
             "max_train_samples": 5,
@@ -203,7 +231,12 @@ def _training_args(goal: str, dataset_rows: int | None, budget: str) -> dict[str
             "max_length": 512,
             "max_run_hours": 1,
         }
-    return _production_training_args(dataset_rows, budget)
+    return _production_training_args(
+        dataset_rows,
+        budget,
+        provider,
+        full_dataset_approved=full_dataset_approved,
+    )
 
 
 def _recommended_hardware(provider: str, goal: str) -> dict[str, Any]:
@@ -262,6 +295,7 @@ def recommend_training_plan(
     budget_preference: str = "balanced",
     user_model_preference: str | None = None,
     intent_hint: str | None = None,
+    full_dataset_approved: bool = False,
 ) -> TrainingPlan:
     normalized_provider = normalize_provider(provider)
     normalized_domain = normalize_domain(domain)
@@ -311,6 +345,14 @@ def recommend_training_plan(
 
     if rows is not None:
         reasoning.append(f"Dataset summary reports {rows} rows.")
+        if (
+            normalized_provider == "gcp-vertex"
+            and rows > 10_000
+            and not full_dataset_approved
+        ):
+            risks.append(
+                f"Dataset has about {rows:,} rows; use a capped production pilot first. Full dataset training requires separate approval."
+            )
     reasoning.append(
         "Recommendations are static planning defaults and do not guarantee provider hardware availability."
     )
@@ -324,7 +366,13 @@ def recommend_training_plan(
         smoke_test_model=SMOKE_TEST_MODEL,
         production_model=production_model,
         recommended_hardware=_recommended_hardware(normalized_provider, goal),
-        training_args=_training_args(goal, rows, budget),
+        training_args=_training_args(
+            goal,
+            rows,
+            budget,
+            normalized_provider,
+            full_dataset_approved=full_dataset_approved,
+        ),
         output_policy=output_policy,
         privacy_warnings=privacy_warnings,
         risks=risks,

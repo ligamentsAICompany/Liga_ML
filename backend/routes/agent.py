@@ -157,6 +157,14 @@ def _output_policy_or_default(value: Any) -> str:
     return "cloud-and-hf-hub"
 
 
+def _output_policy_for_provider(value: Any, cloud_provider: str) -> str:
+    if value in VALID_OUTPUT_POLICIES:
+        return str(value)
+    if cloud_provider == "gcp-vertex":
+        return "cloud-private"
+    return "cloud-and-hf-hub"
+
+
 async def _model_override_for_new_session(
     request: Request,
     requested_model: str | None,
@@ -515,7 +523,9 @@ async def create_session(
         model = body.get("model")
         cloud_provider = _cloud_provider_or_default(body.get("cloud_provider"))
         training_goal = _training_goal_or_default(body.get("training_goal"))
-        output_policy = _output_policy_or_default(body.get("output_policy"))
+        output_policy = _output_policy_for_provider(
+            body.get("output_policy"), cloud_provider
+        )
 
     valid_ids = {m["id"] for m in AVAILABLE_MODELS}
     if model and model not in valid_ids:
@@ -570,7 +580,9 @@ async def restore_session_summary(
     model = body.get("model")
     cloud_provider = _cloud_provider_or_default(body.get("cloud_provider"))
     training_goal = _training_goal_or_default(body.get("training_goal"))
-    output_policy = _output_policy_or_default(body.get("output_policy"))
+    output_policy = _output_policy_for_provider(
+        body.get("output_policy"), cloud_provider
+    )
     valid_ids = {m["id"] for m in AVAILABLE_MODELS}
     if model and model not in valid_ids:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model}")
@@ -666,7 +678,9 @@ async def set_session_cloud_provider(
     if cloud_provider not in VALID_CLOUD_PROVIDERS:
         raise HTTPException(status_code=400, detail="Unknown cloud provider")
     training_goal = _training_goal_or_default(body.get("training_goal"))
-    output_policy = _output_policy_or_default(body.get("output_policy"))
+    output_policy = _output_policy_for_provider(
+        body.get("output_policy"), cloud_provider
+    )
     success = await session_manager.update_session_cloud_provider(
         session_id, cloud_provider, training_goal, output_policy
     )
@@ -931,6 +945,7 @@ async def submit_approval(
         {
             "tool_call_id": a.tool_call_id,
             "approved": a.approved,
+            "approval_id": a.approval_id,
             "feedback": a.feedback,
             "edited_script": a.edited_script,
             "namespace": a.namespace,
@@ -976,8 +991,10 @@ async def chat_sse(
         else None
     )
     output_policy = (
-        _output_policy_or_default(body.get("output_policy"))
-        if "output_policy" in body
+        _output_policy_for_provider(
+            body.get("output_policy"), cloud_provider or "hf-jobs"
+        )
+        if "output_policy" in body or cloud_provider == "gcp-vertex"
         else None
     )
 
@@ -997,6 +1014,7 @@ async def chat_sse(
                 {
                     "tool_call_id": a["tool_call_id"],
                     "approved": a["approved"],
+                    "approval_id": a.get("approval_id"),
                     "feedback": a.get("feedback"),
                     "edited_script": a.get("edited_script"),
                     "namespace": a.get("namespace"),

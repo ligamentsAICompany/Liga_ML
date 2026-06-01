@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from litellm import ChatCompletionMessageToolCall as ToolCall
 
 from agent.config import Config
 from agent.core import agent_loop
@@ -169,6 +170,38 @@ def test_hf_jobs_approval_metadata_includes_provider_model_and_dataset():
         "dataset_config": "normalized",
         "dataset_rows": 42,
     }
+
+
+def test_approval_record_adds_recoverable_identity_and_expiry():
+    tc = ToolCall(
+        id="call-gcp-1",
+        type="function",
+        function={
+            "name": "gcp_vertex_jobs",
+            "arguments": '{"operation":"run"}',
+        },
+    )
+
+    record = agent_loop._approval_record(
+        tc,
+        "gcp_vertex_jobs",
+        {"operation": "run", "output_policy": "cloud-private"},
+    )
+
+    assert record["approval_id"] == "call-gcp-1"
+    assert record["tool_call_id"] == "call-gcp-1"
+    assert record["tool"] == "gcp_vertex_jobs"
+    assert record["operation"] == "run"
+    assert record["provider"] == "gcp-vertex"
+    assert record["status"] == "pending"
+    assert record["created_at"]
+    assert record["expires_at"]
+
+
+def test_typed_approval_words_are_detected_without_auto_launching():
+    assert agent_loop._looks_like_typed_approval("approved")
+    assert agent_loop._looks_like_typed_approval("Run it")
+    assert not agent_loop._looks_like_typed_approval("please change the dataset")
 
 
 @pytest.mark.asyncio
