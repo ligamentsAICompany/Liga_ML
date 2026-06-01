@@ -1,11 +1,11 @@
 #!/bin/bash
 # Entrypoint for HF Spaces dev mode compatibility.
 # Dev mode spawns CMD multiple times simultaneously on restart.
-# Only the first instance can bind port 7860 — the rest must exit
+# Only the first instance can bind the app port — the rest must exit
 # with code 0 so the dev mode daemon doesn't mark the app as crashed.
 
-# Cloud Run injects PORT at runtime. Keep 7860 as the local/HF Spaces fallback.
-uvicorn main:app --host 0.0.0.0 --port "${PORT:-7860}"
+# Cloud Run injects PORT at runtime. Docker production defaults to 8080.
+uvicorn main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8080}"
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then

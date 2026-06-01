@@ -6,9 +6,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 # Load .env before importing routes/session_manager so persistence and quota
 # modules see local Mongo settings during startup.
@@ -112,14 +112,6 @@ app.add_middleware(
 app.include_router(agent_router)
 app.include_router(auth_router)
 
-# Serve static files (frontend build) in production
-static_path = Path(__file__).parent.parent / "static"
-if static_path.exists():
-    app.mount("/", StaticFiles(directory=str(static_path), html=True), name="static")
-    logger.info(f"Serving static files from {static_path}")
-else:
-    logger.info("No static directory found, running in API-only mode")
-
 
 @app.get("/api")
 async def api_root():
@@ -131,8 +123,45 @@ async def api_root():
     }
 
 
+def install_frontend_routes(app: FastAPI, static_path: Path) -> None:
+    """Serve the built frontend when present without shadowing API routes."""
+    index_path = static_path / "index.html"
+    if not index_path.exists():
+        logger.info("No static directory found, running in API-only mode")
+        return
+
+    static_root = static_path.resolve()
+
+    def _static_file(full_path: str) -> Path | None:
+        candidate = (static_root / full_path).resolve()
+        try:
+            candidate.relative_to(static_root)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
+    @app.get("/", include_in_schema=False)
+    async def frontend_index():
+        return FileResponse(index_path)
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def frontend_fallback(full_path: str):
+        if full_path.startswith(("api/", "auth/")) or full_path in {"api", "auth"}:
+            raise HTTPException(status_code=404)
+        if file_path := _static_file(full_path):
+            return FileResponse(file_path)
+        return FileResponse(index_path)
+
+    logger.info("Serving frontend static files from %s", static_path)
+
+
+# Serve static files (frontend build) in production.
+install_frontend_routes(app, Path(__file__).parent.parent / "static")
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    host = os.environ.get("HOST", "0.0.0.0")
+    uvicorn.run(app, host=host, port=port)

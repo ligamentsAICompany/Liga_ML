@@ -8,6 +8,9 @@ An ML intern that autonomously researches, writes, and ships good quality ML rel
 
 ## Quick Start
 
+For single-container Docker or Cloud Run-style client deployment, see
+[`docs/docker-deployment.md`](docs/docker-deployment.md).
+
 ### Installation
 
 ```bash
