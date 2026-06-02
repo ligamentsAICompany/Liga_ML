@@ -1,4 +1,5 @@
 import base64
+import json
 import re
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ class FakeSession:
 
     def __init__(self):
         self.events = []
+        self.uploaded_datasets = []
 
     async def send_event(self, event):
         self.events.append(event)
@@ -69,6 +71,57 @@ class FakeLoggingClient:
     def list_entries(self, **kwargs):
         FakeLoggingClient.list_calls += 1
         return []
+
+
+class FakeFailedJobServiceClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def get_custom_job(self, name):
+        return SimpleNamespace(
+            name=name,
+            display_name="medical-uploaded-sft",
+            state=FakeState("JOB_STATE_FAILED"),
+            create_time="created",
+            update_time="updated",
+            error=SimpleNamespace(
+                message="WorkerPool replica exited with exit code 1."
+            ),
+        )
+
+
+class FakeFailureLoggingClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def list_entries(self, **kwargs):
+        return [
+            SimpleNamespace(payload="INFO preparing training"),
+            SimpleNamespace(
+                payload=(
+                    "datasets.exceptions.DatasetNotFoundError: Dataset "
+                    "'ligaments-dev/ml-intern-567e31d0-datasets' doesn't exist "
+                    "on the Hub or cannot be accessed."
+                )
+            ),
+        ]
+
+
+class FakeBucket:
+    uploads = []
+
+    def blob(self, name):
+        return SimpleNamespace(
+            upload_from_filename=lambda filename: FakeBucket.uploads.append(
+                (name, filename)
+            )
+        )
+
+
+class FakeStorageClient:
+    def bucket(self, bucket_name):
+        self.bucket_name = bucket_name
+        return FakeBucket()
 
 
 @pytest.mark.asyncio
@@ -191,6 +244,151 @@ async def test_run_sft_template_generates_vertex_training_script(monkeypatch):
     assert env["TRACKIO_PROJECT"] == "medical-sft"
     assert env["TRACKIO_SPACE_ID"] == "ligaments-dev/ml-intern-trackio"
     assert "HF_TOKEN" not in env
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_stages_session_uploaded_dataset_to_gcs(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeCustomJob.instances = []
+    FakeBucket.uploads = []
+
+    train_jsonl = tmp_path / "train.jsonl"
+    train_jsonl.write_text(
+        "\n".join(
+            [
+                json.dumps({"text": "first training row", "data": {"text": "first"}}),
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "hi"},
+                        ]
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_hf_hub_download(**kwargs):
+        assert kwargs["repo_id"] == "ligaments-dev/ml-intern-567e31d0-datasets"
+        assert kwargs["filename"] == "uploads/bb5048fac571/train.jsonl"
+        assert kwargs["repo_type"] == "dataset"
+        assert kwargs["token"] == "hf-session-token"
+        return str(train_jsonl)
+
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool.hf_hub_download",
+        fake_hf_hub_download,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool._load_storage_client_cls",
+        lambda: FakeStorageClient,
+        raising=False,
+    )
+
+    session = FakeSession()
+    session.uploaded_datasets = [
+        {
+            "repo_id": "ligaments-dev/ml-intern-567e31d0-datasets",
+            "config_name": "upload_bb5048fac571",
+            "normalized_path_in_repo": "uploads/bb5048fac571/train.jsonl",
+            "normalized_row_count": 2,
+            "source_format": "md",
+            "source": "session-upload",
+            "supports_training": True,
+        }
+    ]
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "display_name": "medical-uploaded-sft",
+            "dataset_name": "ligaments-dev/ml-intern-567e31d0-datasets",
+            "dataset_config": "upload_bb5048fac571",
+            "dataset_split": "train",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "output_policy": "cloud-private",
+            "max_train_samples": 2,
+        }
+    )
+
+    assert not result.get("isError")
+    assert "uploaded-gcs" in result["formatted"]
+    assert (
+        "gs://liga-training/vertex-inputs/medical-uploaded-sft/train.jsonl"
+        in result["formatted"]
+    )
+    assert ("vertex-inputs/medical-uploaded-sft/train.jsonl", str(train_jsonl)) in (
+        FakeBucket.uploads
+    )
+    assert any(name.endswith("metadata.json") for name, _ in FakeBucket.uploads)
+    worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
+    encoded_runner = worker_pool["container_spec"]["command"][-1]
+    encoded_script = re.search(r"b64decode\('([^']+)'\)", encoded_runner).group(1)
+    decoded_script = base64.b64decode(encoded_script).decode("utf-8")
+    assert '"dataset_source": "gcs_jsonl"' in decoded_script
+    assert (
+        '"train_gcs_uri": "gs://liga-training/vertex-inputs/medical-uploaded-sft/train.jsonl"'
+        in decoded_script
+    )
+    assert 'load_dataset("json"' in decoded_script
+    assert "load_dataset(**dataset_kwargs)" in decoded_script
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_rejects_empty_uploaded_jsonl_before_submit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeCustomJob.instances = []
+
+    empty_jsonl = tmp_path / "train.jsonl"
+    empty_jsonl.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool.hf_hub_download",
+        lambda **_: str(empty_jsonl),
+        raising=False,
+    )
+    session = FakeSession()
+    session.uploaded_datasets = [
+        {
+            "repo_id": "owner/session-datasets",
+            "config_name": "upload_abc",
+            "normalized_path_in_repo": "uploads/abc/train.jsonl",
+            "normalized_row_count": 0,
+            "source_format": "csv",
+            "source": "session-upload",
+            "supports_training": True,
+        }
+    ]
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "dataset_name": "owner/session-datasets",
+            "dataset_config": "upload_abc",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "output_policy": "cloud-private",
+        }
+    )
+
+    assert result["isError"] is True
+    assert "staged JSONL" in result["formatted"]
+    assert FakeCustomJob.instances == []
 
 
 @pytest.mark.asyncio
@@ -458,6 +656,37 @@ async def test_vertex_monitoring_is_throttled_per_session(monkeypatch):
     assert not second.get("isError")
     assert FakeJobServiceClient.get_calls == 1
     assert FakeLoggingClient.list_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_vertex_inspect_failed_state_bypasses_cooldown_and_surfaces_root_error(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+
+    session = FakeSession()
+    job_name = "projects/test-project/locations/us-central1/customJobs/123"
+    session._gcp_vertex_monitor_cache = {
+        job_name: {"monotonic": 999999999.0, "state": "JOB_STATE_RUNNING"}
+    }
+    tool = GcpVertexJobsTool(
+        session=session,
+        tool_call_id="call-failed",
+        job_service_client_cls=FakeFailedJobServiceClient,
+        logging_client_cls=FakeFailureLoggingClient,
+    )
+
+    result = await tool.execute({"operation": "inspect", "job_name": job_name})
+
+    assert not result.get("isError")
+    assert "JOB_STATE_FAILED" in result["formatted"]
+    assert "DatasetNotFoundError" in result["formatted"]
+    assert "View in Vertex AI" in result["formatted"]
+    assert session.events[-1].data["state"] == "failed"
+    assert session.events[-1].data["failureReason"]
+    assert "hf-session-token" not in result["formatted"]
 
 
 @pytest.mark.asyncio

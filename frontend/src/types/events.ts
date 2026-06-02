@@ -62,6 +62,8 @@ export interface ToolStateChangeEventData {
   jobName?: string;
   jobUrl?: string;
   outputDir?: string;
+  failureReason?: string;
+  logsUnavailable?: boolean;
   trackioSpaceId?: string;
   trackioProject?: string;
   namespace?: string;

@@ -13,9 +13,13 @@ import base64
 import json
 import os
 import re
+import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
+
+from huggingface_hub import hf_hub_download
 
 from agent.core.session import Event
 from agent.training_templates.sft import SftTemplateConfig, build_sft_training_script
@@ -51,6 +55,18 @@ DEFAULT_PILOT_MAX_EVAL_SAMPLES = 50
 LOW_BUDGET_PILOT_MAX_TRAIN_SAMPLES = 100
 LOW_BUDGET_PILOT_MAX_EVAL_SAMPLES = 20
 LARGE_DATASET_ROW_THRESHOLD = 10_000
+GCS_JSONL_DATASET_SOURCE = "gcs_jsonl"
+UPLOADED_GCS_DATASET_SOURCE = "uploaded-gcs"
+ROOT_ERROR_PATTERNS = (
+    "DatasetNotFoundError",
+    "PermissionDenied",
+    "PERMISSION_DENIED",
+    "FileNotFoundError",
+    "ValueError",
+    "RuntimeError",
+    "Traceback",
+    "exit code 1",
+)
 
 
 def _slug(value: str) -> str:
@@ -190,6 +206,88 @@ def _load_logging_client_cls():
     return logging_v2.Client
 
 
+def _load_storage_client_cls():
+    from google.cloud import storage
+
+    return storage.Client
+
+
+def _parse_gs_uri(gcs_uri: str) -> tuple[str, str]:
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError(f"Invalid GCS URI: {gcs_uri}")
+    bucket_and_prefix = gcs_uri.removeprefix("gs://").strip("/")
+    bucket_name, _, prefix = bucket_and_prefix.partition("/")
+    if not bucket_name or not prefix:
+        raise ValueError(f"Invalid GCS URI: {gcs_uri}")
+    return bucket_name, prefix
+
+
+def _has_training_fields(row: dict[str, Any]) -> bool:
+    return any(
+        key in row
+        for key in (
+            "text",
+            "messages",
+            "data",
+            "prompt",
+            "completion",
+            "instruction",
+            "output",
+            "input",
+            "response",
+            "question",
+            "answer",
+        )
+    )
+
+
+def _validate_normalized_jsonl(path: str | Path) -> tuple[int, list[str]]:
+    row_count = 0
+    sample_keys: set[str] = set()
+    with Path(path).open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Uploaded staged JSONL is not parseable at line {line_number}: {exc.msg}."
+                ) from exc
+            if not isinstance(row, dict):
+                raise ValueError(
+                    f"Uploaded staged JSONL row {line_number} must be a JSON object."
+                )
+            if not _has_training_fields(row):
+                raise ValueError(
+                    "Uploaded staged JSONL rows must include normalized text/data fields."
+                )
+            sample_keys.update(str(key) for key in row.keys())
+            row_count += 1
+    if row_count <= 0:
+        raise ValueError("Uploaded staged JSONL must contain at least one row.")
+    return row_count, sorted(sample_keys)
+
+
+def _extract_root_error_lines(text: str, *, limit: int = 8) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(pattern in line for pattern in ROOT_ERROR_PATTERNS):
+            if line not in lines:
+                lines.append(line[:1200])
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _sanitize_failure_text(text: str) -> str:
+    # Avoid accidentally reflecting raw tokens from exception/log payloads.
+    return re.sub(r"hf_[A-Za-z0-9]{20,}", "[REDACTED_HF_TOKEN]", text)
+
+
 class GcpVertexJobsTool:
     """Manage Vertex AI Custom Training jobs for Liga ML."""
 
@@ -209,6 +307,135 @@ class GcpVertexJobsTool:
         self.job_service_client_cls = job_service_client_cls
         self.logging_client_cls = logging_client_cls
         self.init_aiplatform = init_aiplatform
+
+    def _find_session_uploaded_dataset(
+        self, args: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if self.session is None:
+            return None
+        uploads = [
+            upload
+            for upload in (getattr(self.session, "uploaded_datasets", []) or [])
+            if isinstance(upload, dict)
+        ]
+        if not uploads:
+            return None
+        dataset_name = str(args.get("dataset_name") or "").strip()
+        dataset_config = str(args.get("dataset_config") or "").strip()
+        for upload in reversed(uploads):
+            if (
+                upload.get("supports_training") is False
+                or upload.get("status") == "failed"
+            ):
+                continue
+            if dataset_name and dataset_name != str(upload.get("repo_id") or ""):
+                continue
+            if dataset_config and dataset_config != str(
+                upload.get("config_name") or ""
+            ):
+                continue
+            return upload
+        return None
+
+    def _download_uploaded_train_jsonl(self, upload: dict[str, Any]) -> str:
+        token = (
+            getattr(self.session, "hf_token", None)
+            if self.session is not None
+            else None
+        )
+        if not token:
+            raise ValueError(
+                "A session Hugging Face token is required to stage the uploaded dataset."
+            )
+        repo_id = str(upload.get("repo_id") or "").strip()
+        path_in_repo = str(upload.get("normalized_path_in_repo") or "").strip()
+        if not repo_id or not path_in_repo:
+            raise ValueError(
+                "Uploaded dataset metadata is missing repo_id or normalized path."
+            )
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=path_in_repo,
+            repo_type="dataset",
+            token=token,
+        )
+
+    def _upload_file_to_gcs(self, source_path: str | Path, gcs_uri: str) -> None:
+        bucket_name, blob_name = _parse_gs_uri(gcs_uri)
+        storage_client_cls = _load_storage_client_cls()
+        client = storage_client_cls()
+        bucket = client.bucket(bucket_name)
+        bucket.blob(blob_name).upload_from_filename(str(source_path))
+
+    def _stage_uploaded_dataset_for_vertex(
+        self,
+        *,
+        upload: dict[str, Any],
+        display_name: str,
+        bucket: str,
+    ) -> dict[str, Any]:
+        local_train_path = self._download_uploaded_train_jsonl(upload)
+        row_count, sample_keys = _validate_normalized_jsonl(local_train_path)
+        input_prefix = _gs_path(bucket, f"vertex-inputs/{display_name}")
+        train_gcs_uri = _gs_path(input_prefix, "train.jsonl")
+        metadata_gcs_uri = _gs_path(input_prefix, "metadata.json")
+        metadata = {
+            "dataset_source": UPLOADED_GCS_DATASET_SOURCE,
+            "repo_id": upload.get("repo_id"),
+            "config_name": upload.get("config_name"),
+            "normalized_path_in_repo": upload.get("normalized_path_in_repo"),
+            "source_format": upload.get("source_format"),
+            "normalized_row_count": row_count,
+            "sample_keys": sample_keys,
+            "staged_train_uri": train_gcs_uri,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".json", delete=False
+        ) as handle:
+            json.dump(metadata, handle, sort_keys=True)
+            metadata_path = handle.name
+        try:
+            self._upload_file_to_gcs(local_train_path, train_gcs_uri)
+            self._upload_file_to_gcs(metadata_path, metadata_gcs_uri)
+        finally:
+            try:
+                Path(metadata_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return {
+            "dataset_source": GCS_JSONL_DATASET_SOURCE,
+            "display_dataset_source": UPLOADED_GCS_DATASET_SOURCE,
+            "train_gcs_uri": train_gcs_uri,
+            "staged_train_uri": train_gcs_uri,
+            "metadata_gcs_uri": metadata_gcs_uri,
+            "train_rows": row_count,
+            "source_format": str(upload.get("source_format") or ""),
+        }
+
+    def _preflight_hf_dataset(self, args: dict[str, Any]) -> None:
+        # Unit tests inject fake Vertex classes and should not call live Hub APIs.
+        if self.custom_job_cls is not None:
+            return
+        from datasets import load_dataset
+
+        dataset_name = str(args.get("dataset_name") or "").strip()
+        if not dataset_name:
+            return
+        kwargs: dict[str, Any] = {
+            "path": dataset_name,
+            "split": str(args.get("dataset_split") or "train"),
+        }
+        if args.get("dataset_config"):
+            kwargs["name"] = str(args["dataset_config"])
+        token = (
+            getattr(self.session, "hf_token", None)
+            if self.session is not None
+            else None
+        )
+        if token:
+            kwargs["token"] = token
+        load_dataset(**kwargs)
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
         operation = str(params.get("operation", "")).lower().strip()
@@ -256,8 +483,10 @@ class GcpVertexJobsTool:
             return self._error(
                 "output_policy must be one of: cloud-private, hf-hub, cloud-and-hf-hub"
             )
+        display_name = _slug(args.get("display_name") or f"liga-ml-{_now_suffix()}")
         hf_model_target = ""
         scale_warning = ""
+        staged_dataset: dict[str, Any] | None = None
         if template:
             if script or command:
                 return self._error(
@@ -277,6 +506,23 @@ class GcpVertexJobsTool:
                 return self._error("; ".join(validation_errors))
             try:
                 args, scale_warning = _apply_dataset_scale_guardrails(args)
+                upload = self._find_session_uploaded_dataset(args)
+                if upload is not None:
+                    staged_dataset = self._stage_uploaded_dataset_for_vertex(
+                        upload=upload,
+                        display_name=display_name,
+                        bucket=config["bucket"],
+                    )
+                    args = {
+                        **args,
+                        "dataset_source": GCS_JSONL_DATASET_SOURCE,
+                        "train_gcs_uri": staged_dataset["train_gcs_uri"],
+                        "staged_train_uri": staged_dataset["staged_train_uri"],
+                        "train_rows": staged_dataset["train_rows"],
+                        "source_format": staged_dataset["source_format"],
+                    }
+                else:
+                    self._preflight_hf_dataset(args)
                 template_config = SftTemplateConfig(
                     dataset_name=str(args.get("dataset_name") or ""),
                     dataset_config=args.get("dataset_config"),
@@ -306,6 +552,11 @@ class GcpVertexJobsTool:
                     trackio_project=args.get("trackio_project"),
                     trackio_space_id=args.get("trackio_space_id"),
                     run_name=args.get("run_name"),
+                    dataset_source=str(args.get("dataset_source") or "hf"),
+                    train_gcs_uri=args.get("train_gcs_uri"),
+                    staged_train_uri=args.get("staged_train_uri"),
+                    train_rows=args.get("train_rows"),
+                    source_format=args.get("source_format"),
                 )
                 script = build_sft_training_script(template_config)
                 if output_policy in {"hf-hub", "cloud-and-hf-hub"}:
@@ -318,7 +569,6 @@ class GcpVertexJobsTool:
         if not script and not command:
             return self._error("Either 'script' or 'command' is required.")
 
-        display_name = _slug(args.get("display_name") or f"liga-ml-{_now_suffix()}")
         staging_bucket = args.get("staging_bucket") or _default_staging_bucket(
             config["bucket"]
         )
@@ -426,6 +676,13 @@ class GcpVertexJobsTool:
         scale_warning_line = (
             f"**Dataset scale guardrail:** {scale_warning}\n" if scale_warning else ""
         )
+        staged_dataset_line = ""
+        if staged_dataset:
+            staged_dataset_line = (
+                f"**Dataset source:** {staged_dataset['display_dataset_source']}\n"
+                f"**Staged train URI:** {staged_dataset['staged_train_uri']}\n"
+                f"**Staged train rows:** {staged_dataset['train_rows']}\n"
+            )
         return {
             "formatted": (
                 "Vertex AI job submitted.\n\n"
@@ -438,6 +695,7 @@ class GcpVertexJobsTool:
                 f"**Output policy:** {output_policy}\n"
                 f"**Trackio mode:** {trackio_mode}\n"
                 f"{scale_warning_line}"
+                f"{staged_dataset_line}"
                 f"{hf_target_line}"
                 f"**Console:** {console_url}\n\n"
                 "Use `gcp_vertex_jobs` with `operation='inspect'` or `operation='logs'` "
@@ -484,8 +742,6 @@ class GcpVertexJobsTool:
         job_name = args.get("job_name") or args.get("job_id")
         if not job_name:
             return self._error("job_name is required for inspect.")
-        if cooldown := self._monitor_cooldown_response(job_name):
-            return cooldown
         config, missing = _required_config()
         if missing:
             return self._error(
@@ -497,7 +753,34 @@ class GcpVertexJobsTool:
         client = self._job_service_client(config["region"])
         job = await asyncio.to_thread(client.get_custom_job, name=job_name)
         state = _state_name(job.state)
+        if state not in TERMINAL_JOB_STATES:
+            if cooldown := self._monitor_cooldown_response(job_name):
+                return cooldown
         self._record_monitor_poll(job_name, state)
+        console_url = _vertex_console_url(config["project"], config["region"], job.name)
+        failure_reason = ""
+        logs_unavailable = False
+        if state in {"JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED"}:
+            failure_reason, logs_unavailable = await self._failure_reason_for_job(
+                config, job
+            )
+            await self._emit_vertex_state_change(
+                job,
+                state=state,
+                console_url=console_url,
+                failure_reason=failure_reason,
+                logs_unavailable=logs_unavailable,
+            )
+        failure_section = ""
+        if failure_reason:
+            failure_section = (
+                f"\n\n**Failure reason:**\n\n```text\n{failure_reason}\n```"
+            )
+        elif state == "JOB_STATE_FAILED":
+            failure_section = (
+                "\n\n**Failure reason:** Vertex reported failure, but logs are not "
+                f"available yet. View in Vertex AI: {console_url}"
+            )
         return {
             "formatted": (
                 "**Vertex AI job details:**\n\n"
@@ -505,7 +788,9 @@ class GcpVertexJobsTool:
                 f"**Display name:** {job.display_name}\n"
                 f"**State:** {state}\n"
                 f"**Create time:** {getattr(job, 'create_time', '')}\n"
-                f"**Update time:** {getattr(job, 'update_time', '')}"
+                f"**Update time:** {getattr(job, 'update_time', '')}\n"
+                f"**View in Vertex AI:** {console_url}"
+                f"{failure_section}"
             ),
             "totalResults": 1,
             "resultsShared": 1,
@@ -565,6 +850,77 @@ class GcpVertexJobsTool:
             "totalResults": len(entries),
             "resultsShared": len(lines),
         }
+
+    async def _failure_reason_for_job(
+        self, config: dict[str, str], job: Any
+    ) -> tuple[str, bool]:
+        lines: list[str] = []
+        logs_unavailable = False
+        try:
+            client_cls = self.logging_client_cls or _load_logging_client_cls()
+            client = client_cls(project=config["project"])
+            custom_job_id = str(job.name).rstrip("/").split("/")[-1]
+            log_filter = (
+                'resource.type="ml_job" '
+                f'AND labels."ml.googleapis.com/job_id"="{custom_job_id}"'
+            )
+            entries = await asyncio.to_thread(
+                lambda: list(client.list_entries(filter_=log_filter, page_size=100))
+            )
+            log_text = "\n".join(
+                str(getattr(entry, "payload", entry)) for entry in entries
+            )
+            lines.extend(_extract_root_error_lines(log_text))
+            if not entries:
+                logs_unavailable = True
+        except Exception:
+            logs_unavailable = True
+
+        vertex_error = getattr(job, "error", None)
+        vertex_message = str(getattr(vertex_error, "message", "") or "").strip()
+        if vertex_message:
+            lines.extend(_extract_root_error_lines(vertex_message))
+            if not lines:
+                lines.append(vertex_message[:1200])
+
+        if not lines:
+            logs_unavailable = True
+            lines.append(
+                "Vertex reported a terminal failure, but detailed logs are not available yet."
+            )
+        return _sanitize_failure_text("\n".join(dict.fromkeys(lines))), logs_unavailable
+
+    async def _emit_vertex_state_change(
+        self,
+        job: Any,
+        *,
+        state: str,
+        console_url: str,
+        failure_reason: str = "",
+        logs_unavailable: bool = False,
+    ) -> None:
+        if not self.session or not self.tool_call_id:
+            return
+        state_label = {
+            "JOB_STATE_SUCCEEDED": "succeeded",
+            "JOB_STATE_FAILED": "failed",
+            "JOB_STATE_CANCELLED": "cancelled",
+            "JOB_STATE_EXPIRED": "expired",
+        }.get(state, state.lower())
+        await self.session.send_event(
+            Event(
+                event_type="tool_state_change",
+                data={
+                    "tool_call_id": self.tool_call_id,
+                    "tool": "gcp_vertex_jobs",
+                    "state": state_label,
+                    "jobName": getattr(job, "name", ""),
+                    "jobUrl": console_url,
+                    "failureReason": failure_reason,
+                    "logsUnavailable": logs_unavailable,
+                },
+            )
+        )
 
     def _job_service_client(self, region: str):
         client_cls = self.job_service_client_cls or _load_job_service_client_cls()
@@ -728,6 +1084,27 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
             "dataset_split": {
                 "type": "string",
                 "description": "Dataset split for template='sft'. Default: train.",
+            },
+            "dataset_source": {
+                "type": "string",
+                "enum": ["hf", "gcs_jsonl"],
+                "description": (
+                    "Dataset source for template='sft'. Defaults to hf. The backend "
+                    "sets gcs_jsonl automatically for session-uploaded Vertex datasets "
+                    "after staging normalized train.jsonl to GCS."
+                ),
+            },
+            "train_gcs_uri": {
+                "type": "string",
+                "description": "GCS JSONL input URI for dataset_source='gcs_jsonl'.",
+            },
+            "staged_train_uri": {
+                "type": "string",
+                "description": "Alias/metadata for the staged uploaded train.jsonl GCS URI.",
+            },
+            "source_format": {
+                "type": "string",
+                "description": "Original uploaded source format when the dataset was staged from a session upload.",
             },
             "eval_dataset_split": {
                 "type": "string",

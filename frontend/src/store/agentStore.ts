@@ -65,6 +65,8 @@ export interface JobRuntimeState {
   jobName?: string;
   jobUrl?: string;
   outputDir?: string;
+  failureReason?: string;
+  logsUnavailable?: boolean;
 }
 
 export type ActivityStatus =

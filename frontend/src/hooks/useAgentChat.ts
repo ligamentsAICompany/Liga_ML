@@ -426,6 +426,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           jobName: state.jobName,
           jobUrl: state.jobUrl,
           outputDir: state.outputDir,
+          failureReason: state.failureReason,
+          logsUnavailable: state.logsUnavailable,
         });
         if (state.jobUrl) {
           store.setJobUrl(state.tool_call_id, state.jobUrl);
@@ -437,6 +439,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           jobName: state.jobName,
           jobUrl: state.jobUrl,
           outputDir: state.outputDir,
+          failureReason: state.failureReason,
+          logsUnavailable: state.logsUnavailable,
         });
         if (!stateMarkdown) return;
 
@@ -734,6 +738,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
                 jobName: event.data?.jobName as string | undefined,
                 jobUrl: event.data?.jobUrl as string | undefined,
                 outputDir: event.data?.outputDir as string | undefined,
+                failureReason: event.data?.failureReason as string | undefined,
+                logsUnavailable: event.data?.logsUnavailable as boolean | undefined,
                 trackioSpaceId: event.data?.trackioSpaceId as string | undefined,
                 trackioProject: event.data?.trackioProject as string | undefined,
                 namespace: event.data?.namespace as string | undefined,

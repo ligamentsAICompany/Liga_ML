@@ -13,6 +13,10 @@ LIGA_HUB_MODEL_ID=alice/model-v1
 LIGA_GCS_OUTPUT_DIR=gs://liga-training/vertex-outputs/run-1
 LIGA_EVAL_RESULT_JSON={"eval_loss":0.42,"samples":3}
 LIGA_RESULT_FILE=liga_training_result.json
+LIGA_DATASET_SOURCE=gcs_jsonl
+LIGA_STAGED_TRAIN_URI=gs://liga-training/vertex-inputs/run-1/train.jsonl
+LIGA_TRAIN_ROWS=10
+LIGA_EVAL_ROWS=2
 more logs
 LIGA_TRAINING_STATUS=succeeded
 `);
@@ -23,6 +27,10 @@ LIGA_TRAINING_STATUS=succeeded
     finalModelUrl: 'https://huggingface.co/alice/model-v1',
     hubModelId: 'alice/model-v1',
     gcsOutputDir: 'gs://liga-training/vertex-outputs/run-1',
+    datasetSource: 'gcs_jsonl',
+    stagedTrainUri: 'gs://liga-training/vertex-inputs/run-1/train.jsonl',
+    trainRows: '10',
+    evalRows: '2',
     evalResult: { eval_loss: 0.42, samples: 3 },
     resultFile: 'liga_training_result.json',
   });

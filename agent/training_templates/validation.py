@@ -7,6 +7,7 @@ from typing import Any
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
 VALID_TRACKIO_MODES = {"disabled", "reuse-existing", "create-if-allowed"}
+VALID_DATASET_SOURCES = {"hf", "gcs_jsonl"}
 
 
 def _is_positive_number(value: Any) -> bool:
@@ -47,6 +48,7 @@ def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
     output_policy = str(params.get("output_policy") or "cloud-and-hf-hub").strip()
     training_goal = str(params.get("training_goal") or "agent-decide").strip()
     trackio_mode = str(params.get("trackio_mode") or "disabled").strip()
+    dataset_source = str(params.get("dataset_source") or "hf").strip()
 
     if training_goal not in VALID_TRAINING_GOALS:
         errors.append(
@@ -60,6 +62,8 @@ def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
         errors.append(
             "trackio_mode must be one of: disabled, reuse-existing, create-if-allowed"
         )
+    if dataset_source not in VALID_DATASET_SOURCES:
+        errors.append("dataset_source must be one of: hf, gcs_jsonl")
 
     required_fields = ["dataset_name", "model_name"]
     if output_policy in {"hf-hub", "cloud-and-hf-hub"}:
@@ -67,6 +71,13 @@ def validate_sft_template_request(params: dict[str, Any]) -> list[str]:
     for field in required_fields:
         if not str(params.get(field) or "").strip():
             errors.append(f"{field} is required")
+    if dataset_source == "gcs_jsonl":
+        if not str(params.get("train_gcs_uri") or "").strip():
+            errors.append("train_gcs_uri is required for dataset_source=gcs_jsonl")
+        if params.get("eval_dataset_split"):
+            errors.append(
+                "eval_dataset_split is not supported for dataset_source=gcs_jsonl"
+            )
 
     for field in (
         "num_train_epochs",

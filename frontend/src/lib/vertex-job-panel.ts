@@ -1,13 +1,27 @@
-import type { PanelData } from '@/store/agentStore';
-import { parseLigaTrainingResult, type TrainingResult } from '@/utils/trainingResult';
-import { outputPolicyLabel, storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
-import type { OutputPolicy, TrainingGoal } from '@/types/agent';
+import { parseLigaTrainingResult, type TrainingResult } from '../utils/trainingResult.js';
+import { outputPolicyLabel, storageDestinationLabel, trainingGoalLabel } from './gcloud-preflight.js';
+import type { OutputPolicy, TrainingGoal } from '../types/agent.js';
+
+interface PanelSection {
+  content: string;
+  language: string;
+}
+
+interface PanelData {
+  title: string;
+  script?: PanelSection;
+  output?: PanelSection;
+  input?: PanelSection;
+  parameters?: Record<string, unknown>;
+}
 
 export interface VertexToolState {
   state?: string;
   jobName?: string;
   jobUrl?: string;
   outputDir?: string;
+  failureReason?: string;
+  logsUnavailable?: boolean;
 }
 
 const VERTEX_SUMMARY_FIELDS = [
@@ -23,6 +37,10 @@ const VERTEX_SUMMARY_FIELDS = [
   ['Accelerator count', 'accelerator_count'],
   ['Output dir', 'output_dir'],
   ['Staging bucket', 'staging_bucket'],
+  ['Dataset source', 'dataset_source'],
+  ['Staged train URI', 'staged_train_uri'],
+  ['Train rows', 'train_rows'],
+  ['Source format', 'source_format'],
   ['Trackio project', 'trackio_project'],
   ['Trackio Space', 'trackio_space_id'],
 ] as const;
@@ -82,6 +100,7 @@ export function buildVertexStateMarkdown(state: VertexToolState): string {
     ['Vertex job', state.jobName],
     ['GCS output directory', state.outputDir],
     ['Vertex console', state.jobUrl],
+    ['Failure reason', state.failureReason],
   ]
     .map(([label, value]) => {
       const text = valueToString(value);
@@ -99,6 +118,12 @@ export function buildVertexStateMarkdown(state: VertexToolState): string {
     '| Field | Value |',
     '| --- | --- |',
     ...rows,
+    ...(state.logsUnavailable && state.failureReason
+      ? [
+          '',
+          'Logs are not available yet, but Vertex already reported failure. Use the Vertex console link above for details.',
+        ]
+      : []),
   ].join('\n');
 }
 
@@ -115,6 +140,10 @@ export function buildTrainingResultMarkdown(result: TrainingResult): string {
     ['Final HF model', result.finalModelUrl],
     ['Hub model ID', result.hubModelId],
     ['GCS output directory', result.gcsOutputDir],
+    ['Dataset source', result.datasetSource],
+    ['Staged train URI', result.stagedTrainUri],
+    ['Train rows', result.trainRows],
+    ['Eval rows', result.evalRows],
     ['Result file', result.resultFile],
   ]
     .map(([label, value]) => {

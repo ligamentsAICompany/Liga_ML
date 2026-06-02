@@ -192,6 +192,39 @@ def test_sft_template_result_json_includes_output_policy_for_default_behavior():
     assert "upload_folder_to_gcs(final_dir, gcs_output_dir)" in script
 
 
+def test_sft_template_loads_uploaded_gcs_jsonl_without_hf_dataset_repo():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="ligaments-dev/ml-intern-session-datasets",
+            dataset_config="upload_abc",
+            dataset_source="gcs_jsonl",
+            train_gcs_uri="gs://liga-training/vertex-inputs/job/train.jsonl",
+            train_rows=12,
+            source_format="md",
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            hub_model_id="",
+            output_policy="cloud-private",
+        )
+    )
+
+    ast.parse(script)
+    assert '"dataset_source": "gcs_jsonl"' in script
+    assert (
+        '"train_gcs_uri": "gs://liga-training/vertex-inputs/job/train.jsonl"' in script
+    )
+    assert "local_train_file = download_gcs_file(" in script
+    assert "TRAIN_GCS_URI," in script
+    assert (
+        'load_dataset("json", data_files=str(local_train_file), split="train")'
+        in script
+    )
+    assert "load_dataset(**dataset_kwargs)" in script
+    assert '"dataset_source": DATASET_SOURCE' in script
+    assert '"staged_train_uri": TRAIN_GCS_URI' in script
+    assert '"train_rows": train_rows' in script
+    assert "LIGA_STAGED_TRAIN_URI={TRAIN_GCS_URI}" in script
+
+
 def test_sft_template_defaults_trackio_disabled_and_non_fatal():
     script = build_sft_training_script(
         SftTemplateConfig(

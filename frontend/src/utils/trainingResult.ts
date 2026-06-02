@@ -5,6 +5,10 @@ export interface TrainingResult {
   finalModelUrl?: string;
   hubModelId?: string;
   gcsOutputDir?: string;
+  datasetSource?: string;
+  stagedTrainUri?: string;
+  trainRows?: string;
+  evalRows?: string;
   evalResult?: Record<string, unknown> | null;
   resultFile?: string;
 }
@@ -16,6 +20,10 @@ const MARKERS = {
   finalModelUrl: 'LIGA_FINAL_MODEL_URL',
   hubModelId: 'LIGA_HUB_MODEL_ID',
   gcsOutputDir: 'LIGA_GCS_OUTPUT_DIR',
+  datasetSource: 'LIGA_DATASET_SOURCE',
+  stagedTrainUri: 'LIGA_STAGED_TRAIN_URI',
+  trainRows: 'LIGA_TRAIN_ROWS',
+  evalRows: 'LIGA_EVAL_ROWS',
   evalResult: 'LIGA_EVAL_RESULT_JSON',
   resultFile: 'LIGA_RESULT_FILE',
 } as const;
@@ -62,6 +70,10 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   const finalModelUrl = cleanUrl(markerValue(output, MARKERS.finalModelUrl));
   const hubModelId = markerValue(output, MARKERS.hubModelId);
   const gcsOutputDir = markerValue(output, MARKERS.gcsOutputDir);
+  const datasetSource = markerValue(output, MARKERS.datasetSource);
+  const stagedTrainUri = markerValue(output, MARKERS.stagedTrainUri);
+  const trainRows = markerValue(output, MARKERS.trainRows);
+  const evalRows = markerValue(output, MARKERS.evalRows);
   const evalResult = parseEvalResult(markerValue(output, MARKERS.evalResult));
   const resultFile = markerValue(output, MARKERS.resultFile);
 
@@ -71,6 +83,10 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   if (finalModelUrl) result.finalModelUrl = finalModelUrl;
   if (hubModelId) result.hubModelId = hubModelId;
   if (gcsOutputDir) result.gcsOutputDir = gcsOutputDir;
+  if (datasetSource) result.datasetSource = datasetSource;
+  if (stagedTrainUri) result.stagedTrainUri = stagedTrainUri;
+  if (trainRows) result.trainRows = trainRows;
+  if (evalRows) result.evalRows = evalRows;
   if (evalResult !== undefined) result.evalResult = evalResult;
   if (resultFile) result.resultFile = resultFile;
 

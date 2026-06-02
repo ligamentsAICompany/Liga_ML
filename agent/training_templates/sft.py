@@ -53,6 +53,11 @@ class SftTemplateConfig:
     run_name: str | None = None
     column_mapping: dict[str, Any] = field(default_factory=dict)
     task_type: str = "sft"
+    dataset_source: str = "hf"
+    train_gcs_uri: str | None = None
+    staged_train_uri: str | None = None
+    train_rows: int | None = None
+    source_format: str | None = None
 
 
 def build_sft_training_script(config: SftTemplateConfig) -> str:
@@ -79,11 +84,21 @@ def build_sft_training_script(config: SftTemplateConfig) -> str:
     push_to_hub = config.output_policy in {"hf-hub", "cloud-and-hf-hub"}
     if push_to_hub and not config.hub_model_id.strip():
         raise ValueError("hub_model_id is required.")
+    if (
+        config.dataset_source == "gcs_jsonl"
+        and not str(config.train_gcs_uri or "").strip()
+    ):
+        raise ValueError("train_gcs_uri is required for dataset_source='gcs_jsonl'.")
 
     payload = {
         "dataset_name": config.dataset_name,
         "dataset_config": config.dataset_config,
         "dataset_split": config.dataset_split,
+        "dataset_source": config.dataset_source,
+        "train_gcs_uri": config.train_gcs_uri,
+        "staged_train_uri": config.staged_train_uri or config.train_gcs_uri,
+        "train_rows": config.train_rows,
+        "source_format": config.source_format,
         "eval_dataset_split": config.eval_dataset_split,
         "validation_split_ratio": config.validation_split_ratio,
         "model_name": config.model_name,
@@ -122,6 +137,8 @@ CONFIG = json.loads({config_json!r})
 DATASET_NAME = "{config.dataset_name}"
 MODEL_NAME = "{config.model_name}"
 HUB_MODEL_ID = "{config.hub_model_id}"
+DATASET_SOURCE = CONFIG.get("dataset_source") or "hf"
+TRAIN_GCS_URI = CONFIG.get("train_gcs_uri") or ""
 TRAINING_GOAL = CONFIG["training_goal"]
 OUTPUT_POLICY = CONFIG["output_policy"]
 PUSH_TO_HUB = OUTPUT_POLICY in {{"hf-hub", "cloud-and-hf-hub"}}
@@ -210,6 +227,20 @@ def upload_folder_to_gcs(folder_path: Path, gcs_uri: str) -> None:
         relative_path = file_path.relative_to(folder_path).as_posix()
         blob_name = "/".join(part for part in [prefix, "final", relative_path] if part)
         bucket.blob(blob_name).upload_from_filename(str(file_path))
+
+
+def download_gcs_file(gcs_uri: str, destination: Path) -> Path:
+    if not gcs_uri.startswith("gs://"):
+        raise RuntimeError(f"Invalid GCS input path: {{gcs_uri}}")
+    bucket_and_prefix = gcs_uri.removeprefix("gs://").strip("/")
+    bucket_name, _, blob_name = bucket_and_prefix.partition("/")
+    if not bucket_name or not blob_name:
+        raise RuntimeError(f"Invalid GCS input path: {{gcs_uri}}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    bucket.blob(blob_name).download_to_filename(str(destination))
+    return destination
 
 
 def first_gs_uri(*values):
@@ -340,9 +371,18 @@ def load_dataset_split(split_name):
 
 
 def prepare_datasets():
-    train_dataset = load_dataset_split(CONFIG["dataset_split"])
+    if DATASET_SOURCE == "gcs_jsonl":
+        if CONFIG.get("eval_dataset_split"):
+            raise RuntimeError("eval_dataset_split is not supported for staged GCS JSONL datasets.")
+        local_train_file = download_gcs_file(
+            TRAIN_GCS_URI,
+            Path("/tmp/liga-ml-input/train.jsonl"),
+        )
+        train_dataset = load_dataset("json", data_files=str(local_train_file), split="train")
+    else:
+        train_dataset = load_dataset_split(CONFIG["dataset_split"])
     eval_dataset = None
-    if CONFIG.get("eval_dataset_split"):
+    if DATASET_SOURCE != "gcs_jsonl" and CONFIG.get("eval_dataset_split"):
         eval_dataset = load_dataset_split(CONFIG["eval_dataset_split"])
     elif len(train_dataset) >= 20:
         split = train_dataset.train_test_split(
@@ -383,6 +423,9 @@ def write_result(final_dir, status, gcs_output_dir, eval_metrics, train_rows, ev
         "model_url": hub_model_url(),
         "gcs_output_dir": gcs_output_dir,
         "eval": eval_metrics,
+        "dataset_source": DATASET_SOURCE,
+        "staged_train_uri": TRAIN_GCS_URI,
+        "source_format": CONFIG.get("source_format") or "",
         "train_rows": train_rows,
         "eval_rows": eval_rows,
         "trackio_enabled": TRACKIO_ENABLED,
@@ -527,6 +570,10 @@ def main() -> None:
     print(f"LIGA_GCS_OUTPUT_DIR={{gcs_output_dir}}", flush=True)
     print(f"LIGA_EVAL_RESULT_JSON={{eval_json}}", flush=True)
     print(f"LIGA_RESULT_FILE={{RESULT_FILE_NAME}}", flush=True)
+    print(f"LIGA_DATASET_SOURCE={{DATASET_SOURCE}}", flush=True)
+    print(f"LIGA_STAGED_TRAIN_URI={{TRAIN_GCS_URI}}", flush=True)
+    print(f"LIGA_TRAIN_ROWS={{len(train_dataset)}}", flush=True)
+    print(f"LIGA_EVAL_ROWS={{len(eval_dataset) if eval_dataset is not None else 0}}", flush=True)
     print(f"LIGA_TRACKIO_ENABLED={{str(TRACKIO_ENABLED).lower()}}", flush=True)
     print(f"LIGA_TRACKIO_WARNING={{TRACKIO_WARNING}}", flush=True)
 
