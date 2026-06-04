@@ -64,6 +64,12 @@ export interface ToolStateChangeEventData {
   outputDir?: string;
   failureReason?: string;
   logsUnavailable?: boolean;
+  region?: string;
+  s3TrainUri?: string;
+  s3OutputUri?: string;
+  s3ModelArtifact?: string;
+  cloudWatchLogsUrl?: string;
+  outputPolicy?: string;
   trackioSpaceId?: string;
   trackioProject?: string;
   namespace?: string;

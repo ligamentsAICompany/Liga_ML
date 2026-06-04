@@ -208,6 +208,8 @@ def _validate_tool_args(tool_args: dict) -> tuple[bool, str | None]:
 _IMMEDIATE_HF_JOB_RUNS = {"run", "uv"}
 _IMMEDIATE_GCP_VERTEX_JOB_RUNS = {"run"}
 _APPROVAL_REQUIRED_GCP_VERTEX_OPS = {"run", "cancel"}
+_IMMEDIATE_AWS_SAGEMAKER_JOB_RUNS = {"run"}
+_APPROVAL_REQUIRED_AWS_SAGEMAKER_OPS = {"run", "cancel"}
 _APPROVAL_TTL_MINUTES = 30
 
 
@@ -237,14 +239,27 @@ def _is_immediate_gcp_vertex_job_run(tool_name: str, tool_args: dict) -> bool:
     )
 
 
+def _is_immediate_aws_sagemaker_job_run(tool_name: str, tool_args: dict) -> bool:
+    return (
+        tool_name == "aws_sagemaker_jobs"
+        and _operation(tool_args) in _IMMEDIATE_AWS_SAGEMAKER_JOB_RUNS
+    )
+
+
 def _is_gcp_vertex_cancel(tool_name: str, tool_args: dict) -> bool:
     return tool_name == "gcp_vertex_jobs" and _operation(tool_args) == "cancel"
 
 
+def _is_aws_sagemaker_cancel(tool_name: str, tool_args: dict) -> bool:
+    return tool_name == "aws_sagemaker_jobs" and _operation(tool_args) == "cancel"
+
+
 def _is_immediate_cloud_job_run(tool_name: str, tool_args: dict) -> bool:
-    return _is_immediate_hf_job_run(
-        tool_name, tool_args
-    ) or _is_immediate_gcp_vertex_job_run(tool_name, tool_args)
+    return (
+        _is_immediate_hf_job_run(tool_name, tool_args)
+        or _is_immediate_gcp_vertex_job_run(tool_name, tool_args)
+        or _is_immediate_aws_sagemaker_job_run(tool_name, tool_args)
+    )
 
 
 def _is_scheduled_hf_job_run(tool_name: str, tool_args: dict) -> bool:
@@ -298,6 +313,9 @@ def _base_needs_approval(
     if tool_name == "gcp_vertex_jobs":
         return _operation(tool_args) in _APPROVAL_REQUIRED_GCP_VERTEX_OPS
 
+    if tool_name == "aws_sagemaker_jobs":
+        return _operation(tool_args) in _APPROVAL_REQUIRED_AWS_SAGEMAKER_OPS
+
     # Check for file upload operations (hf_private_repos or other tools)
     if tool_name == "hf_private_repos":
         operation = tool_args.get("operation", "")
@@ -337,6 +355,8 @@ def _needs_approval(
     if _is_scheduled_hf_job_run(tool_name, tool_args):
         return True
     if _is_gcp_vertex_cancel(tool_name, tool_args):
+        return True
+    if _is_aws_sagemaker_cancel(tool_name, tool_args):
         return True
     if config and config.yolo_mode:
         return False
@@ -408,10 +428,21 @@ async def _approval_decision(
             block_reason="Vertex AI job cancellation always requires manual approval.",
         )
 
+    if _is_aws_sagemaker_cancel(tool_name, tool_args):
+        return ApprovalDecision(
+            requires_approval=True,
+            auto_approval_blocked=_effective_yolo_enabled(session, config),
+            block_reason=(
+                "SageMaker job cancellation always requires manual approval."
+            ),
+        )
+
     yolo_enabled = _effective_yolo_enabled(session, config)
     session_yolo_enabled = _session_auto_approval_enabled(session)
     budgeted_target = _is_budgeted_auto_approval_target(tool_name, tool_args)
-    if _is_immediate_gcp_vertex_job_run(tool_name, tool_args):
+    if _is_immediate_gcp_vertex_job_run(
+        tool_name, tool_args
+    ) or _is_immediate_aws_sagemaker_job_run(tool_name, tool_args):
         estimate = await estimate_tool_cost(tool_name, tool_args, session=session)
         remaining = _remaining_budget_after_reservations(session, reserved_spend_usd)
         if not session_yolo_enabled:
@@ -419,7 +450,7 @@ async def _approval_decision(
                 requires_approval=True,
                 auto_approval_blocked=yolo_enabled,
                 block_reason=(
-                    "Vertex AI run requires manual approval unless session "
+                    "Cloud training run requires manual approval unless session "
                     "auto-approval with a cost cap is enabled."
                 ),
                 estimated_cost_usd=estimate.estimated_cost_usd,
@@ -529,10 +560,16 @@ def _record_estimated_spend(session: Session, decision: ApprovalDecision) -> Non
 def _approval_metadata(
     session: Session, tool_name: str, tool_args: dict[str, Any]
 ) -> dict[str, Any] | None:
-    if tool_name not in {"hf_jobs", "gcp_vertex_jobs"}:
+    provider_by_tool = {
+        "hf_jobs": "hf-jobs",
+        "gcp_vertex_jobs": "gcp-vertex",
+        "aws_sagemaker_jobs": "aws-sagemaker",
+    }
+    provider = provider_by_tool.get(tool_name)
+    if provider is None:
         return None
     metadata: dict[str, Any] = {
-        "provider": "hf-jobs" if tool_name == "hf_jobs" else "gcp-vertex",
+        "provider": provider,
         "training_goal": getattr(session, "training_goal", None),
         "output_policy": getattr(session, "output_policy", None),
     }
@@ -547,6 +584,10 @@ def _approval_metadata(
         ("dataset_split", "dataset_split"),
         ("hardware_flavor", "hardware"),
         ("hardware", "hardware"),
+        ("instance_type", "instance_type"),
+        ("instance_count", "instance_count"),
+        ("max_run_seconds", "max_run_seconds"),
+        ("output_policy", "output_policy"),
     ):
         value = tool_args.get(source_key)
         if value not in {None, ""} and target_key not in metadata:
@@ -564,16 +605,17 @@ def _approval_record(
 ) -> dict[str, Any]:
     operation = normalize_tool_operation(tool_args.get("operation"))
     created_at = datetime.now(UTC)
+    provider_by_tool = {
+        "hf_jobs": "hf-jobs",
+        "gcp_vertex_jobs": "gcp-vertex",
+        "aws_sagemaker_jobs": "aws-sagemaker",
+    }
     return {
         "approval_id": tc.id,
         "tool_call_id": tc.id,
         "tool": tool_name,
         "operation": operation,
-        "provider": "gcp-vertex"
-        if tool_name == "gcp_vertex_jobs"
-        else "hf-jobs"
-        if tool_name == "hf_jobs"
-        else None,
+        "provider": provider_by_tool.get(tool_name),
         "created_at": created_at.isoformat(),
         "expires_at": (
             created_at + timedelta(minutes=_APPROVAL_TTL_MINUTES)
@@ -2605,7 +2647,7 @@ async def process_submission(session: Session, submission) -> bool:
         cloud_provider = op.data.get("cloud_provider") if op.data else None
         training_goal = op.data.get("training_goal") if op.data else None
         output_policy = op.data.get("output_policy") if op.data else None
-        if cloud_provider in {"hf-jobs", "gcp-vertex"}:
+        if cloud_provider in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}:
             session.cloud_provider = cloud_provider
             if training_goal in {"smoke-test", "production", "agent-decide"}:
                 session.training_goal = training_goal
@@ -2637,6 +2679,25 @@ async def process_submission(session: Session, submission) -> bool:
                     "approval. For non-training requests, use the normal best-fit "
                     "tools."
                 )
+            elif cloud_provider == "aws-sagemaker":
+                provider_instruction = (
+                    "The frontend training provider selector for this session is "
+                    "set to AWS SageMaker AI. For training, fine-tuning, SFT, "
+                    "model adaptation, or cloud compute requests, use "
+                    "aws_sagemaker_jobs and do not route to Hugging Face Jobs or "
+                    "Google Cloud Vertex AI compute unless the provider changes. "
+                    "Use normalized uploaded dataset configs from this session "
+                    "when present. For AWS training/fine-tuning/SFT, use "
+                    "aws_sagemaker_jobs; it stages normalized datasets to S3 "
+                    "and can submit SageMaker training jobs when readiness and "
+                    "training image config are present. Before billable jobs, "
+                    "show a concise preflight/request approval. Respect "
+                    f"training_goal={training_goal} and output_policy={output_policy}. "
+                    "For output_policy=cloud-private, keep final artifacts in "
+                    "private S3 and do not push to Hugging Face Hub. Operation "
+                    "run and cancel are approval-gated; do not use Hugging Face "
+                    "Jobs or Google Cloud Vertex AI compute unless the provider changes."
+                )
             else:
                 provider_instruction = (
                     "The frontend training provider selector for this session is "
@@ -2650,9 +2711,9 @@ async def process_submission(session: Session, submission) -> bool:
                     "Hugging Face Jobs preflight and the approval-gated hf_jobs "
                     "step; do not stop after planning unless a real clarification "
                     "is required. hf_jobs run operations are approval-gated and "
-                    "billable; do not launch them without approval. Do not route "
-                    "to gcp_vertex_jobs or aws_sagemaker_jobs unless the user "
-                    "changes provider. Do not use Kaggle."
+                    "billable; do not launch them without approval. Keep compute "
+                    "on Hugging Face Jobs unless the user changes provider. Do "
+                    "not use Kaggle."
                 )
             session.context_manager.add_message(
                 Message(

@@ -34,7 +34,7 @@ def test_ci_workflow_has_backend_frontend_without_secrets_or_deploy() -> None:
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
     workflow = workflow_path.read_text(encoding="utf-8")
 
-    assert "branches: [main, gcloud]" in workflow
+    assert "branches: [main, gcloud, AWS]" in workflow
     assert "uv sync --all-extras" in workflow
     assert "uv run ruff check ." in workflow
     assert "uv run ruff format --check ." in workflow
@@ -43,6 +43,8 @@ def test_ci_workflow_has_backend_frontend_without_secrets_or_deploy() -> None:
     assert "npm run lint" in workflow
     assert "npm run build" in workflow
     assert "npm run test:training-result" in workflow
+    assert "npm run test:cloud-providers" in workflow
+    assert "npm run test:aws-sagemaker-panel" in workflow
     lowered = workflow.lower()
     assert "secrets." not in lowered
     assert "gcloud run deploy" not in lowered

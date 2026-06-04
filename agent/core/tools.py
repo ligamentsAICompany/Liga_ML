@@ -43,6 +43,10 @@ from agent.tools.gcp_vertex_jobs_tool import (
     GCP_VERTEX_JOBS_TOOL_SPEC,
     gcp_vertex_jobs_handler,
 )
+from agent.tools.aws_sagemaker_jobs_tool import (
+    AWS_SAGEMAKER_JOBS_TOOL_SPEC,
+    aws_sagemaker_jobs_handler,
+)
 from agent.tools.hf_repo_files_tool import (
     HF_REPO_FILES_TOOL_SPEC,
     hf_repo_files_handler,
@@ -382,6 +386,12 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             description=GCP_VERTEX_JOBS_TOOL_SPEC["description"],
             parameters=GCP_VERTEX_JOBS_TOOL_SPEC["parameters"],
             handler=gcp_vertex_jobs_handler,
+        ),
+        ToolSpec(
+            name=AWS_SAGEMAKER_JOBS_TOOL_SPEC["name"],
+            description=AWS_SAGEMAKER_JOBS_TOOL_SPEC["description"],
+            parameters=AWS_SAGEMAKER_JOBS_TOOL_SPEC["parameters"],
+            handler=aws_sagemaker_jobs_handler,
         ),
         # HF Repo management tools
         ToolSpec(

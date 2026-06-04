@@ -247,3 +247,64 @@ async def test_hf_provider_note_preserves_goal_policy_and_routes_to_hf(monkeypat
     assert "hf_jobs" in note
     assert "gcp_vertex_jobs" in note
     assert "unless the user changes provider" in note
+
+
+@pytest.mark.asyncio
+async def test_aws_provider_note_routes_training_to_sagemaker_tool(monkeypatch):
+    session = _session()
+    seen_messages = []
+
+    async def fake_run_agent(session, text):
+        seen_messages.extend(session.context_manager.items)
+        return "ok"
+
+    monkeypatch.setattr(Handlers, "run_agent", fake_run_agent)
+    submission = SimpleNamespace(
+        operation=SimpleNamespace(
+            op_type=OpType.USER_INPUT,
+            data={
+                "text": "fine tune this model",
+                "cloud_provider": "aws-sagemaker",
+            },
+        )
+    )
+
+    await process_submission(session, submission)
+
+    note = "\n".join(str(getattr(message, "content", "")) for message in seen_messages)
+    assert "AWS SageMaker AI" in note
+    assert "aws_sagemaker_jobs" in note
+    assert "stages normalized datasets to S3" in note
+    assert "can submit SageMaker training jobs" in note
+    assert "training image config" in note
+    assert "do not route to Hugging Face Jobs or Google Cloud Vertex AI" in note
+    assert "uploaded dataset" in note.lower()
+    assert "approval-gated" in note.lower()
+
+
+@pytest.mark.asyncio
+async def test_hf_provider_note_does_not_include_aws_routing(monkeypatch):
+    session = _session()
+    seen_messages = []
+
+    async def fake_run_agent(session, text):
+        seen_messages.extend(session.context_manager.items)
+        return "ok"
+
+    monkeypatch.setattr(Handlers, "run_agent", fake_run_agent)
+    submission = SimpleNamespace(
+        operation=SimpleNamespace(
+            op_type=OpType.USER_INPUT,
+            data={"text": "fine tune this model", "cloud_provider": "hf-jobs"},
+        )
+    )
+
+    await process_submission(session, submission)
+
+    provider_notes = [
+        str(getattr(message, "content", "")) for message in seen_messages[1:]
+    ]
+    note = "\n".join(provider_notes)
+    assert "Hugging Face Jobs" in note
+    assert "AWS SageMaker AI" not in note
+    assert "aws_sagemaker_jobs" not in note

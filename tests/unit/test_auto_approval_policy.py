@@ -86,6 +86,30 @@ def test_gcp_vertex_read_only_operations_do_not_require_approval():
         )
 
 
+def test_aws_sagemaker_run_and_cancel_require_approval():
+    config = _config(confirm_cpu_jobs=False)
+
+    assert agent_loop._needs_approval(
+        "aws_sagemaker_jobs", {"operation": "run"}, config
+    )
+    assert agent_loop._needs_approval(
+        "aws_sagemaker_jobs",
+        {"operation": "cancel", "job_name": "training-job"},
+        config,
+    )
+
+
+def test_aws_sagemaker_read_only_operations_do_not_require_approval():
+    config = _config(confirm_cpu_jobs=True)
+
+    for operation in ["ps", "logs", "inspect"]:
+        assert not agent_loop._needs_approval(
+            "aws_sagemaker_jobs",
+            {"operation": operation, "job_name": "training-job"},
+            config,
+        )
+
+
 def test_existing_sandbox_approval_behavior_is_unchanged():
     config = _config()
 
@@ -172,6 +196,46 @@ def test_hf_jobs_approval_metadata_includes_provider_model_and_dataset():
     }
 
 
+def test_aws_sagemaker_approval_metadata_includes_provider_dataset_and_runtime():
+    session = SimpleNamespace(
+        training_goal="production",
+        output_policy="cloud-private",
+        uploaded_datasets=[
+            {
+                "repo_id": "owner/uploaded-hardware-dataset",
+                "config_name": "normalized",
+                "normalized_row_count": 40,
+            }
+        ],
+    )
+
+    metadata = agent_loop._approval_metadata(
+        session,
+        "aws_sagemaker_jobs",
+        {
+            "operation": "run",
+            "model_name": "Qwen/Qwen2.5-1.5B-Instruct",
+            "instance_type": "ml.g5.xlarge",
+            "instance_count": 1,
+            "max_run_seconds": 7200,
+            "output_policy": "cloud-private",
+        },
+    )
+
+    assert metadata == {
+        "provider": "aws-sagemaker",
+        "training_goal": "production",
+        "output_policy": "cloud-private",
+        "model": "Qwen/Qwen2.5-1.5B-Instruct",
+        "instance_type": "ml.g5.xlarge",
+        "instance_count": 1,
+        "max_run_seconds": 7200,
+        "dataset": "owner/uploaded-hardware-dataset",
+        "dataset_config": "normalized",
+        "dataset_rows": 40,
+    }
+
+
 def test_approval_record_adds_recoverable_identity_and_expiry():
     tc = ToolCall(
         id="call-gcp-1",
@@ -193,6 +257,32 @@ def test_approval_record_adds_recoverable_identity_and_expiry():
     assert record["tool"] == "gcp_vertex_jobs"
     assert record["operation"] == "run"
     assert record["provider"] == "gcp-vertex"
+    assert record["status"] == "pending"
+    assert record["created_at"]
+    assert record["expires_at"]
+
+
+def test_aws_sagemaker_approval_record_adds_provider_identity():
+    tc = ToolCall(
+        id="call-aws-1",
+        type="function",
+        function={
+            "name": "aws_sagemaker_jobs",
+            "arguments": '{"operation":"run"}',
+        },
+    )
+
+    record = agent_loop._approval_record(
+        tc,
+        "aws_sagemaker_jobs",
+        {"operation": "run", "output_policy": "cloud-private"},
+    )
+
+    assert record["approval_id"] == "call-aws-1"
+    assert record["tool_call_id"] == "call-aws-1"
+    assert record["tool"] == "aws_sagemaker_jobs"
+    assert record["operation"] == "run"
+    assert record["provider"] == "aws-sagemaker"
     assert record["status"] == "pending"
     assert record["created_at"]
     assert record["expires_at"]
@@ -264,6 +354,63 @@ async def test_gcp_vertex_unknown_cost_blocks_auto_approval(monkeypatch):
     assert decision.requires_approval is True
     assert decision.auto_approval_blocked is True
     assert "max_run_hours" in decision.block_reason
+
+
+@pytest.mark.asyncio
+async def test_aws_sagemaker_job_under_cap_auto_runs_when_cost_is_known(monkeypatch):
+    async def fake_estimate(*args, **kwargs):
+        return CostEstimate(estimated_cost_usd=1.5, billable=True)
+
+    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
+
+    decision = await agent_loop._approval_decision(
+        "aws_sagemaker_jobs",
+        {
+            "operation": "run",
+            "instance_type": "ml.g5.xlarge",
+            "max_run_seconds": 3600,
+        },
+        _session(cap=5.0, spent=1.0),
+    )
+
+    assert decision.requires_approval is False
+    assert decision.auto_approved is True
+    assert decision.estimated_cost_usd == 1.5
+
+
+@pytest.mark.asyncio
+async def test_aws_sagemaker_unknown_cost_blocks_auto_approval(monkeypatch):
+    async def fake_estimate(*args, **kwargs):
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason="SageMaker jobs need max_run_seconds.",
+        )
+
+    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
+
+    decision = await agent_loop._approval_decision(
+        "aws_sagemaker_jobs",
+        {"operation": "run", "instance_type": "ml.g5.xlarge"},
+        _session(cap=5.0, spent=0.0),
+    )
+
+    assert decision.requires_approval is True
+    assert decision.auto_approval_blocked is True
+    assert "max_run_seconds" in decision.block_reason
+
+
+@pytest.mark.asyncio
+async def test_aws_sagemaker_cancel_stays_manual_with_auto_approval():
+    decision = await agent_loop._approval_decision(
+        "aws_sagemaker_jobs",
+        {"operation": "cancel", "job_name": "training-job"},
+        _session(cap=5.0, spent=0.0),
+    )
+
+    assert decision.requires_approval is True
+    assert decision.auto_approval_blocked is True
+    assert "cancellation" in decision.block_reason
 
 
 @pytest.mark.asyncio

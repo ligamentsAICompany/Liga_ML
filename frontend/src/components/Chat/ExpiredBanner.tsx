@@ -13,6 +13,7 @@ import { loadMessages } from '@/lib/chat-message-store';
 import { uiMessagesToLLMMessages } from '@/lib/convert-llm-messages';
 import { logger } from '@/utils/logger';
 import type { CloudProviderId } from '@/types/agent';
+import { isCloudProviderId } from '@/lib/cloud-providers';
 
 interface Props {
   sessionId: string;
@@ -60,7 +61,7 @@ export default function ExpiredBanner({ sessionId }: Props) {
       renameSession(sessionId, newId);
       if (data.model) updateSessionModel(newId, data.model);
       const restoredProvider = data.cloud_provider as CloudProviderId | undefined;
-      if (restoredProvider === 'hf-jobs' || restoredProvider === 'gcp-vertex') {
+      if (isCloudProviderId(restoredProvider)) {
         updateSessionCloudProvider(newId, restoredProvider);
       }
     } catch (e) {

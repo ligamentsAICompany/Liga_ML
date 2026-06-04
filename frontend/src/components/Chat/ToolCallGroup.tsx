@@ -15,6 +15,7 @@ import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunP
 import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import type { OutputPolicy, TrainingGoal } from '@/types/agent';
 import type { UIMessage } from 'ai';
 
@@ -565,6 +566,16 @@ function InlineApproval({
       );
       setRightPanelOpen(true);
       setLeftSidebarOpen(false);
+    } else if (toolName === 'aws_sagemaker_jobs' && args) {
+      const awsPanel = createAwsSageMakerRunPanel(args);
+      if (!awsPanel) return;
+      setPanel(
+        { ...awsPanel.data, parameters: { ...args, tool_call_id: toolCallId } },
+        awsPanel.view,
+        awsPanel.editable,
+      );
+      setRightPanelOpen(true);
+      setLeftSidebarOpen(false);
     }
   }, [toolCallId, toolName, args, scriptLabel, setPanel, getEditedScript, setRightPanelOpen, setLeftSidebarOpen]);
 
@@ -715,6 +726,39 @@ function InlineApproval({
                 {' · '}Storage destination:{' '}
                 <Box component="span" sx={{ color: 'var(--text)', fontWeight: 500 }}>
                   {storageDestinationLabel(outputPolicy)}
+                </Box>
+              </Typography>
+            )}
+            {autoApproval?.estimatedCostUsd !== undefined && autoApproval.estimatedCostUsd !== null && (
+              <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.8 }}>
+                Estimated cost:{' '}
+                <Box component="span" sx={{ color: 'var(--accent-yellow)', fontWeight: 500 }}>
+                  ${autoApproval.estimatedCostUsd.toFixed(2)}
+                </Box>
+                {autoApproval.remainingCapUsd !== undefined && autoApproval.remainingCapUsd !== null && (
+                  <> · Remaining auto-approval cap: ${autoApproval.remainingCapUsd.toFixed(2)}</>
+                )}
+              </Typography>
+            )}
+          </Box>
+        );
+      })()}
+
+      {toolName === 'aws_sagemaker_jobs' && args && (() => {
+        const operation = String(args.operation || '').toLowerCase();
+        if (operation !== 'run' && operation !== 'cancel') return null;
+        return (
+          <Box sx={{ mb: 1.5 }}>
+            <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.75rem', mb: 0.5 }}>
+              {operation === 'cancel'
+                ? 'Cancel this SageMaker job only after manual approval.'
+                : 'Launch a billable SageMaker training job only after manual approval.'}
+            </Typography>
+            {args.max_run_seconds !== undefined && args.max_run_seconds !== null && (
+              <Typography variant="body2" sx={{ color: 'var(--muted-text)', fontSize: '0.7rem', opacity: 0.8 }}>
+                Max runtime for approval guardrails:{' '}
+                <Box component="span" sx={{ color: 'var(--text)', fontWeight: 500 }}>
+                  {String(args.max_run_seconds)} seconds
                 </Box>
               </Typography>
             )}
@@ -917,6 +961,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         displayMap[t.toolCallId] = 'Training Planner';
       } else if (t.toolName === 'dataset_discovery') {
         displayMap[t.toolCallId] = 'Dataset Discovery';
+      } else if (t.toolName === 'aws_sagemaker_jobs') {
+        displayMap[t.toolCallId] = 'AWS SageMaker Job';
       }
     }
     return { scriptLabelMap: scriptMap, toolDisplayMap: displayMap };
@@ -1060,6 +1106,48 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         }
       }
 
+      if (tool.toolName === 'aws_sagemaker_jobs' && args) {
+        const awsPanel = createAwsSageMakerRunPanel(args);
+        const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
+        const runtimeState = getJobRuntimeState(tool.toolCallId);
+        const stateMarkdown = buildAwsStateMarkdown(runtimeState || {});
+        const outputContent = appendAwsTrainingResultSummary([jobOutput ? String(jobOutput) : '', stateMarkdown]
+          .filter(Boolean)
+          .join('\n\n'));
+
+        if (awsPanel) {
+          setPanel(
+            {
+              ...awsPanel.data,
+              ...(outputContent
+                ? { output: { content: outputContent, language: 'markdown' } }
+                : awsPanel.data.output
+                  ? { output: awsPanel.data.output }
+                  : {}),
+              parameters: { ...args, tool_call_id: tool.toolCallId },
+            },
+            outputContent && tool.state === 'output-error' ? 'output' : awsPanel.view,
+            false,
+          );
+          setRightPanelOpen(true);
+          setLeftSidebarOpen(false);
+          return;
+        }
+
+        if (outputContent) {
+          setPanel(
+            {
+              title: displayName,
+              output: { content: outputContent, language: 'markdown' },
+              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+            },
+            'output',
+          );
+          setRightPanelOpen(true);
+          setLeftSidebarOpen(false);
+          return;
+        }
+      }
       const outputText = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
       const planningPanel = createPreflightPanel(tool.toolName, outputText, args);
       if (planningPanel) {
@@ -1176,6 +1264,22 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     };
   }
 
+  function parseAwsMeta(output: unknown): { jobUrl?: string; jobName?: string; s3OutputUri?: string; s3ModelArtifact?: string; cloudWatchLogsUrl?: string } {
+    if (typeof output !== 'string') return {};
+    const consoleMatch = output.match(/\*\*SageMaker console:\*\*\s*(https:\/\/[^\s\n]+)/);
+    const logsMatch = output.match(/\*\*CloudWatch logs:\*\*\s*(https:\/\/[^\s\n]+)/);
+    const jobMatch = output.match(/\*\*Job name:\*\*\s*`?([^`\n]+)`?/);
+    const outputMatch = output.match(/\*\*S3 output URI:\*\*\s*`?([^`\n]+)`?/);
+    const artifactMatch = output.match(/\*\*S3 model artifact:\*\*\s*`?([^`\n]+)`?/);
+    return {
+      jobUrl: consoleMatch?.[1],
+      jobName: jobMatch?.[1]?.trim(),
+      s3OutputUri: outputMatch?.[1]?.trim(),
+      s3ModelArtifact: artifactMatch?.[1]?.trim(),
+      cloudWatchLogsUrl: logsMatch?.[1],
+    };
+  }
+
   // ── Render ────────────────────────────────────────────────────────
   const decidedCount = pendingTools.filter(t => decisions[t.toolCallId]).length;
 
@@ -1274,16 +1378,20 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             : statusLabel(displayState as ToolPartState);
 
           // Parse job metadata from job outputs and state-change side channels.
-          const isJobTool = tool.toolName === 'hf_jobs' || tool.toolName === 'gcp_vertex_jobs';
+          const isJobTool = tool.toolName === 'hf_jobs' || tool.toolName === 'gcp_vertex_jobs' || tool.toolName === 'aws_sagemaker_jobs';
           const jobUrlFromStore = isJobTool ? getJobUrl(tool.toolCallId) : undefined;
           const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
           const vertexRuntimeState = tool.toolName === 'gcp_vertex_jobs' ? getJobRuntimeState(tool.toolCallId) : undefined;
+          const awsRuntimeState = tool.toolName === 'aws_sagemaker_jobs' ? getJobRuntimeState(tool.toolCallId) : undefined;
 
           const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
             ? parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
           const vertexMetaFromOutput = tool.toolName === 'gcp_vertex_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
             ? parseVertexMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
+            : {};
+          const awsMetaFromOutput = tool.toolName === 'aws_sagemaker_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
+            ? parseAwsMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
 
           // Store job status if we just parsed it and don't have it stored yet
@@ -1294,11 +1402,15 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           // Combine job URL and status from store (persisted) with output metadata (freshly parsed)
           // Prefer stored values to ensure they persist across renders
           const jobMeta = {
-            jobUrl: jobUrlFromStore || vertexRuntimeState?.jobUrl || vertexMetaFromOutput.jobUrl || jobMetaFromOutput.jobUrl,
+            jobUrl: jobUrlFromStore || vertexRuntimeState?.jobUrl || awsRuntimeState?.jobUrl || vertexMetaFromOutput.jobUrl || awsMetaFromOutput.jobUrl || jobMetaFromOutput.jobUrl,
             jobStatus: jobStatusFromStore || jobMetaFromOutput.jobStatus,
-            jobName: vertexRuntimeState?.jobName || vertexMetaFromOutput.jobName,
+            jobName: vertexRuntimeState?.jobName || awsRuntimeState?.jobName || vertexMetaFromOutput.jobName || awsMetaFromOutput.jobName,
             outputDir: vertexRuntimeState?.outputDir || vertexMetaFromOutput.outputDir,
+            s3OutputUri: awsRuntimeState?.s3OutputUri || awsMetaFromOutput.s3OutputUri,
+            s3ModelArtifact: awsRuntimeState?.s3ModelArtifact || awsMetaFromOutput.s3ModelArtifact,
+            cloudWatchLogsUrl: awsRuntimeState?.cloudWatchLogsUrl || awsMetaFromOutput.cloudWatchLogsUrl,
             vertexState: vertexRuntimeState?.state,
+            awsState: awsRuntimeState?.state,
           };
 
           return (
@@ -1327,6 +1439,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                       ? 'output-error'
                       : ((tool.toolName === 'hf_jobs' && jobMeta.jobStatus && ['ERROR', 'FAILED', 'CANCELLED'].includes(jobMeta.jobStatus))
                         || (tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState && ['failed', 'cancelled', 'expired'].some((stateName) => jobMeta.vertexState?.toLowerCase().includes(stateName)))
+                        || (tool.toolName === 'aws_sagemaker_jobs' && jobMeta.awsState && ['failed', 'stopped'].some((stateName) => jobMeta.awsState?.toLowerCase().includes(stateName)))
                         ? 'output-error'
                         : displayState as ToolPartState)
                   }
@@ -1366,7 +1479,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   if (
                     !chipLabel ||
                     (tool.toolName === 'hf_jobs' && jobMeta.jobStatus) ||
-                    (tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState)
+                    (tool.toolName === 'gcp_vertex_jobs' && jobMeta.vertexState) ||
+                    (tool.toolName === 'aws_sagemaker_jobs' && jobMeta.awsState)
                   ) return null;
 
                   return (
@@ -1437,6 +1551,29 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   />
                 )}
 
+                {tool.toolName === 'aws_sagemaker_jobs' && jobMeta.awsState && (
+                  <Chip
+                    label={jobMeta.awsState}
+                    size="small"
+                    sx={{
+                      height: 20,
+                      fontSize: '0.65rem',
+                      fontWeight: 600,
+                      bgcolor: ['failed', 'stopped'].some((stateName) => jobMeta.awsState?.toLowerCase().includes(stateName))
+                        ? 'rgba(224,90,79,0.12)'
+                        : jobMeta.awsState.toLowerCase().includes('succeeded')
+                          ? 'rgba(47,204,113,0.12)'
+                          : 'rgba(255,193,59,0.12)',
+                      color: ['failed', 'stopped'].some((stateName) => jobMeta.awsState?.toLowerCase().includes(stateName))
+                        ? 'var(--accent-red)'
+                        : jobMeta.awsState.toLowerCase().includes('succeeded')
+                          ? 'var(--accent-green)'
+                          : 'var(--accent-yellow)',
+                      letterSpacing: '0.03em',
+                    }}
+                  />
+                )}
+
                 {/* Job link — single place, shown whenever URL is available */}
                 {isJobTool && jobMeta.jobUrl && (
                   <Link
@@ -1456,8 +1593,51 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                     }}
                   >
                     <LaunchIcon sx={{ fontSize: 12 }} />
-                    {tool.toolName === 'gcp_vertex_jobs' ? 'View on Vertex' : 'View on HF'}
+                    {tool.toolName === 'gcp_vertex_jobs'
+                      ? 'View on Vertex'
+                      : tool.toolName === 'aws_sagemaker_jobs'
+                        ? 'View on SageMaker'
+                        : 'View on HF'}
                   </Link>
+                )}
+
+                {tool.toolName === 'aws_sagemaker_jobs' && jobMeta.cloudWatchLogsUrl && (
+                  <Link
+                    href={jobMeta.cloudWatchLogsUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={(e) => e.stopPropagation()}
+                    sx={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 0.5,
+                      color: 'var(--accent-yellow)',
+                      fontSize: '0.68rem',
+                      textDecoration: 'none',
+                      ml: 0.5,
+                      '&:hover': { textDecoration: 'underline' },
+                    }}
+                  >
+                    <LaunchIcon sx={{ fontSize: 12 }} />
+                    CloudWatch logs
+                  </Link>
+                )}
+
+                {tool.toolName === 'aws_sagemaker_jobs' && (jobMeta.s3ModelArtifact || jobMeta.s3OutputUri) && (
+                  <Typography
+                    variant="caption"
+                    title={jobMeta.s3ModelArtifact || jobMeta.s3OutputUri}
+                    sx={{
+                      maxWidth: 180,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      color: 'var(--muted-text)',
+                      fontSize: '0.65rem',
+                    }}
+                  >
+                    {jobMeta.s3ModelArtifact ? 'S3 artifact' : 'S3 output'}
+                  </Typography>
                 )}
 
                 {clickable && !isPending && (

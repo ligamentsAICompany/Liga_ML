@@ -13,7 +13,7 @@ export interface MessageMeta {
   outputPolicy?: OutputPolicy;
 }
 
-export type CloudProviderId = 'hf-jobs' | 'gcp-vertex';
+export type CloudProviderId = 'hf-jobs' | 'gcp-vertex' | 'aws-sagemaker';
 export type TrainingGoal = 'smoke-test' | 'production' | 'agent-decide';
 export type OutputPolicy = 'cloud-private' | 'hf-hub' | 'cloud-and-hf-hub';
 

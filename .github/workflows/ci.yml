@@ -3,7 +3,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, gcloud]
+    branches: [main, gcloud, AWS]
 
 permissions:
   contents: read
@@ -90,3 +90,7 @@ jobs:
       - name: Run dataset discovery panel tests
         working-directory: frontend
         run: npm run test:dataset-discovery-panel
+
+      - name: Run AWS SageMaker panel tests
+        working-directory: frontend
+        run: npm run test:aws-sagemaker-panel

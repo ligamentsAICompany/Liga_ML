@@ -53,6 +53,7 @@ from session_manager import (
 
 import user_quotas
 
+from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
@@ -130,7 +131,7 @@ def _available_models() -> list[dict[str, Any]]:
 
 
 AVAILABLE_MODELS = _available_models()
-VALID_CLOUD_PROVIDERS = {"hf-jobs", "gcp-vertex"}
+VALID_CLOUD_PROVIDERS = {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
 
@@ -160,7 +161,7 @@ def _output_policy_or_default(value: Any) -> str:
 def _output_policy_for_provider(value: Any, cloud_provider: str) -> str:
     if value in VALID_OUTPUT_POLICIES:
         return str(value)
-    if cloud_provider == "gcp-vertex":
+    if cloud_provider in {"gcp-vertex", "aws-sagemaker"}:
         return "cloud-private"
     return "cloud-and-hf-hub"
 
@@ -411,6 +412,7 @@ async def provider_health() -> dict[str, Any]:
             else ["HF_TOKEN or user OAuth token is required to run HF Jobs."],
         },
         "gcp_vertex": build_gcp_vertex_readiness_snapshot(),
+        "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
     }
 
 
