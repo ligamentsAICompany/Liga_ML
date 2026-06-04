@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import re
+import tarfile
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
@@ -291,7 +293,7 @@ class AwsSageMakerJobsTool:
         except Exception as exc:
             return self._error(str(exc))
 
-        script_key = f"{s3_prefix.strip('/')}/jobs/{job_name}/code/train.py"
+        script_key = f"{s3_prefix.strip('/')}/jobs/{job_name}/code/source.tar.gz"
         script_s3_uri = f"s3://{s3_bucket}/{script_key}"
         try:
             await self._upload_training_script(
@@ -408,7 +410,7 @@ class AwsSageMakerJobsTool:
                 f"**S3 train URI:** `{staged.s3_train_uri}`\n"
                 f"**S3 output URI:** `{staged.s3_output_uri}`\n"
                 f"**S3 model artifact:** `{s3_model_artifact}`\n"
-                f"**Training script:** `{script_s3_uri}`\n"
+                f"**Training source:** `{script_s3_uri}`\n"
                 f"**Instance type:** `{instance_type}`\n"
                 f"**Instance count:** `{instance_count}`\n"
                 f"**Max run seconds:** `{max_run_seconds}`\n"
@@ -699,13 +701,24 @@ class AwsSageMakerJobsTool:
         self, *, bucket: str, key: str, script: str, region: str | None = None
     ) -> None:
         s3_client = self.s3_client or _load_s3_client(region)
+        payload = self._source_tarball(script)
         await asyncio.to_thread(
             s3_client.put_object,
             Bucket=bucket,
             Key=key,
-            Body=script.encode("utf-8"),
-            ContentType="text/x-python; charset=utf-8",
+            Body=payload,
+            ContentType="application/gzip",
         )
+
+    @staticmethod
+    def _source_tarball(script: str) -> bytes:
+        payload = io.BytesIO()
+        script_bytes = script.encode("utf-8")
+        info = tarfile.TarInfo("train.py")
+        info.size = len(script_bytes)
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            archive.addfile(info, io.BytesIO(script_bytes))
+        return payload.getvalue()
 
     async def _emit_running_state(
         self,

@@ -983,7 +983,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
             <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
           </Box>
 
-          {(selectedCloudProvider === 'gcp-vertex' || selectedCloudProvider === 'hf-jobs') && (
+          {(['gcp-vertex', 'hf-jobs', 'aws-sagemaker'] as CloudProviderId[]).includes(selectedCloudProvider) && (
             <>
               <Box
                 onClick={(event) => setTrainingGoalAnchorEl(event.currentTarget)}

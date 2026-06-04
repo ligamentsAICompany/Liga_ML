@@ -704,7 +704,7 @@ async def test_upload_route_appends_context_note_and_persists(monkeypatch):
     assert uploaded.normalized_path_in_repo in messages[0].content
     assert uploaded.raw_path_in_repo in messages[0].content
     assert uploaded.load_dataset_snippet in messages[0].content
-    assert "HF Jobs or GCP Vertex" in messages[0].content
+    assert "HF Jobs, GCP Vertex, or AWS SageMaker" in messages[0].content
     assert persisted == [agent_session]
     assert request_state["form_called"] is True
     assert close_state["closed"] is True

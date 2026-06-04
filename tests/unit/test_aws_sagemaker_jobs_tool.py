@@ -1,3 +1,5 @@
+import io
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -266,10 +268,16 @@ async def test_run_with_image_submits_training_job_and_uploads_script(monkeypatc
     assert staged_calls[0]["s3_bucket"] == "training-bucket"
     assert staged_calls[0]["hf_token"] == "hf-session-token"
 
-    script_puts = [put for put in s3.puts if put["Key"].endswith("/code/train.py")]
+    script_puts = [put for put in s3.puts if put["Key"].endswith("/code/source.tar.gz")]
     assert len(script_puts) == 1
     assert script_puts[0]["Bucket"] == "training-bucket"
-    assert "LIGA_PROVIDER=aws-sagemaker" in script_puts[0]["Body"].decode("utf-8")
+    assert script_puts[0]["ContentType"] == "application/gzip"
+    with tarfile.open(
+        fileobj=io.BytesIO(script_puts[0]["Body"]), mode="r:gz"
+    ) as archive:
+        train_py = archive.extractfile("train.py")
+        assert train_py is not None
+        assert "LIGA_PROVIDER=aws-sagemaker" in train_py.read().decode("utf-8")
 
     assert len(sagemaker.calls) == 1
     request = sagemaker.calls[0]
@@ -306,6 +314,9 @@ async def test_run_with_image_submits_training_job_and_uploads_script(monkeypatc
     )
     assert "HF_TOKEN" not in request["Environment"]
     assert request["HyperParameters"]["sagemaker_program"] == "train.py"
+    assert request["HyperParameters"]["sagemaker_submit_directory"].endswith(
+        "/code/source.tar.gz"
+    )
 
     event = session.events[-1]
     assert event.event_type == "tool_state_change"

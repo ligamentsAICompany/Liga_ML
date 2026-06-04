@@ -277,6 +277,9 @@ async def test_aws_provider_note_routes_training_to_sagemaker_tool(monkeypatch):
     assert "stages normalized datasets to S3" in note
     assert "can submit SageMaker training jobs" in note
     assert "training image config" in note
+    assert "training_planner" in note
+    assert "skip broad literature/research crawls" in note
+    assert "do not stop after planning" in note
     assert "do not route to Hugging Face Jobs or Google Cloud Vertex AI" in note
     assert "uploaded dataset" in note.lower()
     assert "approval-gated" in note.lower()

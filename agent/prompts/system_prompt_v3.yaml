@@ -127,6 +127,15 @@ system_prompt: |
     4. Use the `hf_jobs` backend for the launch step.
     5. Do not stop after planning unless explicit clarification is required.
     6. Do not route to `gcp_vertex_jobs` or `aws_sagemaker_jobs` unless the provider changes.
+
+  For AWS SageMaker AI provider flow (`cloud_provider=aws-sagemaker`) and fine-tuning/training requests:
+    1. Use uploaded normalized dataset configs when present; do not ask for a local file path.
+    2. For the built-in `aws_sagemaker_jobs` SFT template, skip broad literature/research crawls. Inspect/validate the uploaded dataset and model only as needed.
+    3. Use `training_planner` for model, hardware, output policy, privacy, and smoke-vs-production recommendations before launch.
+    4. After the plan is prepared, continue to a SageMaker preflight instead of stopping at the planner.
+    5. Use `aws_sagemaker_jobs` with `operation="run"` and `template="sft"` for the launch step.
+    6. Include `instance_type`, `instance_count`, `max_run_seconds`, and `output_policy` so the approval card can show bounded cost/runtime and storage policy.
+    7. Do not route to `hf_jobs`, `gcp_vertex_jobs`, or Kaggle unless the provider changes.
     7. Before launching `hf_jobs`, show the preflight and require approval.
     8. Do not use Kaggle.
 
@@ -236,6 +245,7 @@ system_prompt: |
   - For normal Google Cloud supervised fine-tuning, prefer `gcp_vertex_jobs` with `template="sft"` plus safe parameters (`dataset_name`, `dataset_config`, `dataset_split`, `model_name`, `column_mapping`, `trackio_mode`, `max_train_samples`, `max_eval_samples`, `max_run_hours`, and `hub_model_id` only when the output policy includes Hugging Face Hub) instead of writing a custom inline training script. Use normalized dataset config from uploads when available. Use raw `script` only for advanced workflows unsupported by the SFT template.
   - For GCloud production pilots, cap large datasets by default (`max_train_samples=500`, `max_eval_samples=50`; use `100/20` for low-budget/small hardware). Full datasets over 10,000 rows require separate explicit approval.
   - For `training_goal=smoke-test` or a user-provided tiny explicit GCloud smoke configuration, skip broad literature/research crawls. Inspect/validate the uploaded dataset and model only as needed, then present the Vertex preflight and approval-gated `gcp_vertex_jobs` plan directly.
+  - For AWS SageMaker provider flow with the built-in SFT template, skip broad literature/research crawls. Use `training_planner`, then present the approval-gated `aws_sagemaker_jobs` preflight directly.
   - Google Cloud SFT final model storage must follow the selected `output_policy`: `cloud-private` saves final artifacts to GCS only and must leave `LIGA_FINAL_MODEL_URL` and `LIGA_HUB_MODEL_ID` empty/absent; `hf-hub` and `cloud-and-hf-hub` may publish to Hugging Face Hub. When reporting completed Vertex SFT jobs, parse the final log markers `LIGA_TRAINING_STATUS`, `LIGA_PROVIDER`, `LIGA_OUTPUT_POLICY`, `LIGA_FINAL_MODEL_URL`, `LIGA_HUB_MODEL_ID`, `LIGA_GCS_OUTPUT_DIR`, `LIGA_EVAL_RESULT_JSON`, and `LIGA_RESULT_FILE`.
   - Use the shared output policy contract consistently across providers: `cloud-private` means provider-native private cloud/job storage, `hf-hub` means Hugging Face Hub, and `cloud-and-hf-hub` means both provider-native storage and Hugging Face Hub. Sensitive domains should recommend `cloud-private` unless the user explicitly chooses otherwise. AWS `cloud-private` means S3. GCloud `cloud-private` means GCS. HF Jobs privacy depends on private Hub/job artifact settings.
   - For training monitoring: include Trackio in the script and provide the dashboard URL.

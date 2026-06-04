@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
@@ -124,4 +125,11 @@ test('cloud provider guard accepts only known providers', () => {
   assert.equal(isCloudProviderId('gcp-vertex'), true);
   assert.equal(isCloudProviderId('aws-sagemaker'), true);
   assert.equal(isCloudProviderId('azure-ml'), false);
+});
+
+test('chat input exposes preflight selectors for AWS SageMaker', () => {
+  const source = readFileSync('src/components/Chat/ChatInput.tsx', 'utf8');
+
+  assert.match(source, /\['gcp-vertex', 'hf-jobs', 'aws-sagemaker'\]/);
+  assert.match(source, /outputPolicyLabel\(selectedOutputPolicy, selectedCloudProvider\)/);
 });
