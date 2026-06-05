@@ -46,6 +46,45 @@ ToolCall = ChatCompletionMessageToolCall
 _MALFORMED_TOOL_PREFIX = "ERROR: Tool call to '"
 _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
 _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT = 2
+_ACTIVE_CLOUD_JOB_STATES = {
+    "created",
+    "creating",
+    "pending",
+    "queued",
+    "starting",
+    "started",
+    "running",
+    "inprogress",
+    "in_progress",
+    "stopping",
+    "job_state_pending",
+    "job_state_queued",
+    "job_state_running",
+}
+_TERMINAL_CLOUD_JOB_STATES = {
+    "completed",
+    "succeeded",
+    "success",
+    "failed",
+    "stopped",
+    "cancelled",
+    "canceled",
+    "expired",
+    "job_state_succeeded",
+    "job_state_failed",
+    "job_state_cancelled",
+    "job_state_expired",
+}
+_AWS_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
+_GCP_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
+_AWS_PROVIDER_DRIFT_MESSAGE = (
+    "Provider is AWS SageMaker and a SageMaker job is active. "
+    "Use aws_sagemaker_jobs inspect/logs instead."
+)
+_GCP_PROVIDER_DRIFT_MESSAGE = (
+    "Provider is Google Cloud Vertex AI and a Vertex AI job is active. "
+    "Use gcp_vertex_jobs inspect/logs instead."
+)
 
 
 def _unfinished_plan_items(session: Session) -> list[dict[str, str]]:
@@ -82,6 +121,122 @@ def _no_tool_incomplete_plan_prompt(items: list[dict[str, str]]) -> str:
         "now. If you genuinely cannot continue, first use tools to inspect the "
         "state or verify the blocker."
     )
+
+
+def _normalized_cloud_job_state(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _latest_cloud_job_state(session: Session, tool_name: str) -> str | None:
+    """Return the latest observed state for a provider job tool in this session."""
+
+    for event in reversed(getattr(session, "logged_events", []) or []):
+        if not isinstance(event, dict):
+            continue
+        if event.get("event_type") != "tool_state_change":
+            continue
+        data = event.get("data") or {}
+        if not isinstance(data, dict) or data.get("tool") != tool_name:
+            continue
+        state = _normalized_cloud_job_state(data.get("state"))
+        if state:
+            return state
+    context_manager = getattr(session, "context_manager", None)
+    for message in reversed(getattr(context_manager, "items", []) or []):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        name = (
+            message.get("name")
+            if isinstance(message, dict)
+            else getattr(message, "name", None)
+        )
+        if role != "tool" or name != tool_name:
+            continue
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", "")
+        )
+        text = str(content or "").lower()
+        if any(
+            marker in text
+            for marker in (
+                "trainingjobstatus:** completed",
+                "trainingjobstatus: completed",
+                "job_state_succeeded",
+                "status:** completed",
+            )
+        ):
+            return "succeeded"
+        if any(
+            marker in text
+            for marker in (
+                "trainingjobstatus:** failed",
+                "trainingjobstatus: failed",
+                "job_state_failed",
+                "status:** failed",
+            )
+        ):
+            return "failed"
+        if any(
+            marker in text
+            for marker in (
+                "trainingjobstatus:** stopped",
+                "trainingjobstatus: stopped",
+                "job_state_cancelled",
+                "job_state_expired",
+            )
+        ):
+            return "stopped"
+        if (
+            tool_name == "aws_sagemaker_jobs"
+            and "aws sagemaker training job submitted" in text
+        ):
+            return "running"
+        if tool_name == "gcp_vertex_jobs" and "vertex ai job submitted" in text:
+            return "running"
+    return None
+
+
+def _has_active_provider_job(session: Session, tool_name: str) -> bool:
+    state = _latest_cloud_job_state(session, tool_name)
+    if not state or state in _TERMINAL_CLOUD_JOB_STATES:
+        return False
+    return state in _ACTIVE_CLOUD_JOB_STATES or bool(state)
+
+
+def _provider_tool_policy_violation(
+    session: Session, tool_name: str, tool_args: dict[str, Any]
+) -> str | None:
+    """Block compute-provider drift while an active provider job is being monitored."""
+
+    provider = str(getattr(session, "cloud_provider", "hf-jobs") or "hf-jobs").strip()
+    operation = _operation(tool_args)
+
+    if provider == "aws-sagemaker" and _has_active_provider_job(
+        session, "aws_sagemaker_jobs"
+    ):
+        if tool_name == "aws_sagemaker_jobs":
+            if operation in _AWS_MONITORING_ALLOWED_OPS:
+                return None
+            return _AWS_PROVIDER_DRIFT_MESSAGE
+        if tool_name in {"sandbox_create", "bash", "hf_jobs", "gcp_vertex_jobs"}:
+            return _AWS_PROVIDER_DRIFT_MESSAGE
+
+    if provider == "gcp-vertex" and _has_active_provider_job(
+        session, "gcp_vertex_jobs"
+    ):
+        if tool_name == "gcp_vertex_jobs":
+            if operation in _GCP_MONITORING_ALLOWED_OPS:
+                return None
+            return _GCP_PROVIDER_DRIFT_MESSAGE
+        if tool_name in {"sandbox_create", "bash", "hf_jobs", "aws_sagemaker_jobs"}:
+            return _GCP_PROVIDER_DRIFT_MESSAGE
+
+    return None
 
 
 def _uploaded_dataset_instruction(session: Session) -> str | None:
@@ -2010,6 +2165,58 @@ class Handlers:
                         )
                     )
 
+                policy_allowed_tools: list[tuple[ToolCall, str, dict]] = []
+                for tc, tool_name, tool_args in good_tools:
+                    violation = _provider_tool_policy_violation(
+                        session, tool_name, tool_args
+                    )
+                    if violation is None:
+                        policy_allowed_tools.append((tc, tool_name, tool_args))
+                        continue
+
+                    error_msg = f"ERROR: {violation}"
+                    session.context_manager.add_message(
+                        Message(
+                            role="tool",
+                            content=error_msg,
+                            tool_call_id=tc.id,
+                            name=tool_name,
+                        )
+                    )
+                    await session.send_event(
+                        Event(
+                            event_type="tool_call",
+                            data={
+                                "tool": tool_name,
+                                "arguments": tool_args,
+                                "tool_call_id": tc.id,
+                            },
+                        )
+                    )
+                    await session.send_event(
+                        Event(
+                            event_type="tool_output",
+                            data={
+                                "tool": tool_name,
+                                "tool_call_id": tc.id,
+                                "output": error_msg,
+                                "success": False,
+                            },
+                        )
+                    )
+                    await session.send_event(
+                        Event(
+                            event_type="tool_state_change",
+                            data={
+                                "tool_call_id": tc.id,
+                                "tool": tool_name,
+                                "state": "blocked",
+                                "reason": violation,
+                            },
+                        )
+                    )
+                good_tools = policy_allowed_tools
+
                 # ── Cancellation check: before tool execution ──
                 if session.is_cancelled:
                     break
@@ -2676,8 +2883,12 @@ async def process_submission(session: Session, submission) -> bool:
                     "company data), recommend cloud-private unless user explicitly "
                     "chooses otherwise. gcp_vertex_jobs run and cancel operations "
                     "are approval-gated and billable; do not launch them without "
-                    "approval. For non-training requests, use the normal best-fit "
-                    "tools."
+                    "approval. After a Vertex AI job is launched, monitor only "
+                    "with gcp_vertex_jobs inspect/logs/ps, or cancel if the user "
+                    "approves cancellation. Do not use sandbox_create, bash, "
+                    "hf_jobs, or aws_sagemaker_jobs for Vertex job cooldown, "
+                    "polling, or monitoring. For non-training requests, use the "
+                    "normal best-fit tools."
                 )
             elif cloud_provider == "aws-sagemaker":
                 provider_instruction = (
@@ -2699,7 +2910,12 @@ async def process_submission(session: Session, submission) -> bool:
                     "For output_policy=cloud-private, keep final artifacts in "
                     "private S3 and do not push to Hugging Face Hub. Operation "
                     "run and cancel are approval-gated; do not use Hugging Face "
-                    "Jobs or Google Cloud Vertex AI compute unless the provider changes."
+                    "Jobs or Google Cloud Vertex AI compute unless the provider "
+                    "changes. After a SageMaker job is launched, monitor only "
+                    "with aws_sagemaker_jobs inspect/logs/ps, or cancel if the "
+                    "user approves cancellation. Do not use sandbox_create, bash, "
+                    "hf_jobs, or gcp_vertex_jobs for SageMaker cooldown, polling, "
+                    "or monitoring."
                 )
             else:
                 provider_instruction = (

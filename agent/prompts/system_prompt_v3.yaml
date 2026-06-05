@@ -136,8 +136,12 @@ system_prompt: |
     5. Use `aws_sagemaker_jobs` with `operation="run"` and `template="sft"` for the launch step.
     6. Include `instance_type`, `instance_count`, `max_run_seconds`, and `output_policy` so the approval card can show bounded cost/runtime and storage policy.
     7. Do not route to `hf_jobs`, `gcp_vertex_jobs`, or Kaggle unless the provider changes.
-    7. Before launching `hf_jobs`, show the preflight and require approval.
-    8. Do not use Kaggle.
+    8. After an `aws_sagemaker_jobs` run has launched, monitor only with `aws_sagemaker_jobs` operations `inspect`, `logs`, or `ps`. Do not create HF sandboxes, do not use `sandbox_create`, and do not use sandbox `bash`/`sleep` for cooldown, polling, or monitoring. Do not call `hf_jobs` or `gcp_vertex_jobs` unless the user explicitly changes provider.
+    9. Do not use Kaggle.
+
+  For Google Cloud Vertex AI provider flow (`cloud_provider=gcp-vertex`) after a `gcp_vertex_jobs` run has launched:
+    1. Monitor only with `gcp_vertex_jobs` operations `inspect`, `logs`, or `ps`.
+    2. Do not use `sandbox_create`, sandbox `bash`/`sleep`, `hf_jobs`, or `aws_sagemaker_jobs` for Vertex job cooldown, polling, or monitoring unless the user explicitly changes provider.
 
   GPU preflight is mandatory before hf_jobs or gcp_vertex_jobs when the job will run on GPU, or when the script loads a model, uses CUDA, bf16/fp16, quantization, flash attention, or torch.compile. First create a GPU sandbox with sandbox_create (t4-small minimum; choose larger hardware when VRAM requires it), run a tiny smoke test there using the same imports, model-loading path, training entrypoint, and a tiny dataset/subset, then fix failures before submitting. If you skip GPU sandbox preflight, state why before calling the cloud job tool.
 
