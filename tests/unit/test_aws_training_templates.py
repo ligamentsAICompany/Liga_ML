@@ -4,6 +4,7 @@ import pytest
 
 from agent.training_templates.aws_sft import (
     AwsSftTemplateConfig,
+    DEFAULT_AWS_PACKAGES,
     build_aws_sft_training_script,
 )
 from agent.training_templates.aws_validation import validate_aws_sft_template_request
@@ -62,6 +63,62 @@ def test_aws_sft_template_has_final_markers_and_dependency_skip_flag():
         assert marker in script
 
 
+def test_aws_sft_template_disables_torchvision_before_transformers_imports():
+    script = _script()
+
+    disable_index = script.index('TRANSFORMERS_NO_TORCHVISION", "1"')
+    transformers_index = script.index("from transformers import AutoModelForCausalLM")
+    trl_index = script.index("from trl import SFTConfig, SFTTrainer")
+
+    assert disable_index < transformers_index
+    assert disable_index < trl_index
+    assert 'HF_HUB_DISABLE_TELEMETRY", "1"' in script
+
+
+def test_aws_sft_template_does_not_import_or_install_torchvision_directly():
+    script = _script()
+    tree = ast.parse(script)
+    imported_modules = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    imported_from_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+
+    assert "torchvision" not in imported_modules
+    assert "torchvision" not in imported_from_modules
+    assert '"torch==' not in script
+    assert "torchvision" not in "\n".join(DEFAULT_AWS_PACKAGES)
+
+
+def test_aws_sft_template_prints_dependency_sanity_info():
+    script = _script()
+
+    assert "Python version:" in script
+    assert "torch version:" in script
+    assert "torch cuda available:" in script
+    assert "transformers version:" in script
+    assert "datasets version:" in script
+    assert "trl version:" in script
+    assert "peft version:" in script
+
+
+def test_aws_sft_template_treats_torchvision_incompatibility_as_text_only_non_fatal():
+    script = _script()
+
+    assert (
+        "torchvision unavailable or incompatible; continuing because this is text-only SFT."
+        in script
+    )
+    assert "except Exception as exc" in script
+    assert "check_optional_torchvision()" in script
+
+
 def test_aws_sft_template_output_policy_token_behavior_is_runtime_checked():
     private_script = _script("aws-private")
     hub_script = _script("hf-hub")
@@ -76,7 +133,20 @@ def test_aws_sft_template_output_policy_token_behavior_is_runtime_checked():
     )
     assert "trainer.push_to_hub()" in hub_script
     assert "trainer.push_to_hub()" in cloud_hub_script
-    assert 'OUTPUT_POLICY != "aws-private"' in private_script
+    assert "push_to_hub=OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES" in private_script
+
+
+def test_aws_sft_template_cloud_private_is_s3_only():
+    script = _script("cloud-private")
+
+    assert "requires HF_TOKEN or HUGGINGFACE_HUB_TOKEN" in script
+    assert "PUBLISH_TO_HUB_POLICIES" in script
+    assert "push_to_hub=OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES" in script
+    assert "if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES:" in script
+    assert (
+        'hub_model_id_marker = HUB_MODEL_ID if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES else ""'
+        in script
+    )
 
 
 def test_aws_sft_template_formats_phase3_normalized_rows():

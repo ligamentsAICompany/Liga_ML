@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_AWS_PACKAGES = [
-    "torch==2.4.0",
     "transformers>=4.45,<5",
     "trl==1.5.1",
     "accelerate>=0.34,<2",
@@ -75,11 +74,16 @@ def build_aws_sft_training_script(config: AwsSftTemplateConfig) -> str:
 
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 CONFIG = json.loads({config_json!r})
 
@@ -88,6 +92,7 @@ OUTPUT_MODEL_ID = "{config.output_model_id}"
 OUTPUT_POLICY = "{config.output_policy}"
 HUB_MODEL_ID = CONFIG.get("hub_model_id") or OUTPUT_MODEL_ID
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+PUBLISH_TO_HUB_POLICIES = {{"hf-hub", "cloud-and-hf-hub"}}
 if OUTPUT_POLICY in {{"hf-hub", "cloud-and-hf-hub"}} and not HF_TOKEN:
     raise RuntimeError(
         "output_policy requires HF_TOKEN or HUGGINGFACE_HUB_TOKEN at runtime; tokens are never printed."
@@ -119,6 +124,47 @@ def install_dependencies() -> None:
 
 
 install_dependencies()
+
+
+def _package_version(package_name):
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def check_optional_torchvision() -> None:
+    try:
+        module = importlib.import_module("torchvision")
+    except Exception as exc:
+        print(
+            "torchvision unavailable or incompatible; continuing because this is text-only SFT. "
+            f"Reason: {{type(exc).__name__}}: {{exc}}",
+            flush=True,
+        )
+        return
+    print(f"torchvision version: {{getattr(module, '__version__', 'unknown')}}", flush=True)
+
+
+def print_dependency_sanity() -> None:
+    print(f"Python version: {{sys.version.split()[0]}}", flush=True)
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError(
+            "torch is required for AWS text SFT but could not be imported: "
+            f"{{type(exc).__name__}}: {{exc}}"
+        ) from exc
+    print(f"torch version: {{getattr(torch, '__version__', 'unknown')}}", flush=True)
+    print(f"torch cuda available: {{torch.cuda.is_available()}}", flush=True)
+    print(f"transformers version: {{_package_version('transformers')}}", flush=True)
+    print(f"datasets version: {{_package_version('datasets')}}", flush=True)
+    print(f"trl version: {{_package_version('trl')}}", flush=True)
+    print(f"peft version: {{_package_version('peft')}}", flush=True)
+    check_optional_torchvision()
+
+
+print_dependency_sanity()
 
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -277,7 +323,7 @@ def write_result(status, eval_metrics, train_rows, eval_rows, eval_note, final_m
         "s3_output_dir": os.environ.get("LIGA_S3_OUTPUT_DIR", ""),
         "cloudwatch_logs_url": os.environ.get("LIGA_CLOUDWATCH_LOGS_URL", ""),
         "output_policy": OUTPUT_POLICY,
-        "hub_model_id": HUB_MODEL_ID if OUTPUT_POLICY != "aws-private" else "",
+        "hub_model_id": HUB_MODEL_ID if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES else "",
         "model_url": final_model_url,
         "eval": eval_metrics,
         "eval_note": eval_note,
@@ -318,7 +364,7 @@ def main() -> None:
         disable_tqdm=True,
         report_to=["trackio"] if (trackio_project or trackio_space_id) else [],
         remove_unused_columns=False,
-        push_to_hub=OUTPUT_POLICY != "aws-private",
+        push_to_hub=OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES,
         hub_model_id=HUB_MODEL_ID,
         hub_strategy="every_save",
         packing=False,
@@ -359,7 +405,7 @@ def main() -> None:
     write_metrics(eval_metrics)
 
     final_model_url = ""
-    if OUTPUT_POLICY in {{"hf-hub", "cloud-and-hf-hub"}}:
+    if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES:
         trainer.push_to_hub()
         final_model_url = f"https://huggingface.co/{{HUB_MODEL_ID}}"
 
@@ -373,6 +419,7 @@ def main() -> None:
     )
 
     eval_json = json.dumps(eval_metrics, separators=(",", ":"), sort_keys=True)
+    hub_model_id_marker = HUB_MODEL_ID if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES else ""
     print("LIGA_TRAINING_STATUS=succeeded", flush=True)
     print("LIGA_PROVIDER=aws-sagemaker", flush=True)
     print(f"LIGA_AWS_TRAINING_JOB_NAME={{os.environ.get('LIGA_AWS_TRAINING_JOB_NAME', '')}}", flush=True)
@@ -381,7 +428,7 @@ def main() -> None:
     print(f"LIGA_S3_OUTPUT_DIR={{os.environ.get('LIGA_S3_OUTPUT_DIR', '')}}", flush=True)
     print(f"LIGA_CLOUDWATCH_LOGS_URL={{os.environ.get('LIGA_CLOUDWATCH_LOGS_URL', '')}}", flush=True)
     print(f"LIGA_FINAL_MODEL_URL={{final_model_url}}", flush=True)
-    print(f"LIGA_HUB_MODEL_ID={{HUB_MODEL_ID if OUTPUT_POLICY != 'aws-private' else ''}}", flush=True)
+    print(f"LIGA_HUB_MODEL_ID={{hub_model_id_marker}}", flush=True)
     print(f"LIGA_EVAL_RESULT_JSON={{eval_json}}", flush=True)
     print(f"LIGA_RESULT_FILE={{RESULT_FILE_NAME}}", flush=True)
 
