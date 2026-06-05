@@ -48,11 +48,24 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_REGION",
         "GCS_BUCKET",
+        "VERTEX_STAGING_BUCKET",
+        "VERTEX_OUTPUT_DIR",
         "VERTEX_AI_STAGING_BUCKET",
         "VERTEX_AI_OUTPUT_DIR",
+        "AWS_REGION",
+        "AWS_S3_BUCKET",
+        "AWS_S3_PREFIX",
+        "AWS_SAGEMAKER_ROLE_ARN",
+        "AWS_SAGEMAKER_TRAINING_IMAGE_URI",
+        "AWS_DEFAULT_INSTANCE_TYPE",
+        "AWS_DEFAULT_INSTANCE_COUNT",
+        "AWS_DEFAULT_MAX_RUN_SECONDS",
+        "AWS_OUTPUT_POLICY",
         "ML_INTERN_KPIS_DISABLED",
     ]:
         assert f"{name}=" in env_vars
+
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in deploy_args
 
 
 def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
@@ -61,13 +74,25 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
 
     substitutions = config["substitutions"]
     assert substitutions["_HF_TOKEN_SECRET"] == "hf-token"
+    assert substitutions["_HUGGINGFACE_HUB_TOKEN_SECRET"] == "huggingface-hub-token"
     assert substitutions["_GITHUB_TOKEN_SECRET"] == "github-token"
     assert substitutions["_OPENAI_API_KEY_SECRET"] == "openai-api-key"
+    assert substitutions["_AWS_ACCESS_KEY_ID_SECRET"] == "aws-access-key-id"
+    assert substitutions["_AWS_SECRET_ACCESS_KEY_SECRET"] == "aws-secret-access-key"
+    assert substitutions["_AWS_SESSION_TOKEN_SECRET"] == ""
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg
+    assert (
+        "HUGGINGFACE_HUB_TOKEN=${_HUGGINGFACE_HUB_TOKEN_SECRET}:latest" in secrets_arg
+    )
     assert "GITHUB_TOKEN=${_GITHUB_TOKEN_SECRET}:latest" in secrets_arg
     assert "OPENAI_API_KEY=${_OPENAI_API_KEY_SECRET}:latest" in secrets_arg
+    assert "AWS_ACCESS_KEY_ID=${_AWS_ACCESS_KEY_ID_SECRET}:latest" in secrets_arg
+    assert (
+        "AWS_SECRET_ACCESS_KEY=${_AWS_SECRET_ACCESS_KEY_SECRET}:latest" in secrets_arg
+    )
+    assert "AWS_SESSION_TOKEN=${_AWS_SESSION_TOKEN_SECRET}:latest" in secrets_arg
 
     forbidden = ["hf_", "github_pat_", "ghp_", "sk-"]
     assert all(marker not in rendered for marker in forbidden)

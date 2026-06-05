@@ -22,12 +22,18 @@ AWS_S3_PREFIX=liga-ml
 AWS_SAGEMAKER_ROLE_ARN=arn:aws:iam::123456789012:role/LigaMLSageMakerExecutionRole
 AWS_DEFAULT_INSTANCE_TYPE=ml.g5.xlarge
 AWS_DEFAULT_INSTANCE_COUNT=1
-AWS_DEFAULT_MAX_RUN_SECONDS=3600
+AWS_DEFAULT_MAX_RUN_SECONDS=7200
 AWS_OUTPUT_POLICY=aws-private
 AWS_SAGEMAKER_TRAINING_IMAGE_URI=123456789012.dkr.ecr.us-east-1.amazonaws.com/your-training-image:latest
 ```
 
 `AWS_SAGEMAKER_TRAINING_IMAGE_URI` is required before live submission. The app will not guess a framework image.
+
+For Cloud Run production, store `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+and optional temporary `AWS_SESSION_TOKEN` in Secret Manager or use an approved
+workload identity/federation strategy. Do not commit `.env`, AWS config files,
+access keys, local datasets, `.playwright-mcp`, caches, or generated artifacts.
+Do not bake AWS credentials into the Docker image.
 
 ## IAM Roles
 
@@ -93,7 +99,7 @@ From the repository root:
 
 ```bash
 uv run python scripts/check_aws_readiness.py
-uv run python scripts/aws_sagemaker_dry_run.py --dataset-name example/dataset --model-name Qwen/Qwen2.5-0.5B-Instruct --output-model-id aws-smoke-model --max-run-seconds 3600 --allow-missing-aws --allow-missing-image
+uv run python scripts/aws_sagemaker_dry_run.py --dataset-name example/dataset --model-name Qwen/Qwen2.5-0.5B-Instruct --output-model-id aws-smoke-model --max-run-seconds 7200 --allow-missing-aws --allow-missing-image
 curl http://localhost:5173/api/health/providers
 ```
 
@@ -104,7 +110,7 @@ curl http://localhost:5173/api/health/providers
 In the app, select AWS SageMaker and run this only after maintainers approve credentials, IAM, S3, ECR image, and cost:
 
 ```text
-Run a tiny AWS SageMaker SFT smoke test using template="sft". Use dataset_name="HuggingFaceH4/ultrachat_200k", dataset_split="train_sft", model_name="Qwen/Qwen2.5-0.5B-Instruct", output_model_id="your-hf-namespace/aws-smoke-model", max_train_samples=5, max_eval_samples=2, num_train_epochs=1, max_run_seconds=3600, output_policy="aws-private", and do not push to Hugging Face Hub.
+Run a tiny AWS SageMaker SFT smoke test using template="sft". Use dataset_name="HuggingFaceH4/ultrachat_200k", dataset_split="train_sft", model_name="Qwen/Qwen2.5-0.5B-Instruct", output_model_id="your-hf-namespace/aws-smoke-model", max_train_samples=5, max_eval_samples=2, num_train_epochs=1, max_run_seconds=7200, output_policy="aws-private", and do not push to Hugging Face Hub.
 ```
 
 Confirm the approval card, cost estimate, SageMaker console URL, S3 output path, CloudWatch Logs URL, and final result markers.
