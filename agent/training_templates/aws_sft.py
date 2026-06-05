@@ -278,7 +278,10 @@ def _message_text(messages, role):
             continue
         if str(message.get("role") or "").strip().lower() != role:
             continue
-        content = _string_value(message.get("content"))
+        content = message.get("content")
+        if content is None:
+            continue
+        content = str(content).strip()
         if content:
             parts.append(content)
     return "\\n\\n".join(parts).strip()

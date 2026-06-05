@@ -184,6 +184,13 @@ def test_aws_sft_template_validates_structured_messages_before_trainer():
     assert "assistant_text" in script
 
 
+def test_aws_sft_template_message_validation_does_not_call_string_value_with_scalar():
+    script = _script()
+
+    assert "_string_value(message.get(" not in script
+    assert 'content = message.get("content")' in script
+
+
 def test_aws_sft_template_uses_current_trl_processing_class_style():
     script = _script()
 
