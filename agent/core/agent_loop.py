@@ -78,12 +78,18 @@ _TERMINAL_CLOUD_JOB_STATES = {
 _AWS_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
 _GCP_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
 _AWS_PROVIDER_DRIFT_MESSAGE = (
-    "Provider is AWS SageMaker and a SageMaker job is active. "
-    "Use aws_sagemaker_jobs inspect/logs instead."
+    "An AWS SageMaker job is already active or terminal in this session. "
+    "Use aws_sagemaker_jobs inspect/logs/ps. Do not use sandbox/bash/HF tools "
+    "for AWS monitoring."
 )
 _GCP_PROVIDER_DRIFT_MESSAGE = (
     "Provider is Google Cloud Vertex AI and a Vertex AI job is active. "
     "Use gcp_vertex_jobs inspect/logs instead."
+)
+_AWS_SECOND_RUN_BLOCK_MESSAGE = (
+    _AWS_PROVIDER_DRIFT_MESSAGE
+    + " AWS job failed. No automatic retry was launched. Ask the user explicitly "
+    "before preparing another paid AWS SageMaker run."
 )
 
 
@@ -208,6 +214,45 @@ def _has_active_provider_job(session: Session, tool_name: str) -> bool:
     return state in _ACTIVE_CLOUD_JOB_STATES or bool(state)
 
 
+def _has_provider_job(session: Session, tool_name: str) -> bool:
+    return _latest_cloud_job_state(session, tool_name) is not None
+
+
+def _has_terminal_provider_job(session: Session, tool_name: str) -> bool:
+    state = _latest_cloud_job_state(session, tool_name)
+    return bool(state and state in _TERMINAL_CLOUD_JOB_STATES)
+
+
+def _has_explicit_aws_paid_retry_intent(session: Session) -> bool:
+    if bool(getattr(session, "aws_sagemaker_retry_authorized", False)):
+        return True
+    retry_markers = (
+        "retry",
+        "launch another",
+        "run another",
+        "second paid",
+        "approve second",
+        "try again",
+    )
+    context_manager = getattr(session, "context_manager", None)
+    for message in reversed(getattr(context_manager, "items", []) or []):
+        role = (
+            message.get("role")
+            if isinstance(message, dict)
+            else getattr(message, "role", None)
+        )
+        if role != "user":
+            continue
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", "")
+        )
+        text = str(content or "").lower()
+        return any(marker in text for marker in retry_markers)
+    return False
+
+
 def _provider_tool_policy_violation(
     session: Session, tool_name: str, tool_args: dict[str, Any]
 ) -> str | None:
@@ -216,14 +261,24 @@ def _provider_tool_policy_violation(
     provider = str(getattr(session, "cloud_provider", "hf-jobs") or "hf-jobs").strip()
     operation = _operation(tool_args)
 
-    if provider == "aws-sagemaker" and _has_active_provider_job(
-        session, "aws_sagemaker_jobs"
-    ):
+    if provider == "aws-sagemaker" and _has_provider_job(session, "aws_sagemaker_jobs"):
         if tool_name == "aws_sagemaker_jobs":
             if operation in _AWS_MONITORING_ALLOWED_OPS:
                 return None
+            if operation == "run" and _has_terminal_provider_job(
+                session, "aws_sagemaker_jobs"
+            ):
+                if _has_explicit_aws_paid_retry_intent(session):
+                    return None
+                return _AWS_SECOND_RUN_BLOCK_MESSAGE
             return _AWS_PROVIDER_DRIFT_MESSAGE
-        if tool_name in {"sandbox_create", "bash", "hf_jobs", "gcp_vertex_jobs"}:
+        if tool_name in {
+            "sandbox_create",
+            "bash",
+            "hf_jobs",
+            "gcp_vertex_jobs",
+            "hf_repo_files",
+        }:
             return _AWS_PROVIDER_DRIFT_MESSAGE
 
     if provider == "gcp-vertex" and _has_active_provider_job(
@@ -589,6 +644,18 @@ async def _approval_decision(
             auto_approval_blocked=_effective_yolo_enabled(session, config),
             block_reason=(
                 "SageMaker job cancellation always requires manual approval."
+            ),
+        )
+
+    if _is_immediate_aws_sagemaker_job_run(
+        tool_name, tool_args
+    ) and _has_terminal_provider_job(session, "aws_sagemaker_jobs"):
+        return ApprovalDecision(
+            requires_approval=True,
+            auto_approval_blocked=True,
+            block_reason=(
+                "A second paid AWS SageMaker run after a terminal job requires "
+                "explicit manual approval."
             ),
         )
 

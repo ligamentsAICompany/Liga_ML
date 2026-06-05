@@ -29,12 +29,18 @@ def _tool_message(tool, content):
 def test_aws_active_job_blocks_cross_provider_compute_tools():
     session = _session(events=[_tool_state("aws_sagemaker_jobs")])
 
-    for tool_name in ["sandbox_create", "bash", "hf_jobs", "gcp_vertex_jobs"]:
+    for tool_name in [
+        "sandbox_create",
+        "bash",
+        "hf_jobs",
+        "gcp_vertex_jobs",
+        "hf_repo_files",
+    ]:
         violation = agent_loop._provider_tool_policy_violation(session, tool_name, {})
 
         assert violation is not None
-        assert "Provider is AWS SageMaker" in violation
-        assert "Use aws_sagemaker_jobs inspect/logs instead." in violation
+        assert "An AWS SageMaker job is already active or terminal" in violation
+        assert "Use aws_sagemaker_jobs inspect/logs/ps" in violation
 
 
 def test_aws_active_job_allows_sagemaker_monitoring_and_cancel():
@@ -61,13 +67,58 @@ def test_aws_active_job_blocks_new_sagemaker_run():
     )
 
     assert violation is not None
-    assert "Provider is AWS SageMaker" in violation
+    assert "An AWS SageMaker job is already active or terminal" in violation
 
 
-def test_completed_aws_job_does_not_activate_monitoring_policy():
-    session = _session(events=[_tool_state("aws_sagemaker_jobs", state="succeeded")])
+def test_terminal_failed_aws_job_blocks_recovery_drift_tools():
+    session = _session(events=[_tool_state("aws_sagemaker_jobs", state="failed")])
 
-    assert agent_loop._provider_tool_policy_violation(session, "bash", {}) is None
+    for tool_name in ["bash", "hf_repo_files", "sandbox_create", "gcp_vertex_jobs"]:
+        violation = agent_loop._provider_tool_policy_violation(session, tool_name, {})
+
+        assert violation is not None
+        assert "already active or terminal" in violation
+
+
+def test_terminal_aws_job_allows_sagemaker_monitoring_tools():
+    session = _session(events=[_tool_state("aws_sagemaker_jobs", state="failed")])
+
+    for operation in ["inspect", "logs", "ps", "cancel"]:
+        assert (
+            agent_loop._provider_tool_policy_violation(
+                session,
+                "aws_sagemaker_jobs",
+                {"operation": operation, "job_name": "job-1"},
+            )
+            is None
+        )
+
+
+def test_terminal_aws_job_blocks_automatic_second_run():
+    session = _session(events=[_tool_state("aws_sagemaker_jobs", state="failed")])
+
+    violation = agent_loop._provider_tool_policy_violation(
+        session,
+        "aws_sagemaker_jobs",
+        {"operation": "run"},
+    )
+
+    assert violation is not None
+    assert "No automatic retry was launched" in violation
+
+
+def test_terminal_aws_job_allows_explicit_second_run_request_to_reach_approval():
+    session = _session(events=[_tool_state("aws_sagemaker_jobs", state="failed")])
+    session.aws_sagemaker_retry_authorized = True
+
+    assert (
+        agent_loop._provider_tool_policy_violation(
+            session,
+            "aws_sagemaker_jobs",
+            {"operation": "run"},
+        )
+        is None
+    )
 
 
 def test_aws_active_job_can_be_inferred_from_recent_run_tool_result():
@@ -82,7 +133,7 @@ def test_aws_active_job_can_be_inferred_from_recent_run_tool_result():
     violation = agent_loop._provider_tool_policy_violation(session, "bash", {})
 
     assert violation is not None
-    assert "Provider is AWS SageMaker" in violation
+    assert "An AWS SageMaker job is already active or terminal" in violation
 
 
 def test_gcp_active_job_blocks_cross_provider_compute_tools():

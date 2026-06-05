@@ -2,7 +2,10 @@ import json
 
 import pytest
 
-from agent.core.aws_dataset_staging import stage_hf_dataset_to_s3
+from agent.core.aws_dataset_staging import (
+    stage_hf_dataset_to_s3,
+    validate_sft_records_for_aws,
+)
 
 
 class FakeS3Client:
@@ -72,7 +75,7 @@ async def test_stage_hf_dataset_serializes_rows_and_uploads_expected_s3_key(
     assert result.s3_checkpoint_uri == (
         "s3://training-bucket/team/prefix/jobs/aws-job-1/checkpoints/"
     )
-    assert result.row_count == 2
+    assert result.row_count == 1
     assert result.dataset_name == "owner/uploaded-dataset"
     assert result.dataset_config == "upload_abc123"
     assert result.dataset_split == "train"
@@ -88,7 +91,6 @@ async def test_stage_hf_dataset_serializes_rows_and_uploads_expected_s3_key(
     decoded_lines = body.decode("utf-8").splitlines()
     assert [json.loads(line) for line in decoded_lines] == [
         {"nested": {"answer": 1}, "text": "hello"},
-        {"messages": [{"content": "hi", "role": "user"}]},
     ]
 
     public_text = str(result) + repr(s3.puts)
@@ -135,6 +137,42 @@ async def test_stage_hf_dataset_rejects_empty_dataset(monkeypatch):
             s3_prefix="prefix",
             job_name="job",
             s3_client=FakeS3Client(),
+        )
+
+
+def test_validate_sft_records_accepts_structured_markdown_rows():
+    summary = validate_sft_records_for_aws(
+        [
+            {
+                "messages": [
+                    {"role": "user", "content": "Why is my GPU overheating?"},
+                    {"role": "assistant", "content": "Check airflow and fans."},
+                ],
+                "prompt": "Why is my GPU overheating?",
+                "completion": "Check airflow and fans.",
+                "text": "User: Why is my GPU overheating?\n\nAssistant: Check airflow and fans.",
+            }
+        ]
+    )
+
+    assert summary["valid_records"] == 1
+    assert summary["messages_records"] == 1
+    assert summary["prompt_completion_records"] == 1
+    assert summary["text_records"] == 1
+
+
+def test_validate_sft_records_rejects_empty_structured_content():
+    with pytest.raises(ValueError, match="no valid SFT records"):
+        validate_sft_records_for_aws(
+            [
+                {
+                    "messages": [
+                        {"role": "user", "content": "   "},
+                        {"role": "assistant", "content": ""},
+                    ],
+                    "text": "",
+                }
+            ]
         )
 
 

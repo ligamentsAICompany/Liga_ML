@@ -269,8 +269,49 @@ def format_example(example):
     return {{"text": fallback_text_from_example(example)}}
 
 
+def _message_text(messages, role):
+    if not isinstance(messages, list):
+        return ""
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").strip().lower() != role:
+            continue
+        content = _string_value(message.get("content"))
+        if content:
+            parts.append(content)
+    return "\\n\\n".join(parts).strip()
+
+
+def validate_formatted_example(example):
+    messages = example.get("messages")
+    if isinstance(messages, list):
+        user_text = _message_text(messages, "user")
+        assistant_text = _message_text(messages, "assistant")
+        return bool(user_text and assistant_text)
+    if "text" in example:
+        return bool(_string_value(example, "text"))
+    if "prompt" in example or "completion" in example:
+        return bool(_string_value(example, "prompt") and _string_value(example, "completion"))
+    return False
+
+
 def _format_dataset(dataset):
-    return dataset.map(format_example, remove_columns=dataset.column_names)
+    formatted = dataset.map(format_example, remove_columns=dataset.column_names)
+    valid_records = []
+    skipped_records = 0
+    for example in formatted:
+        if validate_formatted_example(example):
+            valid_records.append(dict(example))
+        else:
+            skipped_records += 1
+    if skipped_records:
+        print(f"Skipped {{skipped_records}} malformed SFT records.", flush=True)
+    if not valid_records:
+        raise ValueError("No valid SFT records found after formatting.")
+    print(f"Validated {{len(valid_records)}} SFT records.", flush=True)
+    return Dataset.from_list(valid_records)
 
 
 def prepare_datasets():

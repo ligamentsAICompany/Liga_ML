@@ -47,8 +47,81 @@ def _reject_binary(value: Any, *, row_index: int) -> Any:
     return value
 
 
+def _string_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _messages_have_user_and_assistant(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    has_user = False
+    has_assistant = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        content = _string_value(message.get("content"))
+        if role == "user" and content:
+            has_user = True
+        if role == "assistant" and content:
+            has_assistant = True
+    return has_user and has_assistant
+
+
+def _sft_record_supported_fields(row: dict[str, Any]) -> set[str]:
+    supported: set[str] = set()
+    if _messages_have_user_and_assistant(row.get("messages")):
+        supported.add("messages")
+    if _string_value(row.get("prompt")) and _string_value(row.get("completion")):
+        supported.add("prompt_completion")
+    if _string_value(row.get("text")):
+        supported.add("text")
+    return supported
+
+
+def _is_supported_sft_record(row: dict[str, Any]) -> bool:
+    return bool(_sft_record_supported_fields(row))
+
+
+def validate_sft_records_for_aws(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """Validate staged SFT rows before a paid SageMaker job can be requested."""
+    summary = {
+        "total_records": len(rows),
+        "valid_records": 0,
+        "invalid_records": 0,
+        "messages_records": 0,
+        "prompt_completion_records": 0,
+        "text_records": 0,
+    }
+    for row in rows:
+        supported_fields = _sft_record_supported_fields(row)
+        if not supported_fields:
+            summary["invalid_records"] += 1
+            continue
+        summary["valid_records"] += 1
+        if "messages" in supported_fields:
+            summary["messages_records"] += 1
+        if "prompt_completion" in supported_fields:
+            summary["prompt_completion_records"] += 1
+        if "text" in supported_fields:
+            summary["text_records"] += 1
+    if summary["valid_records"] <= 0:
+        raise ValueError(
+            "Loaded dataset split contains no valid SFT records. Expected at least one "
+            "row with messages, prompt+completion, or text."
+        )
+    return summary
+
+
+def _valid_sft_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    validate_sft_records_for_aws(rows)
+    return [row for row in rows if _is_supported_sft_record(row)]
+
+
 def _rows_to_jsonl_bytes(dataset: Any) -> tuple[bytes, int]:
-    lines: list[str] = []
+    rows: list[dict[str, Any]] = []
     for row_index, raw_row in enumerate(dataset, start=1):
         row = dict(raw_row) if not isinstance(raw_row, dict) else raw_row
         if not isinstance(row, dict):
@@ -56,14 +129,19 @@ def _rows_to_jsonl_bytes(dataset: Any) -> tuple[bytes, int]:
                 f"Dataset row {row_index} must serialize as a JSON object."
             )
         safe_row = _reject_binary(row, row_index=row_index)
+        rows.append(safe_row)
+    if not rows:
+        raise ValueError("Loaded dataset split contains no rows.")
+
+    valid_rows = _valid_sft_rows(rows)
+    lines: list[str] = []
+    for row_index, safe_row in enumerate(valid_rows, start=1):
         try:
             lines.append(json.dumps(safe_row, ensure_ascii=False, sort_keys=True))
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"Dataset row {row_index} could not be serialized as JSON: {exc}"
             ) from exc
-    if not lines:
-        raise ValueError("Loaded dataset split contains no rows.")
     return ("\n".join(lines) + "\n").encode("utf-8"), len(lines)
 
 

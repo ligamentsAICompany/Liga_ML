@@ -388,6 +388,9 @@ def _normalize_markdown(contents: bytes, filename: str) -> list[dict[str, Any]]:
         text = contents.decode("utf-8-sig")
     except UnicodeDecodeError:
         _bad_dataset("Markdown dataset must be UTF-8 encoded.")
+    structured_rows = _markdown_structured_example_rows(text, filename)
+    if structured_rows:
+        return structured_rows
     section_rows = _markdown_section_rows(text, filename)
     if section_rows:
         return section_rows
@@ -403,6 +406,92 @@ def _normalize_markdown(contents: bytes, filename: str) -> list[dict[str, Any]]:
         }
         for index, chunk in enumerate(chunks)
     ]
+
+
+_MARKDOWN_SFT_FIELD_RE = re.compile(
+    r"^\s*(?:[-*]\s*)?(User|Assistant|Category|Safety):\s*(.*)$",
+    re.IGNORECASE,
+)
+_MARKDOWN_EXAMPLE_HEADING_RE = re.compile(r"^##\s+Example\s+(\d+)\b", re.IGNORECASE)
+
+
+def _clean_markdown_field(lines: list[str]) -> str:
+    text = "\n".join(lines).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _compact_markdown_field(lines: list[str]) -> str:
+    return re.sub(r"\s+", " ", _clean_markdown_field(lines)).strip()
+
+
+def _extract_markdown_sft_fields(block: str) -> dict[str, str]:
+    fields: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in block.splitlines():
+        match = _MARKDOWN_SFT_FIELD_RE.match(line)
+        if match:
+            current = match.group(1).lower()
+            fields.setdefault(current, [])
+            remainder = match.group(2).strip()
+            if remainder:
+                fields[current].append(remainder)
+            continue
+        if current is not None:
+            fields[current].append(line)
+    return {key: _clean_markdown_field(value) for key, value in fields.items()}
+
+
+def _markdown_structured_example_rows(text: str, filename: str) -> list[dict[str, Any]]:
+    """Extract Markdown SFT examples with explicit User/Assistant blocks."""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    heading_indexes = [
+        index for index, line in enumerate(lines) if re.match(r"^##\s+\S", line)
+    ]
+    ranges: list[tuple[int, int]] = []
+    if heading_indexes:
+        for section_number, start in enumerate(heading_indexes):
+            end = (
+                heading_indexes[section_number + 1]
+                if section_number + 1 < len(heading_indexes)
+                else len(lines)
+            )
+            ranges.append((start, end))
+    else:
+        ranges.append((0, len(lines)))
+
+    rows: list[dict[str, Any]] = []
+    for start, end in ranges:
+        block = "\n".join(lines[start:end]).strip()
+        fields = _extract_markdown_sft_fields(block)
+        prompt = _clean_markdown_field([fields.get("user", "")])
+        completion = _clean_markdown_field([fields.get("assistant", "")])
+        if not prompt or not completion:
+            continue
+        heading = lines[start] if start < len(lines) else ""
+        heading_match = _MARKDOWN_EXAMPLE_HEADING_RE.match(heading)
+        example_index = int(heading_match.group(1)) if heading_match else len(rows) + 1
+        row: dict[str, Any] = {
+            "source_format": "md",
+            "source_file": filename,
+            "chunk_index": len(rows),
+            "example_index": example_index,
+            "text": f"User: {prompt}\n\nAssistant: {completion}",
+            "prompt": prompt,
+            "completion": completion,
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion},
+            ],
+        }
+        category = _compact_markdown_field([fields.get("category", "")])
+        safety = _compact_markdown_field([fields.get("safety", "")])
+        if category:
+            row["category"] = category
+        if safety:
+            row["safety"] = safety
+        rows.append(row)
+    return rows
 
 
 def _markdown_section_rows(text: str, filename: str) -> list[dict[str, Any]]:

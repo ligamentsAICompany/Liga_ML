@@ -173,6 +173,17 @@ def test_aws_sft_template_formats_phase3_normalized_rows():
     assert "Mapped {kind} column is missing" in script
 
 
+def test_aws_sft_template_validates_structured_messages_before_trainer():
+    script = _script()
+
+    assert "def validate_formatted_example" in script
+    assert "valid_records" in script
+    assert "Skipped" in script
+    assert "No valid SFT records found" in script
+    assert "user_text" in script
+    assert "assistant_text" in script
+
+
 def test_aws_sft_template_uses_current_trl_processing_class_style():
     script = _script()
 
