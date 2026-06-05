@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
@@ -15,7 +16,8 @@ import {
   consumeExplicitApprovalDecision,
   registerExplicitToolApprovals,
 } from '../src/lib/explicit-tool-approvals.js';
-import type { OutputPolicy, TrainingGoal } from '../src/types/agent.js';
+import { CLOUD_PROVIDER_OPTIONS, isCloudProviderId } from '../src/lib/cloud-providers.js';
+import type { CloudProviderId, OutputPolicy, TrainingGoal } from '../src/types/agent.js';
 
 test('defines GCloud preflight option labels and defaults', () => {
   assert.equal(DEFAULT_TRAINING_GOAL, 'agent-decide');
@@ -102,4 +104,32 @@ test('requires an explicit user approval before consuming a tool approval decisi
     namespace: null,
   });
   assert.equal(consumeExplicitApprovalDecision('session-1', 'tool-1'), null);
+});
+
+test('cloud provider options include AWS SageMaker AI', () => {
+  const ids = CLOUD_PROVIDER_OPTIONS.map((provider) => provider.id);
+  const labels = CLOUD_PROVIDER_OPTIONS.map((provider) => provider.name);
+
+  assert.deepEqual(ids, ['hf-jobs', 'gcp-vertex', 'aws-sagemaker']);
+  assert.ok(labels.includes('AWS SageMaker AI'));
+});
+
+test('cloud provider type accepts AWS SageMaker provider id', () => {
+  const provider: CloudProviderId = 'aws-sagemaker';
+
+  assert.equal(provider, 'aws-sagemaker');
+});
+
+test('cloud provider guard accepts only known providers', () => {
+  assert.equal(isCloudProviderId('hf-jobs'), true);
+  assert.equal(isCloudProviderId('gcp-vertex'), true);
+  assert.equal(isCloudProviderId('aws-sagemaker'), true);
+  assert.equal(isCloudProviderId('azure-ml'), false);
+});
+
+test('chat input exposes preflight selectors for AWS SageMaker', () => {
+  const source = readFileSync('src/components/Chat/ChatInput.tsx', 'utf8');
+
+  assert.match(source, /\['gcp-vertex', 'hf-jobs', 'aws-sagemaker'\]/);
+  assert.match(source, /outputPolicyLabel\(selectedOutputPolicy, selectedCloudProvider\)/);
 });

@@ -76,3 +76,68 @@ test('strips safe trailing URL punctuation from marked final model URL', () => {
 
   assert.equal(result?.finalModelUrl, 'https://huggingface.co/alice/model');
 });
+
+test('parses AWS SageMaker final result markers', () => {
+  const result = parseLigaTrainingResult(`
+LIGA_TRAINING_STATUS=succeeded
+LIGA_PROVIDER=aws-sagemaker
+LIGA_AWS_TRAINING_JOB_NAME=training-job-1
+LIGA_AWS_REGION=us-east-1
+LIGA_AWS_INSTANCE_TYPE=ml.g5.xlarge
+LIGA_AWS_INSTANCE_COUNT=1
+LIGA_S3_MODEL_ARTIFACT=s3://bucket/prefix/output/model.tar.gz
+LIGA_S3_OUTPUT_DIR=s3://bucket/prefix/output/
+LIGA_CLOUDWATCH_LOGS_URL=https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/foo,
+LIGA_OUTPUT_POLICY=aws-private
+LIGA_DATASET_SOURCE=owner/dataset
+LIGA_STAGED_TRAIN_URI=s3://bucket/prefix/input/train.jsonl
+LIGA_TRAIN_ROWS=20
+LIGA_EVAL_ROWS=4
+LIGA_EVAL_RESULT_JSON={"eval_loss":0.25}
+LIGA_RESULT_FILE=liga_training_result.json
+`);
+
+  assert.deepEqual(result, {
+    status: 'succeeded',
+    provider: 'aws-sagemaker',
+    awsTrainingJobName: 'training-job-1',
+    awsRegion: 'us-east-1',
+    awsInstanceType: 'ml.g5.xlarge',
+    awsInstanceCount: '1',
+    s3ModelArtifact: 's3://bucket/prefix/output/model.tar.gz',
+    s3OutputDir: 's3://bucket/prefix/output/',
+    cloudWatchLogsUrl: 'https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/foo',
+    outputPolicy: 'aws-private',
+    datasetSource: 'owner/dataset',
+    stagedTrainUri: 's3://bucket/prefix/input/train.jsonl',
+    trainRows: '20',
+    evalRows: '4',
+    evalResult: { eval_loss: 0.25 },
+    resultFile: 'liga_training_result.json',
+  });
+});
+
+test('uses latest repeated AWS marker values', () => {
+  const result = parseLigaTrainingResult(`
+LIGA_PROVIDER=aws-sagemaker
+LIGA_AWS_TRAINING_JOB_NAME=old-job
+LIGA_S3_MODEL_ARTIFACT=s3://bucket/old/model.tar.gz
+LIGA_AWS_TRAINING_JOB_NAME=new-job
+LIGA_S3_MODEL_ARTIFACT=s3://bucket/new/model.tar.gz
+`);
+
+  assert.equal(result?.awsTrainingJobName, 'new-job');
+  assert.equal(result?.s3ModelArtifact, 's3://bucket/new/model.tar.gz');
+});
+
+test('parses AWS result with missing optional markers', () => {
+  const result = parseLigaTrainingResult(`
+LIGA_PROVIDER=aws-sagemaker
+LIGA_AWS_TRAINING_JOB_NAME=training-job-1
+`);
+
+  assert.deepEqual(result, {
+    provider: 'aws-sagemaker',
+    awsTrainingJobName: 'training-job-1',
+  });
+});

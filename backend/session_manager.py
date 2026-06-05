@@ -1128,7 +1128,10 @@ class SessionManager:
     ) -> bool:
         """Submit user input to a session."""
         agent_session = self.sessions.get(session_id)
-        if cloud_provider in {"hf-jobs", "gcp-vertex"} and agent_session:
+        if (
+            cloud_provider in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
+            and agent_session
+        ):
             agent_session.cloud_provider = cloud_provider
             agent_session.session.cloud_provider = cloud_provider
         if (

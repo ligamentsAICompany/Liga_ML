@@ -1,6 +1,6 @@
 export interface TrainingResult {
   status?: string;
-  provider?: 'gcp-vertex' | 'hf-jobs' | string;
+  provider?: 'gcp-vertex' | 'hf-jobs' | 'aws-sagemaker' | string;
   outputPolicy?: string;
   finalModelUrl?: string;
   hubModelId?: string;
@@ -9,6 +9,13 @@ export interface TrainingResult {
   stagedTrainUri?: string;
   trainRows?: string;
   evalRows?: string;
+  awsTrainingJobName?: string;
+  awsRegion?: string;
+  awsInstanceType?: string;
+  awsInstanceCount?: string;
+  s3ModelArtifact?: string;
+  s3OutputDir?: string;
+  cloudWatchLogsUrl?: string;
   evalResult?: Record<string, unknown> | null;
   resultFile?: string;
 }
@@ -24,6 +31,13 @@ const MARKERS = {
   stagedTrainUri: 'LIGA_STAGED_TRAIN_URI',
   trainRows: 'LIGA_TRAIN_ROWS',
   evalRows: 'LIGA_EVAL_ROWS',
+  awsTrainingJobName: 'LIGA_AWS_TRAINING_JOB_NAME',
+  awsRegion: 'LIGA_AWS_REGION',
+  awsInstanceType: 'LIGA_AWS_INSTANCE_TYPE',
+  awsInstanceCount: 'LIGA_AWS_INSTANCE_COUNT',
+  s3ModelArtifact: 'LIGA_S3_MODEL_ARTIFACT',
+  s3OutputDir: 'LIGA_S3_OUTPUT_DIR',
+  cloudWatchLogsUrl: 'LIGA_CLOUDWATCH_LOGS_URL',
   evalResult: 'LIGA_EVAL_RESULT_JSON',
   resultFile: 'LIGA_RESULT_FILE',
 } as const;
@@ -74,6 +88,13 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   const stagedTrainUri = markerValue(output, MARKERS.stagedTrainUri);
   const trainRows = markerValue(output, MARKERS.trainRows);
   const evalRows = markerValue(output, MARKERS.evalRows);
+  const awsTrainingJobName = markerValue(output, MARKERS.awsTrainingJobName);
+  const awsRegion = markerValue(output, MARKERS.awsRegion);
+  const awsInstanceType = markerValue(output, MARKERS.awsInstanceType);
+  const awsInstanceCount = markerValue(output, MARKERS.awsInstanceCount);
+  const s3ModelArtifact = markerValue(output, MARKERS.s3ModelArtifact);
+  const s3OutputDir = markerValue(output, MARKERS.s3OutputDir);
+  const cloudWatchLogsUrl = cleanUrl(markerValue(output, MARKERS.cloudWatchLogsUrl));
   const evalResult = parseEvalResult(markerValue(output, MARKERS.evalResult));
   const resultFile = markerValue(output, MARKERS.resultFile);
 
@@ -87,6 +108,13 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   if (stagedTrainUri) result.stagedTrainUri = stagedTrainUri;
   if (trainRows) result.trainRows = trainRows;
   if (evalRows) result.evalRows = evalRows;
+  if (awsTrainingJobName) result.awsTrainingJobName = awsTrainingJobName;
+  if (awsRegion) result.awsRegion = awsRegion;
+  if (awsInstanceType) result.awsInstanceType = awsInstanceType;
+  if (awsInstanceCount) result.awsInstanceCount = awsInstanceCount;
+  if (s3ModelArtifact) result.s3ModelArtifact = s3ModelArtifact;
+  if (s3OutputDir) result.s3OutputDir = s3OutputDir;
+  if (cloudWatchLogsUrl) result.cloudWatchLogsUrl = cloudWatchLogsUrl;
   if (evalResult !== undefined) result.evalResult = evalResult;
   if (resultFile) result.resultFile = resultFile;
 

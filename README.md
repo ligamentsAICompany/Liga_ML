@@ -305,6 +305,10 @@ Cloud Build API
 Fine-tune a model for Indian GST notice classification using Google Cloud Vertex AI. Save checkpoints to GCS and push the final model to Hugging Face Hub.
 ```
 
+## AWS SageMaker Training
+
+AWS SageMaker support is deployment-gated behind explicit AWS environment, IAM, S3, and training image configuration. See [AWS SageMaker deployment](docs/aws-sagemaker-deployment.md) and [AWS merge readiness](docs/aws-merge-readiness.md). Local validation helpers live at [`scripts/check_aws_readiness.py`](scripts/check_aws_readiness.py) and [`scripts/aws_sagemaker_dry_run.py`](scripts/aws_sagemaker_dry_run.py).
+
 ## License
 
 MIT License

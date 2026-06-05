@@ -741,11 +741,12 @@ does not load directly as train rows.
 def dataset_context_note(upload: DatasetUpload) -> str:
     return f"""[SYSTEM: The user has uploaded data for this session.
 
-Use this normalized dataset config for HF Jobs or GCP Vertex training when the
-task needs the uploaded data. Prefer the latest uploaded dataset unless the
-user names a different upload. Do not ask for a local file path, do not look
-for the uploaded file on local disk, do not load the raw file for training, and
-do not ask the user to upload again unless this dataset load fails.
+Use this normalized dataset config for HF Jobs, GCP Vertex, or AWS SageMaker
+training when the task needs the uploaded data. Prefer the latest uploaded
+dataset unless the user names a different upload. Do not ask for a local file
+path, do not look for the uploaded file on local disk, do not load the raw file
+for training, and do not ask the user to upload again unless this dataset load
+fails.
 
 - Repo ID: {upload.repo_id}
 - Repo type: dataset

@@ -29,6 +29,26 @@ def test_premium_model_predicate_includes_bedrock_claude_and_gpt55_only():
     assert not agent._is_premium_model("moonshotai/Kimi-K2.6")
 
 
+@pytest.mark.parametrize("cloud_provider", ["hf-jobs", "gcp-vertex", "aws-sagemaker"])
+def test_submit_request_accepts_known_training_providers(cloud_provider):
+    request = agent.SubmitRequest(
+        session_id="s1",
+        text="fine tune this model",
+        cloud_provider=cloud_provider,
+    )
+
+    assert request.cloud_provider == cloud_provider
+
+
+def test_submit_request_rejects_unknown_training_provider():
+    with pytest.raises(agent.ValidationError):
+        agent.SubmitRequest(
+            session_id="s1",
+            text="fine tune this model",
+            cloud_provider="unknown-provider",
+        )
+
+
 @pytest.mark.asyncio
 async def test_default_premium_session_falls_back_to_free_model(monkeypatch):
     monkeypatch.setattr(
@@ -181,6 +201,65 @@ async def test_switching_cloud_provider_persists_gcloud_preflight_options(monkey
         "output_policy": "cloud-private",
     }
     assert updated == [("s1", "gcp-vertex", "smoke-test", "cloud-private")]
+
+
+@pytest.mark.asyncio
+async def test_switching_cloud_provider_accepts_aws_sagemaker(monkeypatch):
+    updated = []
+
+    async def fake_check_session_access(session_id, user, request=None):
+        assert session_id == "s1"
+        assert user["user_id"] == "u1"
+        return SimpleNamespace(user_id="u1")
+
+    async def fake_update_session_cloud_provider(
+        session_id,
+        cloud_provider,
+        training_goal=None,
+        output_policy=None,
+    ):
+        updated.append((session_id, cloud_provider, training_goal, output_policy))
+        return True
+
+    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    monkeypatch.setattr(
+        agent.session_manager,
+        "update_session_cloud_provider",
+        fake_update_session_cloud_provider,
+    )
+
+    response = await agent.set_session_cloud_provider(
+        "s1",
+        {"cloud_provider": "aws-sagemaker"},
+        request=None,
+        user={"user_id": "u1", "plan": "free"},
+    )
+
+    assert response == {
+        "session_id": "s1",
+        "cloud_provider": "aws-sagemaker",
+        "training_goal": "agent-decide",
+        "output_policy": "cloud-private",
+    }
+    assert updated == [("s1", "aws-sagemaker", "agent-decide", "cloud-private")]
+
+
+@pytest.mark.asyncio
+async def test_switching_cloud_provider_rejects_unknown_provider(monkeypatch):
+    async def fake_check_session_access(session_id, user, request=None):
+        return SimpleNamespace(user_id=user["user_id"])
+
+    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent.set_session_cloud_provider(
+            "s1",
+            {"cloud_provider": "not-a-provider"},
+            request=None,
+            user={"user_id": "u1", "plan": "free"},
+        )
+
+    assert exc_info.value.status_code == 400
 
 
 @pytest.mark.asyncio

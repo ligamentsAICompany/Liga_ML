@@ -33,6 +33,19 @@ GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR: dict[str, float] = {
     "NVIDIA_TESLA_A100": 3.70,
 }
 
+AWS_SAGEMAKER_INSTANCE_PRICE_USD_PER_HOUR: dict[str, float] = {
+    "ml.m5.large": 0.20,
+    "ml.m5.xlarge": 0.40,
+    "ml.m5.2xlarge": 0.80,
+    "ml.g4dn.xlarge": 0.90,
+    "ml.g4dn.2xlarge": 1.20,
+    "ml.g5.xlarge": 1.50,
+    "ml.g5.2xlarge": 2.00,
+    "ml.g5.4xlarge": 3.50,
+    "ml.p3.2xlarge": 4.00,
+    "ml.p4d.24xlarge": 35.00,
+}
+
 # Static fallback prices are intentionally conservative enough for a budget
 # guard. The live /api/jobs/hardware catalog wins whenever it is reachable.
 HF_JOBS_PRICE_USD_PER_HOUR: dict[str, float] = {
@@ -405,6 +418,89 @@ async def estimate_gcp_vertex_job_cost(args: dict[str, Any]) -> CostEstimate:
     )
 
 
+def _parse_positive_seconds(value: Any) -> float | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        seconds = float(value)
+        return seconds if seconds > 0 else None
+    if isinstance(value, str):
+        if re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", value):
+            parsed = float(value)
+        else:
+            hours = parse_timeout_hours(value, default_hours=0)
+            parsed = hours * 3600 if hours else None
+        return parsed if parsed and parsed > 0 else None
+    return None
+
+
+async def estimate_aws_sagemaker_job_cost(args: dict[str, Any]) -> CostEstimate:
+    operation = str(args.get("operation") or "").strip().lower()
+    if operation != "run":
+        return CostEstimate(
+            estimated_cost_usd=0.0,
+            billable=False,
+            label="aws_sagemaker_jobs",
+        )
+
+    max_run_seconds = _parse_positive_seconds(args.get("max_run_seconds"))
+    if max_run_seconds is None:
+        max_run_hours = _parse_positive_hours(args.get("max_run_hours"))
+        if max_run_hours is not None:
+            max_run_seconds = max_run_hours * 3600
+    if max_run_seconds is None:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason=(
+                "SageMaker jobs are billable and need max_run_seconds for safe "
+                "auto-approval cost estimation."
+            ),
+            label="aws_sagemaker_jobs",
+        )
+
+    instance_type = str(args.get("instance_type") or "ml.g5.xlarge")
+    instance_price = AWS_SAGEMAKER_INSTANCE_PRICE_USD_PER_HOUR.get(instance_type)
+    if instance_price is None:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason=(
+                "No conservative SageMaker price is available for instance_type "
+                f"'{instance_type}'."
+            ),
+            label="aws_sagemaker_jobs",
+        )
+
+    try:
+        instance_count = (
+            1
+            if args.get("instance_count") in (None, "")
+            else int(args["instance_count"])
+        )
+    except (TypeError, ValueError):
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason="Could not parse SageMaker instance_count.",
+            label="aws_sagemaker_jobs",
+        )
+    if instance_count <= 0:
+        return CostEstimate(
+            estimated_cost_usd=None,
+            billable=True,
+            block_reason="SageMaker instance_count must be positive.",
+            label="aws_sagemaker_jobs",
+        )
+
+    max_run_hours = max_run_seconds / 3600
+    return CostEstimate(
+        estimated_cost_usd=round(instance_price * instance_count * max_run_hours, 4),
+        billable=True,
+        label="aws_sagemaker_jobs",
+    )
+
+
 async def estimate_tool_cost(
     tool_name: str, args: dict[str, Any], *, session: Any = None
 ) -> CostEstimate:
@@ -414,4 +510,6 @@ async def estimate_tool_cost(
         return await estimate_hf_job_cost(args)
     if tool_name == "gcp_vertex_jobs":
         return await estimate_gcp_vertex_job_cost(args)
+    if tool_name == "aws_sagemaker_jobs":
+        return await estimate_aws_sagemaker_job_cost(args)
     return CostEstimate(estimated_cost_usd=0.0, billable=False)

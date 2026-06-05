@@ -42,6 +42,7 @@ import {
   isPremiumPath,
 } from '@/utils/model';
 import { clearLlmErrorOnModelChange, isModelUnavailable } from '@/lib/llm-error-recovery';
+import { CLOUD_PROVIDER_OPTIONS, isCloudProviderId } from '@/lib/cloud-providers';
 import type {
   CloudProviderId,
   DatasetUploadResponse,
@@ -109,23 +110,6 @@ const DEFAULT_MODEL_OPTIONS: ModelOption[] = [
     description: 'DeepInfra',
     modelPath: 'deepseek-ai/DeepSeek-V4-Pro:deepinfra',
     avatarUrl: getHfAvatarUrl('deepseek-ai/DeepSeek-V4-Pro'),
-  },
-];
-
-const CLOUD_PROVIDER_OPTIONS: Array<{
-  id: CloudProviderId;
-  name: string;
-  description: string;
-}> = [
-  {
-    id: 'hf-jobs',
-    name: 'Hugging Face Jobs',
-    description: 'Run training on Hugging Face infrastructure',
-  },
-  {
-    id: 'gcp-vertex',
-    name: 'Google Cloud Vertex AI',
-    description: 'Run training with the gcp_vertex_jobs backend',
   },
 ];
 
@@ -313,7 +297,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
           if (model) setSelectedModelId(model.id);
           updateSessionModel(sessionId, data.model);
         }
-        if (data?.cloud_provider === 'hf-jobs' || data?.cloud_provider === 'gcp-vertex') {
+        if (isCloudProviderId(data?.cloud_provider)) {
           updateSessionCloudProvider(sessionId, data.cloud_provider);
         }
         if (data?.training_goal || data?.output_policy) {
@@ -992,14 +976,14 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
             <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--muted-text)', textTransform: 'uppercase', letterSpacing: '0.05em', fontWeight: 500 }}>
               training on
             </Typography>
-            <CloudQueueIcon sx={{ fontSize: '14px', color: selectedCloudProvider === 'gcp-vertex' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
+            <CloudQueueIcon sx={{ fontSize: '14px', color: selectedCloudProvider !== 'hf-jobs' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
             <Typography variant="caption" sx={{ fontSize: '10px', color: 'var(--text)', fontWeight: 600, letterSpacing: '0.02em' }}>
               {selectedProvider.name}
             </Typography>
             <ArrowDropDownIcon sx={{ fontSize: '14px', color: 'var(--muted-text)' }} />
           </Box>
 
-          {(selectedCloudProvider === 'gcp-vertex' || selectedCloudProvider === 'hf-jobs') && (
+          {(['gcp-vertex', 'hf-jobs', 'aws-sagemaker'] as CloudProviderId[]).includes(selectedCloudProvider) && (
             <>
               <Box
                 onClick={(event) => setTrainingGoalAnchorEl(event.currentTarget)}
@@ -1224,7 +1208,7 @@ export default function ChatInput({ sessionId, initialModelPath, onSend, onStop,
               }}
             >
               <ListItemIcon>
-                <CloudQueueIcon sx={{ color: provider.id === 'gcp-vertex' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
+                <CloudQueueIcon sx={{ color: provider.id !== 'hf-jobs' ? 'var(--accent-yellow)' : 'var(--muted-text)' }} />
               </ListItemIcon>
               <ListItemText
                 primary={provider.name}

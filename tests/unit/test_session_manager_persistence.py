@@ -194,13 +194,15 @@ def _install_fake_runtime(manager: SessionManager) -> asyncio.Event:
     manager.run_calls = 0  # type: ignore[attr-defined]
 
     def fake_create_session_sync(**kwargs: Any):
-        return object(), FakeRuntimeSession(
+        runtime = FakeRuntimeSession(
             hf_token=kwargs.get("hf_token"),
             model=kwargs.get("model") or "test-model",
             cloud_provider=kwargs.get("cloud_provider") or "hf-jobs",
             training_goal=kwargs.get("training_goal") or "agent-decide",
             output_policy=kwargs.get("output_policy") or "cloud-and-hf-hub",
         )
+        runtime.cloud_provider = kwargs.get("cloud_provider") or "hf-jobs"
+        return object(), runtime
 
     async def fake_run_session(*_: Any) -> None:
         manager.run_calls += 1  # type: ignore[attr-defined]
@@ -483,6 +485,32 @@ async def test_create_session_schedules_cpu_sandbox_preload():
 
 
 @pytest.mark.asyncio
+async def test_create_session_stores_aws_cloud_provider():
+    manager = _manager_with_store(NoopSessionStore())
+    stop = _install_fake_runtime(manager)
+    scheduled: list[str] = []
+
+    def fake_start_cpu_sandbox_preload(agent_session: AgentSession) -> None:
+        scheduled.append(agent_session.session_id)
+
+    manager._start_cpu_sandbox_preload = fake_start_cpu_sandbox_preload  # type: ignore[method-assign]
+
+    try:
+        session_id = await manager.create_session(
+            user_id="owner",
+            hf_token="token",
+            cloud_provider="aws-sagemaker",
+        )
+
+        agent_session = manager.sessions[session_id]
+        assert agent_session.cloud_provider == "aws-sagemaker"
+        assert agent_session.session.cloud_provider == "aws-sagemaker"
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
 async def test_lazy_restore_schedules_cpu_sandbox_preload():
     manager = _manager_with_store(RestoreStore())
     stop = _install_fake_runtime(manager)
@@ -503,6 +531,35 @@ async def test_lazy_restore_schedules_cpu_sandbox_preload():
         assert "persisted-session" in manager.sessions
         assert not hasattr(restored.session, "_ml_intern_artifact_collection_task")
         assert not hasattr(restored.session, "_ml_intern_artifact_collection_slug")
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_lazy_restore_preserves_aws_cloud_provider():
+    store = RestoreStore(
+        metadata={
+            "session_id": "aws-session",
+            "user_id": "owner",
+            "model": "test-model",
+            "cloud_provider": "aws-sagemaker",
+            "created_at": datetime.now(UTC),
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+
+    try:
+        restored = await manager.ensure_session_loaded("aws-session", user_id="owner")
+
+        assert restored is not None
+        assert restored.cloud_provider == "aws-sagemaker"
+        assert restored.session.cloud_provider == "aws-sagemaker"
+        assert (
+            manager.get_session_info("aws-session")["cloud_provider"] == "aws-sagemaker"
+        )
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)
@@ -736,6 +793,7 @@ async def test_list_sessions_dev_uses_store_dev_visibility():
                         "user_id": "alice",
                         "model": "m",
                         "created_at": datetime.now(UTC),
+                        "cloud_provider": "aws-sagemaker",
                         "auto_approval_enabled": True,
                         "auto_approval_cost_cap_usd": 5.0,
                         "auto_approval_estimated_spend_usd": 2.0,
@@ -757,6 +815,7 @@ async def test_list_sessions_dev_uses_store_dev_visibility():
     assert store.seen_user_id == "dev"
     assert {session["session_id"] for session in sessions} == {"s1", "s2"}
     yolo = next(session for session in sessions if session["session_id"] == "s1")
+    assert yolo["cloud_provider"] == "aws-sagemaker"
     assert yolo["auto_approval"] == {
         "enabled": True,
         "cost_cap_usd": 5.0,

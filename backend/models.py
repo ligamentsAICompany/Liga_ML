@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-CloudProviderId = Literal["hf-jobs", "gcp-vertex"]
+CloudProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker"]
 TrainingGoal = Literal["smoke-test", "production", "agent-decide"]
 OutputPolicy = Literal["cloud-private", "hf-hub", "cloud-and-hf-hub"]
 DatasetSourceFormat = Literal["csv", "json", "jsonl", "pdf", "docx", "xlsx", "md"]
