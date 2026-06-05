@@ -23,6 +23,7 @@ class AwsSftTemplateConfig:
     dataset_split: str = "train"
     model_name: str
     output_model_id: str
+    dataset_name: str = ""
     output_policy: str = "aws-private"
     hub_model_id: str | None = None
     max_train_samples: int | None = None
@@ -48,6 +49,7 @@ def build_aws_sft_training_script(config: AwsSftTemplateConfig) -> str:
         raise ValueError("output_model_id is required.")
 
     payload = {
+        "dataset_name": config.dataset_name,
         "dataset_split": config.dataset_split,
         "model_name": config.model_name,
         "output_model_id": config.output_model_id,
@@ -88,6 +90,7 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 CONFIG = json.loads({config_json!r})
 
 MODEL_NAME = "{config.model_name}"
+DATASET_NAME = CONFIG.get("dataset_name") or ""
 OUTPUT_MODEL_ID = "{config.output_model_id}"
 OUTPUT_POLICY = "{config.output_policy}"
 HUB_MODEL_ID = CONFIG.get("hub_model_id") or OUTPUT_MODEL_ID
@@ -314,6 +317,16 @@ def write_metrics(eval_metrics):
 
 
 def write_result(status, eval_metrics, train_rows, eval_rows, eval_note, final_model_url):
+    training_args = {{
+        "num_train_epochs": CONFIG["num_train_epochs"],
+        "per_device_train_batch_size": CONFIG["per_device_train_batch_size"],
+        "gradient_accumulation_steps": CONFIG["gradient_accumulation_steps"],
+        "learning_rate": CONFIG["learning_rate"],
+        "max_length": CONFIG["max_length"],
+        "max_train_samples": CONFIG.get("max_train_samples"),
+        "max_eval_samples": CONFIG.get("max_eval_samples"),
+        "validation_split_ratio": CONFIG["validation_split_ratio"],
+    }}
     result = {{
         "status": status,
         "provider": "aws-sagemaker",
@@ -323,16 +336,28 @@ def write_result(status, eval_metrics, train_rows, eval_rows, eval_note, final_m
         "s3_output_dir": os.environ.get("LIGA_S3_OUTPUT_DIR", ""),
         "cloudwatch_logs_url": os.environ.get("LIGA_CLOUDWATCH_LOGS_URL", ""),
         "output_policy": OUTPUT_POLICY,
+        "instance_type": os.environ.get("LIGA_AWS_INSTANCE_TYPE", ""),
+        "instance_count": os.environ.get("LIGA_AWS_INSTANCE_COUNT", ""),
         "hub_model_id": HUB_MODEL_ID if OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES else "",
         "model_url": final_model_url,
+        "model_name": MODEL_NAME,
+        "dataset_name": DATASET_NAME,
+        "dataset_split": CONFIG["dataset_split"],
+        "dataset_source": DATASET_NAME,
         "eval": eval_metrics,
+        "eval_result": eval_metrics,
         "eval_note": eval_note,
         "train_rows": train_rows,
         "eval_rows": eval_rows,
+        "training_args": training_args,
+        "result_file": RESULT_FILE_NAME,
     }}
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DATA_DIR.mkdir(parents=True, exist_ok=True)
     result_path = MODEL_DIR / RESULT_FILE_NAME
     result_path.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
+    output_result_path = OUTPUT_DATA_DIR / RESULT_FILE_NAME
+    output_result_path.write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
     return result
 
 
@@ -427,6 +452,13 @@ def main() -> None:
     print(f"LIGA_S3_MODEL_ARTIFACT={{os.environ.get('LIGA_S3_MODEL_ARTIFACT', '')}}", flush=True)
     print(f"LIGA_S3_OUTPUT_DIR={{os.environ.get('LIGA_S3_OUTPUT_DIR', '')}}", flush=True)
     print(f"LIGA_CLOUDWATCH_LOGS_URL={{os.environ.get('LIGA_CLOUDWATCH_LOGS_URL', '')}}", flush=True)
+    print(f"LIGA_OUTPUT_POLICY={{OUTPUT_POLICY}}", flush=True)
+    print(f"LIGA_DATASET_SOURCE={{DATASET_NAME}}", flush=True)
+    print(f"LIGA_STAGED_TRAIN_URI={{os.environ.get('LIGA_STAGED_TRAIN_URI', '')}}", flush=True)
+    print(f"LIGA_TRAIN_ROWS={{len(train_dataset)}}", flush=True)
+    print(f"LIGA_EVAL_ROWS={{len(eval_dataset) if eval_dataset is not None else 0}}", flush=True)
+    print(f"LIGA_AWS_INSTANCE_TYPE={{os.environ.get('LIGA_AWS_INSTANCE_TYPE', '')}}", flush=True)
+    print(f"LIGA_AWS_INSTANCE_COUNT={{os.environ.get('LIGA_AWS_INSTANCE_COUNT', '')}}", flush=True)
     print(f"LIGA_FINAL_MODEL_URL={{final_model_url}}", flush=True)
     print(f"LIGA_HUB_MODEL_ID={{hub_model_id_marker}}", flush=True)
     print(f"LIGA_EVAL_RESULT_JSON={{eval_json}}", flush=True)

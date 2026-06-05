@@ -39,8 +39,13 @@ def test_aws_sft_template_generates_parseable_sagemaker_script_contract():
     assert 'TRAIN_FILE = TRAIN_CHANNEL_DIR / "train.jsonl"' in script
     assert 'RESULT_FILE_NAME = "liga_training_result.json"' in script
     assert "result_path = MODEL_DIR / RESULT_FILE_NAME" in script
+    assert "output_result_path = OUTPUT_DATA_DIR / RESULT_FILE_NAME" in script
     assert 'metrics_path = OUTPUT_DATA_DIR / "metrics.json"' in script
     assert 'provider": "aws-sagemaker"' in script
+    assert '"eval_result": eval_metrics' in script
+    assert '"training_args":' in script
+    assert '"dataset_name": DATASET_NAME' in script
+    assert '"model_name": MODEL_NAME' in script
 
 
 def test_aws_sft_template_has_final_markers_and_dependency_skip_flag():
@@ -59,6 +64,9 @@ def test_aws_sft_template_has_final_markers_and_dependency_skip_flag():
         "LIGA_HUB_MODEL_ID=",
         "LIGA_EVAL_RESULT_JSON=",
         "LIGA_RESULT_FILE=",
+        "LIGA_TRAIN_ROWS=",
+        "LIGA_EVAL_ROWS=",
+        "LIGA_DATASET_SOURCE=",
     ]:
         assert marker in script
 

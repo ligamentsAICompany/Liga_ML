@@ -65,10 +65,24 @@ def _run_args(**overrides):
 class FakeS3Client:
     def __init__(self):
         self.puts = []
+        self.objects = {}
 
     def put_object(self, **kwargs):
         self.puts.append(kwargs)
+        self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
         return {"ETag": '"fake"'}
+
+    def add_object(self, uri, body):
+        bucket, key = uri.removeprefix("s3://").split("/", 1)
+        self.objects[(bucket, key)] = body
+
+    def head_object(self, **kwargs):
+        body = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {"ContentLength": len(body)}
+
+    def get_object(self, **kwargs):
+        body = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {"Body": io.BytesIO(body)}
 
 
 class FakeSageMakerClient:
@@ -152,6 +166,22 @@ class FakeLogsClient:
     def get_log_events(self, **kwargs):
         self.calls.append({"get_log_events": kwargs})
         return {"events": self.events}
+
+
+class ResourceNotFoundLogsClient(FakeLogsClient):
+    def describe_log_streams(self, **kwargs):
+        self.calls.append({"describe_log_streams": kwargs})
+        exc = Exception("The specified log group does not exist")
+        exc.response = {"Error": {"Code": "ResourceNotFoundException"}}
+        raise exc
+
+
+class AccessDeniedLogsClient(FakeLogsClient):
+    def describe_log_streams(self, **kwargs):
+        self.calls.append({"describe_log_streams": kwargs})
+        exc = Exception("not authorized to perform logs:DescribeLogStreams")
+        exc.response = {"Error": {"Code": "AccessDeniedException"}}
+        raise exc
 
 
 class FakeSession:
@@ -494,6 +524,65 @@ async def test_inspect_uses_mocked_describe_training_job_and_formats_status(
 
 
 @pytest.mark.asyncio
+async def test_inspect_completed_job_extracts_small_result_files_from_s3_archive(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "agent.tools.aws_sagemaker_jobs_tool.build_aws_sagemaker_readiness_snapshot",
+        lambda: _ready_snapshot(),
+    )
+    result_payload = {
+        "status": "succeeded",
+        "provider": "aws-sagemaker",
+        "training_job_name": "job-completed",
+        "s3_model_artifact": "s3://training-bucket/liga-ml/jobs/job-completed/output/model.tar.gz",
+        "s3_output_dir": "s3://training-bucket/liga-ml/jobs/job-completed/output/",
+        "output_policy": "aws-private",
+        "eval_result": {"eval_loss": 0.19},
+        "train_rows": 20,
+        "eval_rows": 4,
+        "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+        "dataset_name": "owner/dataset",
+        "result_file": "liga_training_result.json",
+    }
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        for name, payload in {
+            "liga_training_result.json": result_payload,
+            "metrics.json": {"eval_loss": 0.19, "eval_runtime": 1.2},
+            "training_args.json": {"per_device_train_batch_size": 1},
+        }.items():
+            body = json_bytes = __import__("json").dumps(payload).encode("utf-8")
+            info = tarfile.TarInfo(name=name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(json_bytes))
+        weights = b"0" * 1024
+        info = tarfile.TarInfo(name="pytorch_model.bin")
+        info.size = len(weights)
+        archive.addfile(info, io.BytesIO(weights))
+
+    s3 = FakeS3Client()
+    s3.add_object(
+        "s3://training-bucket/liga-ml/jobs/job-completed/output/model.tar.gz",
+        archive_buffer.getvalue(),
+    )
+
+    result = await AwsSageMakerJobsTool(
+        sagemaker_client=FakeSageMakerClient(),
+        s3_client=s3,
+    ).execute({"operation": "inspect", "job_name": "job-completed"})
+
+    assert not result.get("isError")
+    assert "AWS training completed" in result["formatted"]
+    assert "liga_training_result.json" in result["formatted"]
+    assert "eval_loss" in result["formatted"]
+    assert "Qwen/Qwen2.5-0.5B-Instruct" in result["formatted"]
+    assert "owner/dataset" in result["formatted"]
+    assert "aws-private" in result["formatted"]
+    assert "pytorch_model.bin" not in result["formatted"]
+
+
+@pytest.mark.asyncio
 async def test_logs_uses_mocked_cloudwatch_client_and_formats_recent_logs(monkeypatch):
     monkeypatch.setattr(
         "agent.tools.aws_sagemaker_jobs_tool.build_aws_sagemaker_readiness_snapshot",
@@ -513,6 +602,7 @@ async def test_logs_uses_mocked_cloudwatch_client_and_formats_recent_logs(monkey
         logs.calls[0]["describe_log_streams"]["logGroupName"]
         == "/aws/sagemaker/TrainingJobs"
     )
+    assert logs.calls[0]["describe_log_streams"]["orderBy"] == "LogStreamName"
 
 
 @pytest.mark.asyncio
@@ -531,6 +621,42 @@ async def test_logs_handles_no_streams_or_events(monkeypatch):
 
     assert "No CloudWatch log streams found yet" in no_streams["formatted"]
     assert "No CloudWatch log events found yet" in no_events["formatted"]
+
+
+@pytest.mark.asyncio
+async def test_logs_missing_log_group_returns_actionable_non_error(monkeypatch):
+    monkeypatch.setattr(
+        "agent.tools.aws_sagemaker_jobs_tool.build_aws_sagemaker_readiness_snapshot",
+        lambda: _ready_snapshot(),
+    )
+    logs = ResourceNotFoundLogsClient()
+
+    result = await AwsSageMakerJobsTool(logs_client=logs).execute(
+        {"operation": "logs", "job_name": "job-completed"}
+    )
+
+    assert not result.get("isError")
+    assert "CloudWatch log group was not found" in result["formatted"]
+    assert "/aws/sagemaker/TrainingJobs" in result["formatted"]
+    assert "CloudWatch logs:" in result["formatted"]
+    assert result["resultsShared"] == 0
+
+
+@pytest.mark.asyncio
+async def test_logs_permission_denied_returns_actionable_non_error(monkeypatch):
+    monkeypatch.setattr(
+        "agent.tools.aws_sagemaker_jobs_tool.build_aws_sagemaker_readiness_snapshot",
+        lambda: _ready_snapshot(),
+    )
+
+    result = await AwsSageMakerJobsTool(logs_client=AccessDeniedLogsClient()).execute(
+        {"operation": "logs", "job_name": "job-completed"}
+    )
+
+    assert not result.get("isError")
+    assert "CloudWatch logs are not accessible" in result["formatted"]
+    assert "logs:DescribeLogStreams" in result["formatted"]
+    assert "CloudWatch logs:" in result["formatted"]
 
 
 @pytest.mark.asyncio

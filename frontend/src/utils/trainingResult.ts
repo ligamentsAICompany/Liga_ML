@@ -11,6 +11,8 @@ export interface TrainingResult {
   evalRows?: string;
   awsTrainingJobName?: string;
   awsRegion?: string;
+  awsInstanceType?: string;
+  awsInstanceCount?: string;
   s3ModelArtifact?: string;
   s3OutputDir?: string;
   cloudWatchLogsUrl?: string;
@@ -31,6 +33,8 @@ const MARKERS = {
   evalRows: 'LIGA_EVAL_ROWS',
   awsTrainingJobName: 'LIGA_AWS_TRAINING_JOB_NAME',
   awsRegion: 'LIGA_AWS_REGION',
+  awsInstanceType: 'LIGA_AWS_INSTANCE_TYPE',
+  awsInstanceCount: 'LIGA_AWS_INSTANCE_COUNT',
   s3ModelArtifact: 'LIGA_S3_MODEL_ARTIFACT',
   s3OutputDir: 'LIGA_S3_OUTPUT_DIR',
   cloudWatchLogsUrl: 'LIGA_CLOUDWATCH_LOGS_URL',
@@ -86,6 +90,8 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   const evalRows = markerValue(output, MARKERS.evalRows);
   const awsTrainingJobName = markerValue(output, MARKERS.awsTrainingJobName);
   const awsRegion = markerValue(output, MARKERS.awsRegion);
+  const awsInstanceType = markerValue(output, MARKERS.awsInstanceType);
+  const awsInstanceCount = markerValue(output, MARKERS.awsInstanceCount);
   const s3ModelArtifact = markerValue(output, MARKERS.s3ModelArtifact);
   const s3OutputDir = markerValue(output, MARKERS.s3OutputDir);
   const cloudWatchLogsUrl = cleanUrl(markerValue(output, MARKERS.cloudWatchLogsUrl));
@@ -104,6 +110,8 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   if (evalRows) result.evalRows = evalRows;
   if (awsTrainingJobName) result.awsTrainingJobName = awsTrainingJobName;
   if (awsRegion) result.awsRegion = awsRegion;
+  if (awsInstanceType) result.awsInstanceType = awsInstanceType;
+  if (awsInstanceCount) result.awsInstanceCount = awsInstanceCount;
   if (s3ModelArtifact) result.s3ModelArtifact = s3ModelArtifact;
   if (s3OutputDir) result.s3OutputDir = s3OutputDir;
   if (cloudWatchLogsUrl) result.cloudWatchLogsUrl = cloudWatchLogsUrl;

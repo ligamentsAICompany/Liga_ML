@@ -102,10 +102,17 @@ export function buildAwsTrainingResultMarkdown(result: TrainingResult): string {
     ['Provider', result.provider],
     ['SageMaker job name', result.awsTrainingJobName],
     ['Region', result.awsRegion],
+    ['Instance type', result.awsInstanceType],
+    ['Instance count', result.awsInstanceCount],
+    ['Dataset/source', result.datasetSource],
+    ['Staged train URI', result.stagedTrainUri],
+    ['Output policy', result.outputPolicy],
     ['S3 model artifact', result.s3ModelArtifact],
     ['S3 output dir', result.s3OutputDir],
     ['CloudWatch logs URL', result.cloudWatchLogsUrl],
-    ['Final model', result.finalModelUrl],
+    ...(result.provider === 'aws-sagemaker' && !result.finalModelUrl
+      ? []
+      : ([['Final model', result.finalModelUrl]] as [string, unknown][])),
     ['Hub model ID', result.hubModelId],
     ['Result file', result.resultFile],
   ]

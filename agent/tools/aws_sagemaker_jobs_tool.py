@@ -35,6 +35,15 @@ AWS_REQUIRED_ENV_HELP = (
 DEFAULT_VOLUME_SIZE_GB = 30
 DEFAULT_LOG_GROUP = "/aws/sagemaker/TrainingJobs"
 MAX_LOG_EVENTS = 150
+MAX_RESULT_FILE_BYTES = 1_000_000
+MAX_RESULT_ARCHIVE_BYTES = 50_000_000
+RESULT_FILE_NAMES = {
+    "metrics.json",
+    "medical_safety_eval.json",
+    "liga_training_result.json",
+    "training_args.json",
+    "result.json",
+}
 SAGEMAKER_STATUS_MAP = {
     "Completed": "succeeded",
     "Failed": "failed",
@@ -162,6 +171,21 @@ def _safe_log_message(message: Any) -> str:
     for pattern, replacement in redactions:
         text = re.sub(pattern, replacement, text)
     return text
+
+
+def _aws_error_code(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = error.get("Code")
+            if code:
+                return str(code)
+    return exc.__class__.__name__
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
 
 
 class AwsSageMakerJobsTool:
@@ -309,7 +333,9 @@ class AwsSageMakerJobsTool:
 
         console_url = _console_url(region, job_name)
         cloudwatch_logs_url = _cloudwatch_logs_url(region, job_name)
-        s3_model_artifact = staged.s3_output_uri.rstrip("/") + "/model.tar.gz"
+        s3_model_artifact = (
+            staged.s3_output_uri.rstrip("/") + f"/{job_name}/output/model.tar.gz"
+        )
         train_input_uri = _s3_dir_for_file(staged.s3_train_uri)
 
         request = {
@@ -359,6 +385,10 @@ class AwsSageMakerJobsTool:
                 "LIGA_S3_OUTPUT_DIR": staged.s3_output_uri,
                 "LIGA_CLOUDWATCH_LOGS_URL": cloudwatch_logs_url,
                 "LIGA_OUTPUT_POLICY": output_policy,
+                "LIGA_DATASET_SOURCE": dataset_name,
+                "LIGA_STAGED_TRAIN_URI": staged.s3_train_uri,
+                "LIGA_AWS_INSTANCE_TYPE": instance_type,
+                "LIGA_AWS_INSTANCE_COUNT": str(instance_count),
             },
             "HyperParameters": {
                 "sagemaker_program": "train.py",
@@ -383,6 +413,7 @@ class AwsSageMakerJobsTool:
             s3_model_artifact=s3_model_artifact,
             cloudwatch_logs_url=cloudwatch_logs_url,
             region=region,
+            output_policy=output_policy,
         )
 
         metadata = {
@@ -471,6 +502,223 @@ class AwsSageMakerJobsTool:
             "resultsShared": len(summaries),
         }
 
+    async def _read_s3_json_object(
+        self,
+        s3_client: Any,
+        uri: str,
+    ) -> tuple[str, Any] | None:
+        bucket, key = _split_s3_uri(uri)
+        try:
+            head = await asyncio.to_thread(
+                s3_client.head_object, Bucket=bucket, Key=key
+            )
+            size = int(head.get("ContentLength") or 0)
+            if size <= 0 or size > MAX_RESULT_FILE_BYTES:
+                return None
+            response = await asyncio.to_thread(
+                s3_client.get_object,
+                Bucket=bucket,
+                Key=key,
+            )
+            body = response["Body"].read()
+        except Exception:
+            return None
+        try:
+            return uri, json.loads(body.decode("utf-8"))
+        except Exception:
+            return None
+
+    async def _extract_result_files_from_archive(
+        self,
+        s3_client: Any,
+        uri: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        bucket, key = _split_s3_uri(uri)
+        try:
+            head = await asyncio.to_thread(
+                s3_client.head_object, Bucket=bucket, Key=key
+            )
+            size = int(head.get("ContentLength") or 0)
+            if size <= 0 or size > MAX_RESULT_ARCHIVE_BYTES:
+                return None
+            response = await asyncio.to_thread(
+                s3_client.get_object,
+                Bucket=bucket,
+                Key=key,
+            )
+            archive_bytes = response["Body"].read()
+        except Exception:
+            return None
+
+        extracted: dict[str, Any] = {}
+        try:
+            with tarfile.open(
+                fileobj=io.BytesIO(archive_bytes), mode="r:gz"
+            ) as archive:
+                for member in archive.getmembers():
+                    filename = member.name.rsplit("/", 1)[-1]
+                    if filename not in RESULT_FILE_NAMES:
+                        continue
+                    if member.size <= 0 or member.size > MAX_RESULT_FILE_BYTES:
+                        continue
+                    file_obj = archive.extractfile(member)
+                    if file_obj is None:
+                        continue
+                    try:
+                        extracted[filename] = json.loads(
+                            file_obj.read().decode("utf-8")
+                        )
+                    except Exception:
+                        continue
+        except tarfile.TarError:
+            return None
+        return (uri, extracted) if extracted else None
+
+    async def _extract_completed_job_result_files(
+        self,
+        *,
+        job_name: str,
+        output_uri: str | None,
+        model_artifact: str | None,
+        region: str,
+    ) -> tuple[dict[str, Any], list[str], str]:
+        s3_client = self.s3_client or _load_s3_client(region)
+        parsed: dict[str, Any] = {}
+        sources: list[str] = []
+        fallback = "Result JSON was not found separately or was not safely extractable."
+
+        prefixes: list[str] = []
+        if output_uri:
+            base_output = output_uri.rstrip("/")
+            prefixes.extend([base_output + "/", f"{base_output}/{job_name}/output/"])
+        if model_artifact:
+            prefixes.append(_s3_dir_for_file(model_artifact))
+
+        for prefix in dict.fromkeys(prefixes):
+            for filename in RESULT_FILE_NAMES:
+                result = await self._read_s3_json_object(s3_client, prefix + filename)
+                if result is None:
+                    continue
+                source, payload = result
+                parsed[filename] = payload
+                sources.append(source)
+
+        archive_uris: list[str] = []
+        if output_uri:
+            archive_uris.append(
+                f"{output_uri.rstrip('/')}/{job_name}/output/output.tar.gz"
+            )
+        if model_artifact:
+            archive_uris.extend(
+                [
+                    _s3_dir_for_file(model_artifact) + "output.tar.gz",
+                    model_artifact,
+                ]
+            )
+
+        for archive_uri in dict.fromkeys(archive_uris):
+            result = await self._extract_result_files_from_archive(
+                s3_client, archive_uri
+            )
+            if result is None:
+                continue
+            source, files = result
+            for filename, payload in files.items():
+                parsed.setdefault(filename, payload)
+            sources.append(source)
+
+        if model_artifact and not parsed:
+            fallback = (
+                "Result JSON was not found separately; the S3 model artifact is "
+                "available, but small result files were not safely extractable."
+            )
+        return parsed, sources, fallback
+
+    def _completed_job_result_markers(
+        self,
+        *,
+        status: str,
+        job_name: str,
+        region: str,
+        output_uri: str | None,
+        model_artifact: str | None,
+        logs_url: str,
+        resource_config: dict[str, Any],
+        parsed_files: dict[str, Any],
+    ) -> list[str]:
+        result_json = parsed_files.get("liga_training_result.json")
+        if not isinstance(result_json, dict):
+            result_json = {}
+        metrics = parsed_files.get("metrics.json") or result_json.get("eval_result")
+        if not isinstance(metrics, dict):
+            metrics = (
+                result_json.get("eval")
+                if isinstance(result_json.get("eval"), dict)
+                else {}
+            )
+        dataset = str(
+            result_json.get("dataset_source") or result_json.get("dataset_name") or ""
+        )
+        return [
+            f"LIGA_TRAINING_STATUS={map_sagemaker_status(status)}",
+            "LIGA_PROVIDER=aws-sagemaker",
+            f"LIGA_AWS_TRAINING_JOB_NAME={job_name}",
+            f"LIGA_AWS_REGION={region}",
+            f"LIGA_S3_MODEL_ARTIFACT={model_artifact or ''}",
+            f"LIGA_S3_OUTPUT_DIR={output_uri or ''}",
+            f"LIGA_CLOUDWATCH_LOGS_URL={logs_url}",
+            f"LIGA_OUTPUT_POLICY={result_json.get('output_policy', '')}",
+            f"LIGA_DATASET_SOURCE={dataset}",
+            f"LIGA_TRAIN_ROWS={result_json.get('train_rows', '')}",
+            f"LIGA_EVAL_ROWS={result_json.get('eval_rows', '')}",
+            "LIGA_AWS_INSTANCE_TYPE="
+            f"{result_json.get('instance_type') or resource_config.get('InstanceType') or ''}",
+            "LIGA_AWS_INSTANCE_COUNT="
+            f"{result_json.get('instance_count') or resource_config.get('InstanceCount') or ''}",
+            f"LIGA_EVAL_RESULT_JSON={_compact_json(metrics)}",
+            "LIGA_RESULT_FILE=liga_training_result.json",
+        ]
+
+    def _completed_job_result_summary(
+        self,
+        *,
+        parsed_files: dict[str, Any],
+        sources: list[str],
+        fallback: str,
+    ) -> list[str]:
+        lines = ["", "## AWS final result", "", "**AWS training completed:** yes"]
+        result_json = parsed_files.get("liga_training_result.json")
+        if isinstance(result_json, dict):
+            metrics = parsed_files.get("metrics.json") or result_json.get("eval_result")
+            training_args = parsed_files.get("training_args.json") or result_json.get(
+                "training_args"
+            )
+            lines.extend(
+                [
+                    "**Result file:** `liga_training_result.json`",
+                    f"**Output policy:** `{result_json.get('output_policy', '')}`",
+                    f"**Dataset used:** `{result_json.get('dataset_name') or result_json.get('dataset_source') or ''}`",
+                    f"**Model:** `{result_json.get('model_name', '')}`",
+                    f"**Train rows:** `{result_json.get('train_rows', '')}`",
+                    f"**Eval rows:** `{result_json.get('eval_rows', '')}`",
+                ]
+            )
+            if isinstance(metrics, dict):
+                lines.append(f"**Metrics:** `{_compact_json(metrics)}`")
+            if isinstance(training_args, dict):
+                lines.append(f"**Training args:** `{_compact_json(training_args)}`")
+        else:
+            lines.append(f"**Result file:** {fallback}")
+        if sources:
+            lines.append(
+                "**Result sources inspected:** "
+                + ", ".join(f"`{source}`" for source in sources)
+            )
+            lines.append(
+                "**Large weights avoided:** only known small JSON result files were read."
+            )
+        return lines
+
     async def _inspect_job(self, args: dict[str, Any]) -> ToolResult:
         job_name = str(args.get("job_name") or args.get("job_id") or "").strip()
         if not job_name:
@@ -516,6 +764,50 @@ class AwsSageMakerJobsTool:
         formatted_rows = [
             f"**{label}:** {value}" for label, value in rows if value not in (None, "")
         ]
+        parsed_files: dict[str, Any] = {}
+        result_sources: list[str] = []
+        result_fallback = ""
+        if status == "Completed":
+            (
+                parsed_files,
+                result_sources,
+                result_fallback,
+            ) = await self._extract_completed_job_result_files(
+                job_name=job_name,
+                output_uri=output_uri,
+                model_artifact=model_artifact,
+                region=region,
+            )
+            formatted_rows.extend(
+                self._completed_job_result_summary(
+                    parsed_files=parsed_files,
+                    sources=result_sources,
+                    fallback=result_fallback,
+                )
+            )
+            formatted_rows.extend(
+                [
+                    "",
+                    "## Final result markers",
+                    "",
+                    *self._completed_job_result_markers(
+                        status=status,
+                        job_name=job_name,
+                        region=region,
+                        output_uri=output_uri,
+                        model_artifact=model_artifact,
+                        logs_url=logs_url,
+                        resource_config=job.get("ResourceConfig") or {},
+                        parsed_files=parsed_files,
+                    ),
+                ]
+            )
+        result_json_for_state = parsed_files.get("liga_training_result.json")
+        output_policy_for_state = (
+            result_json_for_state.get("output_policy")
+            if isinstance(result_json_for_state, dict)
+            else None
+        )
         await self._emit_job_state(
             state=map_sagemaker_status(status),
             job_name=job_name,
@@ -524,6 +816,9 @@ class AwsSageMakerJobsTool:
             s3_model_artifact=model_artifact,
             cloudwatch_logs_url=logs_url,
             region=region,
+            output_policy=str(output_policy_for_state)
+            if output_policy_for_state
+            else None,
         )
         return {
             "formatted": "AWS SageMaker training job details.\n\n"
@@ -549,11 +844,40 @@ class AwsSageMakerJobsTool:
                 logs_client.describe_log_streams,
                 logGroupName=log_group,
                 logStreamNamePrefix=job_name,
-                orderBy="LastEventTime",
+                orderBy="LogStreamName",
                 descending=True,
                 limit=5,
             )
         except Exception as exc:
+            code = _aws_error_code(exc)
+            logs_url = _cloudwatch_logs_url(region, job_name)
+            if code == "ResourceNotFoundException":
+                return {
+                    "formatted": (
+                        f"CloudWatch log group was not found for `{job_name}`.\n\n"
+                        f"**Log group:** `{log_group}`\n"
+                        f"**CloudWatch logs:** {logs_url}\n"
+                        "The SageMaker job may still be completed; missing logs do not "
+                        "change the training job status. Check the SageMaker console or "
+                        "verify that the training image writes stdout/stderr to CloudWatch."
+                    ),
+                    "totalResults": 0,
+                    "resultsShared": 0,
+                }
+            if code in {"AccessDeniedException", "UnrecognizedClientException"}:
+                return {
+                    "formatted": (
+                        f"CloudWatch logs are not accessible for `{job_name}`.\n\n"
+                        f"**Log group:** `{log_group}`\n"
+                        f"**CloudWatch logs:** {logs_url}\n"
+                        f"**AWS error:** `{code}` - {exc}\n"
+                        "Grant logs:DescribeLogStreams and logs:GetLogEvents for this "
+                        "log group to view logs. The training job status should be checked "
+                        "with `inspect`."
+                    ),
+                    "totalResults": 0,
+                    "resultsShared": 0,
+                }
             return self._error(
                 f"Could not discover CloudWatch log streams for `{job_name}`: {exc}"
             )
@@ -671,6 +995,7 @@ class AwsSageMakerJobsTool:
             dataset_split=str(args.get("dataset_split") or "train"),
             model_name=str(args.get("model_name") or ""),
             output_model_id=str(args.get("output_model_id") or ""),
+            dataset_name=str(args.get("dataset_name") or ""),
             output_policy=str(args.get("output_policy") or "aws-private"),
             hub_model_id=args.get("hub_model_id"),
             column_mapping=dict(args.get("column_mapping") or {}),
@@ -730,6 +1055,7 @@ class AwsSageMakerJobsTool:
         s3_model_artifact: str,
         cloudwatch_logs_url: str,
         region: str,
+        output_policy: str | None = None,
     ) -> None:
         await self._emit_job_state(
             state="running",
@@ -740,6 +1066,7 @@ class AwsSageMakerJobsTool:
             s3_model_artifact=s3_model_artifact,
             cloudwatch_logs_url=cloudwatch_logs_url,
             region=region,
+            output_policy=output_policy,
         )
 
     async def _emit_job_state(
@@ -753,6 +1080,7 @@ class AwsSageMakerJobsTool:
         s3_model_artifact: str | None = None,
         cloudwatch_logs_url: str | None = None,
         region: str | None = None,
+        output_policy: str | None = None,
     ) -> None:
         if self.session is None or not self.tool_call_id:
             return
@@ -782,6 +1110,7 @@ class AwsSageMakerJobsTool:
                             else {}
                         ),
                         **({"region": region} if region else {}),
+                        **({"outputPolicy": output_policy} if output_policy else {}),
                     },
                 )
             )

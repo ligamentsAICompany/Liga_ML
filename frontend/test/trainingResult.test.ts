@@ -83,10 +83,16 @@ LIGA_TRAINING_STATUS=succeeded
 LIGA_PROVIDER=aws-sagemaker
 LIGA_AWS_TRAINING_JOB_NAME=training-job-1
 LIGA_AWS_REGION=us-east-1
+LIGA_AWS_INSTANCE_TYPE=ml.g5.xlarge
+LIGA_AWS_INSTANCE_COUNT=1
 LIGA_S3_MODEL_ARTIFACT=s3://bucket/prefix/output/model.tar.gz
 LIGA_S3_OUTPUT_DIR=s3://bucket/prefix/output/
 LIGA_CLOUDWATCH_LOGS_URL=https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/foo,
-LIGA_FINAL_MODEL_URL=https://huggingface.co/alice/aws-model.
+LIGA_OUTPUT_POLICY=aws-private
+LIGA_DATASET_SOURCE=owner/dataset
+LIGA_STAGED_TRAIN_URI=s3://bucket/prefix/input/train.jsonl
+LIGA_TRAIN_ROWS=20
+LIGA_EVAL_ROWS=4
 LIGA_EVAL_RESULT_JSON={"eval_loss":0.25}
 LIGA_RESULT_FILE=liga_training_result.json
 `);
@@ -96,10 +102,16 @@ LIGA_RESULT_FILE=liga_training_result.json
     provider: 'aws-sagemaker',
     awsTrainingJobName: 'training-job-1',
     awsRegion: 'us-east-1',
+    awsInstanceType: 'ml.g5.xlarge',
+    awsInstanceCount: '1',
     s3ModelArtifact: 's3://bucket/prefix/output/model.tar.gz',
     s3OutputDir: 's3://bucket/prefix/output/',
     cloudWatchLogsUrl: 'https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/foo',
-    finalModelUrl: 'https://huggingface.co/alice/aws-model',
+    outputPolicy: 'aws-private',
+    datasetSource: 'owner/dataset',
+    stagedTrainUri: 's3://bucket/prefix/input/train.jsonl',
+    trainRows: '20',
+    evalRows: '4',
     evalResult: { eval_loss: 0.25 },
     resultFile: 'liga_training_result.json',
   });

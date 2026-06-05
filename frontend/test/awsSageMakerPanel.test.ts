@@ -49,16 +49,45 @@ test('AWS running state markdown includes job S3 and CloudWatch links', () => {
   assert.match(markdown, /SageMaker console/);
 });
 
-test('AWS final summary includes S3 model artifact and final model URL', () => {
+test('AWS final summary keeps S3-only outputs visible without HF URL', () => {
   const output = appendAwsTrainingResultSummary(`
 LIGA_TRAINING_STATUS=succeeded
 LIGA_PROVIDER=aws-sagemaker
 LIGA_AWS_TRAINING_JOB_NAME=training-job-1
+LIGA_AWS_REGION=us-east-1
 LIGA_S3_MODEL_ARTIFACT=s3://bucket/prefix/output/model.tar.gz
-LIGA_FINAL_MODEL_URL=https://huggingface.co/alice/aws-model
+LIGA_S3_OUTPUT_DIR=s3://bucket/prefix/output/
+LIGA_CLOUDWATCH_LOGS_URL=https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups/log-group/foo
+LIGA_OUTPUT_POLICY=aws-private
+LIGA_EVAL_RESULT_JSON={"eval_loss":0.25,"eval_samples_per_second":2}
+LIGA_RESULT_FILE=liga_training_result.json
 `);
 
   assert.match(output, /Liga Training Result/);
+  assert.match(output, /succeeded/);
+  assert.match(output, /aws-sagemaker/);
   assert.match(output, /s3:\/\/bucket\/prefix\/output\/model.tar.gz/);
-  assert.match(output, /https:\/\/huggingface.co\/alice\/aws-model/);
+  assert.match(output, /s3:\/\/bucket\/prefix\/output\//);
+  assert.match(output, /liga_training_result\.json/);
+  assert.match(output, /eval_loss/);
+  assert.match(output, /aws-private/);
+  assert.doesNotMatch(output, /huggingface\.co/);
+});
+
+test('AWS final summary explains missing result JSON while preserving success', () => {
+  const output = appendAwsTrainingResultSummary(`
+AWS training completed.
+
+**TrainingJobStatus:** Completed
+**S3ModelArtifacts:** s3://bucket/prefix/output/model.tar.gz
+**Result file:** result JSON was not found separately; inspect model artifact if needed.
+
+LIGA_TRAINING_STATUS=succeeded
+LIGA_PROVIDER=aws-sagemaker
+LIGA_S3_MODEL_ARTIFACT=s3://bucket/prefix/output/model.tar.gz
+`);
+
+  assert.match(output, /succeeded/);
+  assert.match(output, /s3:\/\/bucket\/prefix\/output\/model.tar.gz/);
+  assert.match(output, /result JSON was not found separately/);
 });
