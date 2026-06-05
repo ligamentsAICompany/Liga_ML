@@ -26,11 +26,14 @@ Create Secret Manager secrets for tokens that the service uses. Do not place raw
 
 ```bash
 printf '%s' "$HF_TOKEN" | gcloud secrets create hf-token --data-file=-
+printf '%s' "$HUGGINGFACE_HUB_TOKEN" | gcloud secrets create huggingface-hub-token --data-file=-
 printf '%s' "$GITHUB_TOKEN" | gcloud secrets create github-token --data-file=-
 printf '%s' "$OPENAI_API_KEY" | gcloud secrets create openai-api-key --data-file=-
+printf '%s' "$AWS_ACCESS_KEY_ID" | gcloud secrets create aws-access-key-id --data-file=-
+printf '%s' "$AWS_SECRET_ACCESS_KEY" | gcloud secrets create aws-secret-access-key --data-file=-
 ```
 
-`HF_TOKEN` is required for Hugging Face Hub uploads and HF Jobs. `GITHUB_TOKEN` is required for GitHub-backed tools. `OPENAI_API_KEY` is only required if premium/OpenAI model support is used.
+`HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` are used for Hugging Face Hub uploads and HF Jobs. `GITHUB_TOKEN` is required for GitHub-backed tools. `OPENAI_API_KEY` is only required if premium/OpenAI model support is used. AWS secrets are required only when the Cloud Run service should submit SageMaker jobs with static AWS credentials; omit `AWS_SESSION_TOKEN` unless using temporary credentials, or prefer an approved workload identity/federation strategy where available.
 
 ## Bucket Setup
 
@@ -91,10 +94,12 @@ From the repository root:
 
 ```bash
 gcloud builds submit \
-  --substitutions=_REGION=us-central1,_SERVICE_NAME=liga-ml-intern,_ARTIFACT_REPO=liga-ml-containers,_IMAGE_NAME=liga-ml-intern,_GCS_BUCKET=liga-ml-training,_VERTEX_AI_SERVICE_ACCOUNT=vertex-runner@PROJECT_ID.iam.gserviceaccount.com
+  --substitutions=_REGION=us-central1,_SERVICE_NAME=liga-ml-intern,_ARTIFACT_REPO=liga-ml-containers,_IMAGE_NAME=liga-ml-intern,_GCS_BUCKET=liga-ml-training,_VERTEX_AI_SERVICE_ACCOUNT=vertex-runner@PROJECT_ID.iam.gserviceaccount.com,_AWS_REGION=us-east-1,_AWS_S3_BUCKET=your-s3-bucket,_AWS_SAGEMAKER_ROLE_ARN=arn:aws:iam::123456789012:role/LigaMLSageMakerExecutionRole,_AWS_SAGEMAKER_TRAINING_IMAGE_URI=123456789012.dkr.ecr.us-east-1.amazonaws.com/your-training-image:latest
 ```
 
-Leave `_VERTEX_AI_SERVICE_ACCOUNT` empty to use the Cloud Run service account for Vertex job submission. The build creates the Artifact Registry repository if needed, builds the Docker image, pushes `$COMMIT_SHA` and `latest` tags, then deploys Cloud Run with 2 GiB memory, 2 CPU, 3600 second timeout, concurrency 20, port 8080, production environment variables, and Secret Manager-backed `HF_TOKEN`, `GITHUB_TOKEN`, and `OPENAI_API_KEY`.
+Leave `_VERTEX_AI_SERVICE_ACCOUNT` empty to use the Cloud Run service account for Vertex job submission. The build creates the Artifact Registry repository if needed, builds the Docker image, pushes `$COMMIT_SHA` and `latest` tags, then deploys Cloud Run with 2 GiB memory, 2 CPU, 3600 second timeout, concurrency 20, port 8080, production environment variables, and Secret Manager-backed `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`. Temporary AWS sessions may also set `_AWS_SESSION_TOKEN_SECRET`.
+
+Do not set `GOOGLE_APPLICATION_CREDENTIALS` for Cloud Run production. Attach the Cloud Run service account and grant IAM roles instead. JSON credential files are for local development only and must not be committed or copied into the container image.
 
 The default deployment uses `--allow-unauthenticated` because the existing web product is public. Remove that flag from `cloudbuild.yaml` and configure IAM/IAP if you want private access.
 
@@ -121,11 +126,19 @@ Expected `/api/health/providers` behavior:
     "region": "us-central1",
     "bucket": "liga-ml-training",
     "credentials_detected": true
+  },
+  "aws_sagemaker": {
+    "configured": true,
+    "missing_env": [],
+    "region": "us-east-1",
+    "s3_bucket": "your-s3-bucket",
+    "credentials_detected": true,
+    "training_image_configured": true
   }
 }
 ```
 
-If `gcp_vertex.configured` is false, inspect `missing_env`, `warnings`, and `credentials_detected`. The endpoint performs only local readiness checks and does not call Vertex AI.
+If `gcp_vertex.configured` or `aws_sagemaker.configured` is false, inspect `missing_env`, `warnings`, and `credentials_detected`. The endpoint performs only local readiness checks and does not call Vertex AI or SageMaker.
 
 You can also run the local helper:
 

@@ -43,13 +43,13 @@ def test_env_example_includes_aws_sagemaker_placeholders() -> None:
 
     expected_lines = [
         "# AWS / SageMaker",
-        "AWS_REGION=us-east-1",
+        "AWS_REGION=",
         "AWS_S3_BUCKET=",
         "AWS_S3_PREFIX=liga-ml",
         "AWS_SAGEMAKER_ROLE_ARN=",
         "AWS_DEFAULT_INSTANCE_TYPE=ml.g5.xlarge",
         "AWS_DEFAULT_INSTANCE_COUNT=1",
-        "AWS_DEFAULT_MAX_RUN_SECONDS=3600",
+        "AWS_DEFAULT_MAX_RUN_SECONDS=7200",
         "AWS_OUTPUT_POLICY=aws-private",
         "AWS_SAGEMAKER_TRAINING_IMAGE_URI=",
         "AWS_ACCESS_KEY_ID=",

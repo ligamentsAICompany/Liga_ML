@@ -17,6 +17,10 @@ def test_dockerfile_builds_frontend_and_runs_backend_on_8080() -> None:
     assert "FROM python:" in text
     assert "uv sync --no-dev --frozen" in text
     assert "COPY --from=frontend-builder /app/frontend/dist ./static/" in text
+    assert "COPY agent/ ./agent/" in text
+    assert "COPY backend/ ./backend/" in text
+    assert "COPY docs/ ./docs/" in text
+    assert "COPY scripts/ ./scripts/" in text
     assert "EXPOSE 8080" in text
     assert "${PORT:-8080}" in text
     assert "uvicorn main:app --host 0.0.0.0" in text
@@ -37,8 +41,11 @@ def test_dockerignore_excludes_secrets_caches_and_local_datasets() -> None:
         "__pycache__",
         ".pytest_cache",
         ".ruff_cache",
+        ".playwright-mcp",
         ".env",
         ".env.*",
+        "*credentials*.json",
+        "service-account*.json",
         "*.pem",
         "*.key",
         "*.p12",
@@ -46,6 +53,7 @@ def test_dockerignore_excludes_secrets_caches_and_local_datasets() -> None:
         ".DS_Store",
         "session_logs",
         "medical_patient_support_training_data.md",
+        "aws_hardware_support_real_world_dataset.md",
         "hardware_support_real_world_dataset.md",
         "call_center_real_world_pilot.csv",
     ]
@@ -79,8 +87,28 @@ def test_docker_docs_are_linked_from_readme() -> None:
         "Secret Manager",
         "Cloud Run",
         "HF_TOKEN",
+        "AWS SageMaker",
+        "GOOGLE_APPLICATION_CREDENTIALS",
         "MONGODB_URI",
     ]:
         assert expected in docs
 
     assert "docs/docker-deployment.md" in readme
+
+
+def test_docker_docs_cover_all_provider_runtime_files_and_readiness() -> None:
+    docs = _read("docs/docker-deployment.md")
+
+    for expected in [
+        "Hugging Face Jobs",
+        "Google Cloud Vertex AI",
+        "AWS SageMaker AI",
+        "AWS_SAGEMAKER_TRAINING_IMAGE_URI",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "Secret Manager",
+        "docker build -t liga-ml:all-providers",
+        "docker compose --env-file .env up --build",
+        "without launching training jobs",
+    ]:
+        assert expected in docs

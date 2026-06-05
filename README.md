@@ -8,7 +8,8 @@ An ML intern that autonomously researches, writes, and ships good quality ML rel
 
 ## Quick Start
 
-For single-container Docker or Cloud Run-style client deployment, see
+For single-container Docker or Cloud Run-style client deployment across
+Hugging Face Jobs, Google Cloud Vertex AI, and AWS SageMaker AI, see
 [`docs/docker-deployment.md`](docs/docker-deployment.md).
 
 ### Installation
@@ -40,6 +41,17 @@ GOOGLE_CLOUD_REGION=us-central1
 GCS_BUCKET=<your-training-bucket-name>
 VERTEX_AI_STAGING_BUCKET=gs://<your-training-bucket-name>/vertex-staging
 VERTEX_AI_OUTPUT_DIR=gs://<your-training-bucket-name>/vertex-outputs
+
+# Optional: enable AWS SageMaker AI training
+AWS_REGION=<your-aws-region>
+AWS_S3_BUCKET=<your-training-bucket-name>
+AWS_S3_PREFIX=liga-ml
+AWS_SAGEMAKER_ROLE_ARN=<your-sagemaker-execution-role-arn>
+AWS_SAGEMAKER_TRAINING_IMAGE_URI=<your-training-image-uri>
+AWS_DEFAULT_INSTANCE_TYPE=ml.g5.xlarge
+AWS_DEFAULT_INSTANCE_COUNT=1
+AWS_DEFAULT_MAX_RUN_SECONDS=7200
+AWS_OUTPUT_POLICY=aws-private
 ```
 
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
@@ -240,6 +252,42 @@ Edit `configs/cli_agent_config.json` or `configs/frontend_agent_config.json`:
 ```
 
 Note: Environment variables like `${YOUR_TOKEN}` are auto-substituted from `.env`.
+
+## Docker And Cloud Run Deployment
+
+The production container serves the FastAPI backend and built frontend on
+`0.0.0.0:$PORT`, defaulting to port `8080`. Build and run locally with:
+
+```bash
+docker build -t liga-ml:all-providers .
+docker run --rm --env-file .env -p 8080:8080 liga-ml:all-providers
+```
+
+Or use Compose:
+
+```bash
+docker compose --env-file .env up --build
+```
+
+Cloud Run should use at least 2 GiB memory, 2 CPU, a 3600 second timeout,
+concurrency around 20, port `8080`, Secret Manager for `OPENAI_API_KEY`,
+`HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`, plus normal env vars
+for non-secret provider configuration. Do not use
+`GOOGLE_APPLICATION_CREDENTIALS` for Cloud Run production; attach an appropriate
+service account instead. Never commit `.env`, credential files, local datasets,
+`.playwright-mcp`, caches, or generated artifacts.
+
+After deployment, verify without launching paid jobs:
+
+```bash
+curl "$SERVICE_URL/api/health"
+curl "$SERVICE_URL/api/health/providers"
+curl "$SERVICE_URL/"
+```
+
+The provider health endpoint reports non-secret readiness for Hugging Face Jobs,
+Google Cloud Vertex AI, and AWS SageMaker AI.
 
 ## Google Cloud Vertex AI Training
 

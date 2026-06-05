@@ -7,6 +7,11 @@
 .env.*
 !.env.example
 credentials*.json
+*credentials*.json
+service-account*.json
+*-service-account.json
+gcloud*.json
+adc*.json
 *.pem
 *.key
 *.p12
@@ -40,6 +45,7 @@ frontend/tsconfig.tsbuildinfo
 # Local/generated project data
 logs/
 session_logs/
+.playwright-mcp/
 scratch/
 data/
 datasets/
@@ -51,6 +57,7 @@ hf-agent-leaderboard/
 *.jsonl
 *.csv
 medical_patient_support_training_data.md
+aws_hardware_support_real_world_dataset.md
 hardware_support_real_world_dataset.md
 call_center_real_world_pilot.csv
 
