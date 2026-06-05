@@ -26,7 +26,16 @@ def _session(*, cap=5.0, spent=0.0, enabled=True):
         auto_approval_cost_cap_usd=cap,
         auto_approval_estimated_spend_usd=spent,
         sandbox=None,
+        logged_events=[],
+        context_manager=SimpleNamespace(items=[]),
     )
+
+
+def _aws_state(state: str):
+    return {
+        "event_type": "tool_state_change",
+        "data": {"tool": "aws_sagemaker_jobs", "state": state, "jobName": "job-1"},
+    }
 
 
 @pytest.mark.asyncio
@@ -376,6 +385,33 @@ async def test_aws_sagemaker_job_under_cap_auto_runs_when_cost_is_known(monkeypa
     assert decision.requires_approval is False
     assert decision.auto_approved is True
     assert decision.estimated_cost_usd == 1.5
+
+
+@pytest.mark.asyncio
+async def test_second_aws_sagemaker_run_after_terminal_job_requires_manual_approval(
+    monkeypatch,
+):
+    async def fake_estimate(*args, **kwargs):
+        return CostEstimate(estimated_cost_usd=1.5, billable=True)
+
+    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
+    session = _session(cap=5.0, spent=1.0)
+    session.logged_events = [_aws_state("failed")]
+    session.aws_sagemaker_retry_authorized = True
+
+    decision = await agent_loop._approval_decision(
+        "aws_sagemaker_jobs",
+        {
+            "operation": "run",
+            "instance_type": "ml.g5.xlarge",
+            "max_run_seconds": 3600,
+        },
+        session,
+    )
+
+    assert decision.requires_approval is True
+    assert decision.auto_approval_blocked is True
+    assert "second paid AWS SageMaker run" in decision.block_reason
 
 
 @pytest.mark.asyncio

@@ -192,6 +192,79 @@ def test_normalize_markdown_chunks_to_training_jsonl_schema():
     ]
 
 
+def test_normalize_structured_markdown_user_assistant_examples_to_sft_rows():
+    rows = dataset_uploads.normalize_uploaded_dataset(
+        b"""# Hardware Support
+
+## Example 1
+
+User:
+My GPU reaches 90 degrees Celsius during games. What should I check?
+
+Assistant:
+Check case airflow, GPU fan behavior, dust buildup, and driver version. Power off and unplug the desktop before cleaning.
+
+Category:
+gpu_overheating
+
+Safety:
+power_off_before_cleaning
+
+## Example 2
+
+User:
+My upgraded RAM causes random crashes.
+
+Assistant:
+Check motherboard compatibility, slots, default memory settings, and run memory diagnostics.
+
+Category:
+ram_compatibility
+
+Safety:
+esd_safe_reseat
+""",
+        "hardware.md",
+        "md",
+    )
+
+    assert len(rows) == 2
+    assert rows[0] == {
+        "source_format": "md",
+        "source_file": "hardware.md",
+        "chunk_index": 0,
+        "example_index": 1,
+        "text": (
+            "User: My GPU reaches 90 degrees Celsius during games. What should I check?\n\n"
+            "Assistant: Check case airflow, GPU fan behavior, dust buildup, and driver version. "
+            "Power off and unplug the desktop before cleaning."
+        ),
+        "prompt": "My GPU reaches 90 degrees Celsius during games. What should I check?",
+        "completion": (
+            "Check case airflow, GPU fan behavior, dust buildup, and driver version. "
+            "Power off and unplug the desktop before cleaning."
+        ),
+        "messages": [
+            {
+                "role": "user",
+                "content": "My GPU reaches 90 degrees Celsius during games. What should I check?",
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "Check case airflow, GPU fan behavior, dust buildup, and driver version. "
+                    "Power off and unplug the desktop before cleaning."
+                ),
+            },
+        ],
+        "category": "gpu_overheating",
+        "safety": "power_off_before_cleaning",
+    }
+    assert rows[1]["example_index"] == 2
+    assert rows[1]["messages"][0]["content"] == "My upgraded RAM causes random crashes."
+    assert rows[1]["category"] == "ram_compatibility"
+
+
 def test_normalize_markdown_splits_examples_and_preserves_structured_content():
     rows = dataset_uploads.normalize_uploaded_dataset(
         b"""# Fine-tuning Examples
@@ -218,13 +291,20 @@ print("keep code")
 
     assert len(rows) == 2
     assert rows[0]["chunk_index"] == 0
-    assert rows[0]["text"].startswith("# Fine-tuning Examples\n\n## Example 1")
-    assert "User: How do I reset my password?" in rows[0]["text"]
+    assert rows[0]["prompt"] == "How do I reset my password?"
+    assert (
+        rows[0]["completion"]
+        == "Go to Settings, choose Security, then select Reset Password."
+    )
+    assert rows[0]["messages"][0]["role"] == "user"
+    assert rows[0]["messages"][1]["role"] == "assistant"
     assert rows[1]["chunk_index"] == 1
-    assert rows[1]["text"].startswith("# Fine-tuning Examples\n\n## Example 2")
-    assert "- User: How do I export my report?" in rows[1]["text"]
-    assert "| source | docs |" in rows[1]["text"]
-    assert 'print("keep code")' in rows[1]["text"]
+    assert rows[1]["prompt"] == "How do I export my report?"
+    assert rows[1]["completion"].startswith(
+        "Open Reports, choose the desired report, and click Export."
+    )
+    assert "| source | docs |" in rows[1]["completion"]
+    assert 'print("keep code")' in rows[1]["completion"]
 
 
 def test_markdown_rows_serialize_as_one_json_object_per_line():

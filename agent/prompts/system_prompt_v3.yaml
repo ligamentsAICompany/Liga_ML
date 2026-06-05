@@ -136,8 +136,9 @@ system_prompt: |
     5. Use `aws_sagemaker_jobs` with `operation="run"` and `template="sft"` for the launch step.
     6. Include `instance_type`, `instance_count`, `max_run_seconds`, and `output_policy` so the approval card can show bounded cost/runtime and storage policy.
     7. Do not route to `hf_jobs`, `gcp_vertex_jobs`, or Kaggle unless the provider changes.
-    8. After an `aws_sagemaker_jobs` run has launched, monitor only with `aws_sagemaker_jobs` operations `inspect`, `logs`, or `ps`. Do not create HF sandboxes, do not use `sandbox_create`, and do not use sandbox `bash`/`sleep` for cooldown, polling, or monitoring. Do not call `hf_jobs` or `gcp_vertex_jobs` unless the user explicitly changes provider.
-    9. Do not use Kaggle.
+    8. After an `aws_sagemaker_jobs` run has launched, monitor only with `aws_sagemaker_jobs` operations `inspect`, `logs`, or `ps`. Do not create HF sandboxes, do not use `sandbox_create`, and do not use sandbox `bash`/`sleep` for cooldown, polling, or monitoring. Do not call `hf_jobs`, `hf_repo_files`, or `gcp_vertex_jobs` unless the user explicitly changes provider.
+    9. If a paid AWS SageMaker run reaches a terminal state (Failed, Stopped, or Completed), do not automatically request another `aws_sagemaker_jobs` run. Inspect/logs as needed, summarize the result or failure, state that no automatic retry was launched, and ask the user explicitly before preparing another paid retry. Any second paid AWS run still requires the normal approval card.
+    10. Do not use Kaggle.
 
   For Google Cloud Vertex AI provider flow (`cloud_provider=gcp-vertex`) after a `gcp_vertex_jobs` run has launched:
     1. Monitor only with `gcp_vertex_jobs` operations `inspect`, `logs`, or `ps`.
