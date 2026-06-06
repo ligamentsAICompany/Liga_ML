@@ -37,10 +37,11 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
     assert '--region="${_REGION}"' in deploy_args
     assert "--platform=managed" in deploy_args
     assert "--port=8080" in deploy_args
-    assert "--memory=2Gi" in deploy_args
+    assert "--memory=4Gi" in deploy_args
     assert "--cpu=2" in deploy_args
     assert "--timeout=3600" in deploy_args
-    assert "--concurrency=20" in deploy_args
+    assert "--concurrency=5" in deploy_args
+    assert "--min-instances=1" in deploy_args
 
     env_vars = deploy_args
     for name in [
@@ -80,6 +81,7 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert substitutions["_AWS_ACCESS_KEY_ID_SECRET"] == "aws-access-key-id"
     assert substitutions["_AWS_SECRET_ACCESS_KEY_SECRET"] == "aws-secret-access-key"
     assert substitutions["_AWS_SESSION_TOKEN_SECRET"] == ""
+    assert "_MONGODB_URI_SECRET" in substitutions
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg
@@ -93,6 +95,8 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
         "AWS_SECRET_ACCESS_KEY=${_AWS_SECRET_ACCESS_KEY_SECRET}:latest" in secrets_arg
     )
     assert "AWS_SESSION_TOKEN=${_AWS_SESSION_TOKEN_SECRET}:latest" in secrets_arg
+    assert 'if [ -n "${_MONGODB_URI_SECRET}" ]; then' in secrets_arg
+    assert "MONGODB_URI=${_MONGODB_URI_SECRET}:latest" in secrets_arg
 
     forbidden = ["hf_", "github_pat_", "ghp_", "sk-"]
     assert all(marker not in rendered for marker in forbidden)

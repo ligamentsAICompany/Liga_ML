@@ -8,6 +8,8 @@ import asyncio
 import json
 import logging
 import os
+import time
+import uuid
 from typing import Any
 
 from dependencies import (
@@ -58,6 +60,8 @@ from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.session import Event
+from agent.core.session_persistence import session_store_status
 
 logger = logging.getLogger(__name__)
 
@@ -335,10 +339,13 @@ async def _check_session_access(
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
+    store = session_manager.persistence_store
     return HealthResponse(
         status="ok",
         active_sessions=session_manager.active_session_count,
         max_sessions=MAX_SESSIONS,
+        session_store=session_store_status(store),
+        cloud_run_revision=os.environ.get("K_REVISION"),
     )
 
 
@@ -413,6 +420,7 @@ async def provider_health() -> dict[str, Any]:
         },
         "gcp_vertex": build_gcp_vertex_readiness_snapshot(),
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
+        "session_store": session_store_status(session_manager.persistence_store),
     }
 
 
@@ -973,6 +981,8 @@ async def chat_sse(
 
     # Parse body
     body = await request.json()
+    request_id = str(body.get("request_id") or uuid.uuid4())
+    stream_started_at = time.monotonic()
 
     # Subscribe BEFORE submitting so we never miss events — even if the
     # agent loop processes the submission before this coroutine continues.
@@ -1011,6 +1021,14 @@ async def chat_sse(
             raise
 
     try:
+        logger.info(
+            "chat_stream_event request_id=%s session_id=%s cloud_provider=%s "
+            "selected_model=%s event_type=stream_start",
+            request_id,
+            session_id,
+            cloud_provider or agent_session.cloud_provider,
+            agent_session.session.config.model_name,
+        )
         if approvals:
             formatted = [
                 {
@@ -1040,11 +1058,34 @@ async def chat_sse(
     except HTTPException:
         broadcaster.unsubscribe(sub_id)
         raise
-    except Exception:
+    except Exception as e:
         broadcaster.unsubscribe(sub_id)
+        logger.exception(
+            "chat_stream_event request_id=%s session_id=%s event_type=stream_error",
+            request_id,
+            session_id,
+        )
+        await agent_session.session.send_event(
+            Event(
+                event_type="stream_error",
+                data={
+                    "error": str(e),
+                    "request_id": request_id,
+                    "session_id": session_id,
+                },
+            )
+        )
         raise
 
-    return _sse_response(broadcaster, event_queue, sub_id)
+    return _sse_response(
+        broadcaster,
+        event_queue,
+        sub_id,
+        request=request,
+        session_id=session_id,
+        request_id=request_id,
+        stream_started_at=stream_started_at,
+    )
 
 
 @router.post("/pro-click/{session_id}")
@@ -1077,6 +1118,7 @@ _TERMINAL_EVENTS = {
     "turn_complete",
     "approval_required",
     "error",
+    "stream_error",
     "interrupted",
     "shutdown",
 }
@@ -1115,6 +1157,10 @@ def _sse_response(
     event_queue,
     sub_id,
     *,
+    request: Request | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    stream_started_at: float | None = None,
     replay_events: list[dict[str, Any]] | None = None,
     after_seq: int = 0,
 ) -> StreamingResponse:
@@ -1138,13 +1184,71 @@ def _sse_response(
                         event_queue.get(), timeout=_SSE_KEEPALIVE_SECONDS
                     )
                 except asyncio.TimeoutError:
-                    # SSE comment — ignored by parsers, keeps connection alive
-                    yield ": keepalive\n\n"
+                    if request is not None and await request.is_disconnected():
+                        logger.info(
+                            "chat_stream_event request_id=%s session_id=%s "
+                            "event_type=client_disconnected duration_ms=%s",
+                            request_id,
+                            session_id,
+                            int(
+                                (
+                                    time.monotonic()
+                                    - (stream_started_at or time.monotonic())
+                                )
+                                * 1000
+                            ),
+                        )
+                        break
+                    yield _format_sse(
+                        {
+                            "event_type": "heartbeat",
+                            "data": {
+                                "request_id": request_id,
+                                "session_id": session_id,
+                            },
+                        }
+                    )
                     continue
                 event_type = msg.get("event_type", "")
+                data = msg.get("data") or {}
+                safe_data = {
+                    "request_id": data.get("request_id") or request_id,
+                    "session_id": data.get("session_id") or session_id,
+                }
+                if event_type in {"tool_call", "tool_output"}:
+                    safe_data["tool"] = data.get("tool")
+                logger.info(
+                    "chat_stream_event request_id=%s session_id=%s event_type=%s "
+                    "cloud_provider=%s selected_model=%s duration_ms=%s",
+                    safe_data.get("request_id"),
+                    safe_data.get("session_id"),
+                    event_type,
+                    data.get("cloud_provider"),
+                    data.get("model"),
+                    int(
+                        (time.monotonic() - (stream_started_at or time.monotonic()))
+                        * 1000
+                    ),
+                )
                 yield _format_sse(msg)
                 if event_type in _TERMINAL_EVENTS:
                     break
+        except Exception as e:
+            logger.exception(
+                "chat_stream_event request_id=%s session_id=%s event_type=stream_error",
+                request_id,
+                session_id,
+            )
+            yield _format_sse(
+                {
+                    "event_type": "stream_error",
+                    "data": {
+                        "error": str(e),
+                        "request_id": request_id,
+                        "session_id": session_id,
+                    },
+                }
+            )
         finally:
             broadcaster.unsubscribe(sub_id)
 
@@ -1184,6 +1288,10 @@ async def subscribe_events(
         broadcaster,
         event_queue,
         sub_id,
+        request=request,
+        session_id=session_id,
+        request_id=f"reconnect-{uuid.uuid4()}",
+        stream_started_at=time.monotonic(),
         replay_events=replay_events,
         after_seq=after_seq,
     )

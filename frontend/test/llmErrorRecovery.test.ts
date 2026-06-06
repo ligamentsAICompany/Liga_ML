@@ -145,3 +145,16 @@ test('select-another-model action is available in the banner UI', () => {
   assert.match(appLayoutSource, /liga-open-model-selector/);
   assert.match(chatInputSource, /addEventListener\('liga-open-model-selector'/);
 });
+
+test('stream recovery copy and request id handling are wired into the frontend', () => {
+  const transportSource = readFileSync(join(process.cwd(), 'src/lib/sse-chat-transport.ts'), 'utf8');
+  const hookSource = readFileSync(join(process.cwd(), 'src/hooks/useAgentChat.ts'), 'utf8');
+  const agentStoreSource = readFileSync(join(process.cwd(), 'src/store/agentStore.ts'), 'utf8');
+
+  assert.match(transportSource, /STREAM_STALL_TIMEOUT_MS\s*=\s*90_000/);
+  assert.match(transportSource, /Connection stalled\. Checking session status\.\.\./);
+  assert.match(transportSource, /stream_error/);
+  assert.match(hookSource, /This session was lost after a server restart\. Please start a new session or retry the prompt\./);
+  assert.match(hookSource, /request_id/);
+  assert.match(agentStoreSource, /streamRecoveryError/);
+});

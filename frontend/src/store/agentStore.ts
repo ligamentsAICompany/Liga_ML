@@ -81,6 +81,7 @@ export type ActivityStatus =
   | { type: 'tool'; toolName: string; description?: string }
   | { type: 'waiting-approval' }
   | { type: 'streaming' }
+  | { type: 'stalled'; message: string }
   | { type: 'cancelled' };
 
 export interface ResearchAgentStats {
@@ -110,6 +111,7 @@ export interface PerSessionState {
   researchSteps: string[];
   /** @deprecated kept for backward compat selectors — use researchAgents instead */
   researchStats: ResearchAgentStats;
+  streamRecoveryError: string | null;
 }
 
 const defaultResearchStats: ResearchAgentStats = { toolCount: 0, tokenCount: 0, startedAt: null, finalElapsed: null };
@@ -124,6 +126,7 @@ const defaultSessionState: PerSessionState = {
   researchAgents: {},
   researchSteps: [],
   researchStats: { ...defaultResearchStats },
+  streamRecoveryError: null,
 };
 
 interface AgentStore {
@@ -140,6 +143,7 @@ interface AgentStore {
   /** Set when a premium-model send hits the daily quota; ChatInput opens the cap dialog. */
   claudeQuotaExhausted: boolean;
   jobsUpgradeRequired: JobsUpgradeState | null;
+  streamRecoveryError: string | null;
 
   // Right panel (single-artifact pattern)
   panelData: PanelData | null;
@@ -324,6 +328,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   llmHealthError: null,
   claudeQuotaExhausted: false,
   jobsUpgradeRequired: null,
+  streamRecoveryError: null,
 
   panelData: null,
   panelView: 'script',
@@ -397,6 +402,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
         panelView: state.panelView,
         panelEditable: state.panelEditable,
         plan: state.plan,
+        streamRecoveryError: state.streamRecoveryError,
         researchAgents: state.sessionStates[state.activeSessionId]?.researchAgents ?? {},
         researchSteps: state.sessionStates[state.activeSessionId]?.researchSteps ?? [],
         researchStats: state.sessionStates[state.activeSessionId]?.researchStats ?? { ...defaultResearchStats },
@@ -414,6 +420,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
       panelView: incoming.panelView,
       panelEditable: incoming.panelEditable,
       plan: incoming.plan,
+      streamRecoveryError: incoming.streamRecoveryError,
     });
   },
 

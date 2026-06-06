@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 MAX_BSON_BYTES = 15 * 1024 * 1024
+NO_DURABLE_STORE_WARNING = (
+    "MONGODB_URI is not configured; sessions will not survive restarts"
+)
 
 
 def _now() -> datetime:
@@ -516,6 +519,29 @@ def get_session_store() -> NoopSessionStore | MongoSessionStore:
         db_name = os.environ.get("MONGODB_DB", "ml-intern")
         _store = MongoSessionStore(uri, db_name) if uri else NoopSessionStore()
     return _store
+
+
+def session_store_status(
+    store: NoopSessionStore | MongoSessionStore | None = None,
+) -> dict[str, Any]:
+    """Return a non-secret health summary for hosted session durability."""
+    active_store = store or get_session_store()
+    if isinstance(active_store, MongoSessionStore) or getattr(
+        active_store, "enabled", False
+    ):
+        durable = bool(active_store.enabled)
+        return {
+            "type": "mongodb",
+            "durable": durable,
+            "warning": None
+            if durable
+            else "MongoDB session persistence is not available; sessions will not survive restarts",
+        }
+    return {
+        "type": "noop",
+        "durable": False,
+        "warning": NO_DURABLE_STORE_WARNING,
+    }
 
 
 def _reset_store_for_tests(

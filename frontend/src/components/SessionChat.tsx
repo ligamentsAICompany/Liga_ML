@@ -5,6 +5,7 @@
  * runs — processing events — but only the active session renders visible
  * UI (MessageList + ChatInput).
  */
+import { Alert } from '@mui/material';
 import { useCallback, useEffect } from 'react';
 import { useAgentChat } from '@/hooks/useAgentChat';
 import { useAgentStore } from '@/store/agentStore';
@@ -22,7 +23,7 @@ interface SessionChatProps {
 }
 
 export default function SessionChat({ sessionId, isActive, onSessionDead }: SessionChatProps) {
-  const { isConnected, isProcessing, activityStatus, updateSession } = useAgentStore();
+  const { isConnected, isProcessing, activityStatus, streamRecoveryError, updateSession } = useAgentStore();
   const { updateSessionTitle, sessions } = useSessionStore();
   const sessionMeta = sessions.find((s) => s.id === sessionId);
   const isExpired = sessionMeta?.expired === true;
@@ -123,6 +124,11 @@ export default function SessionChat({ sessionId, isActive, onSessionDead }: Sess
         onUndoLastTurn={undoLastTurn}
         onEditAndRegenerate={editAndRegenerate}
       />
+      {streamRecoveryError && (
+        <Alert severity="warning" sx={{ mx: 2, mb: 1 }}>
+          {streamRecoveryError}
+        </Alert>
+      )}
       {isExpired ? (
         <ExpiredBanner sessionId={sessionId} />
       ) : (

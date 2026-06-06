@@ -87,7 +87,9 @@ MONGODB_URI=
 SESSION_STORE_PATH=/tmp/liga-ml-sessions
 ```
 
-Use `MONGODB_URI` for durable hosted-session persistence across restarts. The
+Use `MONGODB_URI` for durable hosted-session persistence across restarts. In
+production, `/api/health` and `/api/health/providers` report
+`session_store.durable=false` with a warning when MongoDB is not configured. The
 `SESSION_STORE_PATH` default is an ephemeral local path for Docker runtime files.
 
 AWS SageMaker AI:
@@ -132,11 +134,11 @@ with SPA fallback for frontend routes.
 
 Long-running HF Jobs, Vertex AI, and SageMaker training stay external to the web
 container. Cloud Run should only host the UI/API control plane. Use at least
-2 GiB memory, 2 CPU, a 3600 second request timeout, concurrency around 20, and
-port `8080`. Grant the Cloud Run service account the required Vertex AI, GCS,
-Artifact Registry, Cloud Logging, and Secret Manager permissions documented in
-`docs/google-cloud-deployment.md`, plus AWS runtime credentials documented in
-`docs/aws-sagemaker-deployment.md`.
+4 GiB memory, 2 CPU, a 3600 second request timeout, concurrency `5`, min
+instances `1`, and port `8080`. Grant the Cloud Run service account the required
+Vertex AI, GCS, Artifact Registry, Cloud Logging, and Secret Manager permissions
+documented in `docs/google-cloud-deployment.md`, plus AWS runtime credentials
+documented in `docs/aws-sagemaker-deployment.md`.
 
 After deploy, verify:
 
@@ -163,4 +165,5 @@ submitting or approving any paid training job.
   Manager or runtime identity.
 - If HF Jobs are not configured, provide `HF_TOKEN` or a user OAuth token.
 - If sessions disappear after restart, configure `MONGODB_URI`; local Docker
-  filesystem writes are ephemeral.
+  filesystem writes are ephemeral. Cloud Run should inject `MONGODB_URI` from
+  Secret Manager rather than a raw environment value.
