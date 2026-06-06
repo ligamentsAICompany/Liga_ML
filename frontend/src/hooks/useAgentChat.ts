@@ -95,12 +95,19 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       },
       onRequestStart: (requestId: string) => {
         useAgentStore.getState().clearLlmErrorForNewRequest(sessionId, requestId);
+        updateSession(sessionId, { streamRecoveryError: null });
       },
       onRequestSuccess: (requestId: string) => {
         useAgentStore.getState().clearLlmErrorForSuccessfulRequest(sessionId, requestId);
       },
       onError: (error: string, data?: Record<string, unknown>) => {
         updateSession(sessionId, { isProcessing: false });
+        const requestId = typeof data?.request_id === 'string' ? data.request_id : null;
+        if (data?.event_type === 'stream_error' || data?.request_id) {
+          updateSession(sessionId, {
+            streamRecoveryError: requestId ? `${error} (request_id: ${requestId})` : error,
+          });
+        }
         const errorType = typeof data?.error_type === 'string' ? data.error_type : null;
         const model = typeof data?.model === 'string' ? data.model : null;
         if (errorType || model) {
@@ -252,6 +259,10 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       },
       onSessionDead: (deadSessionId: string) => {
         logger.warn(`Session ${deadSessionId} dead, removing`);
+        updateSession(sessionId, {
+          isProcessing: false,
+          streamRecoveryError: 'This session was lost after a server restart. Please start a new session or retry the prompt.',
+        });
         callbacksRef.current.onSessionDead?.(deadSessionId);
       },
       onApprovalRequired: (tools) => {
@@ -539,6 +550,24 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         updateSession(sessionId, updates);
       },
       onInterrupted: () => { /* no-op — handled by stop() caller */ },
+      onStreamStalled: (message: string) => {
+        updateSession(sessionId, {
+          activityStatus: { type: 'stalled', message },
+          streamRecoveryError: null,
+        });
+      },
+      onStreamRecoveryResult: (message: string | null, data?: Record<string, unknown>) => {
+        updateSession(sessionId, {
+          isProcessing: false,
+          streamRecoveryError: message,
+          activityStatus: message
+            ? { type: 'stalled', message }
+            : { type: 'idle' },
+        });
+        if (data?.session && typeof data.session === 'object') {
+          refreshMessages();
+        }
+      },
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [sessionId],

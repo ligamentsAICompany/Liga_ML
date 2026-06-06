@@ -1069,9 +1069,18 @@ class SessionManager:
                         logger.info(f"Session {session_id} cancelled")
                         break
                     except Exception as e:
-                        logger.error(f"Error in session {session_id}: {e}")
+                        logger.exception(
+                            "chat_stream_event session_id=%s event_type=stream_error",
+                            session_id,
+                        )
                         await session.send_event(
-                            Event(event_type="error", data={"error": str(e)})
+                            Event(
+                                event_type="stream_error",
+                                data={
+                                    "error": str(e),
+                                    "session_id": session_id,
+                                },
+                            )
                         )
 
         finally:

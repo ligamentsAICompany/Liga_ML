@@ -35,6 +35,9 @@ GITHUB_TOKEN=<github-personal-access-token>
 ML_INTERN_DEFAULT_MODEL_ID=moonshotai/Kimi-K2.6
 ML_INTERN_KPIS_DISABLED=1
 
+# Optional: durable web sessions for hosted/Cloud Run deployments
+MONGODB_URI=<mongodb-connection-string>
+
 # Optional: enable Google Cloud Vertex AI training
 GOOGLE_CLOUD_PROJECT=<your-gcp-project-id>
 GOOGLE_CLOUD_REGION=us-central1
@@ -201,7 +204,9 @@ The agent emits the following events via `event_queue`:
 - `tool_state_change` - Tool execution state transition
 - `approval_required` - Requesting user approval for sensitive operations
 - `turn_complete` - Agent finished processing
+- `heartbeat` - Streaming connection is still alive while the agent works
 - `error` - Error occurred during processing
+- `stream_error` - Streaming failed with request/session identifiers for retry
 - `interrupted` - Agent was interrupted
 - `compacted` - Context was compacted
 - `undo_complete` - Undo operation completed

@@ -190,12 +190,22 @@ class DatasetUploadResponse(BaseModel):
     load_dataset_snippet: str
 
 
+class SessionStoreHealth(BaseModel):
+    """Non-secret session persistence status."""
+
+    type: str
+    durable: bool
+    warning: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str = "ok"
     active_sessions: int = 0
     max_sessions: int = 0
+    session_store: SessionStoreHealth | None = None
+    cloud_run_revision: str | None = None
 
 
 class LLMHealthResponse(BaseModel):

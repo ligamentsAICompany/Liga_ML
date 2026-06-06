@@ -111,6 +111,7 @@ function statusLabel(status: ActivityStatus): string {
       return base;
     }
     case 'waiting-approval': return 'Waiting for approval';
+    case 'stalled': return status.message;
     case 'cancelled': return 'What should the agent do instead?';
     default: return '';
   }
@@ -139,7 +140,7 @@ export default function ActivityStatusBar() {
           animation: `${shimmer} 4s ease-in-out infinite`,
         }}
       >
-        {label}{activityStatus.type !== 'cancelled' && '…'}
+        {label}{activityStatus.type !== 'cancelled' && activityStatus.type !== 'stalled' && '…'}
       </Typography>
     </Box>
   );

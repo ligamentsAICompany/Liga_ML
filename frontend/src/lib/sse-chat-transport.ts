@@ -57,18 +57,114 @@ export interface SideChannelCallbacks {
   onStreaming: () => void;
   onToolRunning: (toolName: string, description?: string) => void;
   onInterrupted: () => void;
+  onStreamStalled: (message: string) => void;
+  onStreamRecoveryResult: (message: string | null, data?: Record<string, unknown>) => void;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 let partIdCounter = 0;
+const STREAM_STALL_TIMEOUT_MS = 90_000;
+const STREAM_STALLED_MESSAGE = 'Connection stalled. Checking session status...';
+const SESSION_LOST_MESSAGE = 'This session was lost after a server restart. Please start a new session or retry the prompt.';
+
 function nextPartId(prefix: string): string {
   return `${prefix}-${Date.now()}-${++partIdCounter}`;
 }
 
 function lastEventKey(sessionId: string): string {
   return `hf-agent-last-event:${sessionId}`;
+}
+
+async function recoverStreamState(
+  sessionId: string,
+  sideChannel: SideChannelCallbacks,
+  reason: 'stall' | 'close',
+): Promise<void> {
+  try {
+    const response = await apiFetch(`/api/session/${sessionId}`);
+    if (response.status === 404) {
+      sideChannel.onSessionDead(sessionId);
+      sideChannel.onStreamRecoveryResult(SESSION_LOST_MESSAGE, { reason, session_id: sessionId });
+      sideChannel.onProcessingDone();
+      return;
+    }
+    if (!response.ok) {
+      sideChannel.onStreamRecoveryResult(`Stream recovery failed while checking session status (${response.status}).`, {
+        reason,
+        session_id: sessionId,
+      });
+      sideChannel.onProcessingDone();
+      return;
+    }
+    const info = await response.json().catch(() => ({}));
+    sideChannel.onStreamRecoveryResult(null, { reason, session_id: sessionId, session: info });
+    if (!info?.is_processing) {
+      sideChannel.onProcessingDone();
+    }
+  } catch (error) {
+    sideChannel.onStreamRecoveryResult(
+      `Stream recovery failed while checking session status: ${error instanceof Error ? error.message : String(error)}`,
+      { reason, session_id: sessionId },
+    );
+    sideChannel.onProcessingDone();
+  }
+}
+
+function createStreamRecoveryMonitor(
+  sessionId: string,
+  sideChannel: SideChannelCallbacks,
+): TransformStream<AgentEvent, AgentEvent> {
+  let terminalSeen = false;
+  let stalled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearTimer = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  const armTimer = () => {
+    clearTimer();
+    if (terminalSeen) return;
+    timer = setTimeout(() => {
+      stalled = true;
+      sideChannel.onStreamStalled(STREAM_STALLED_MESSAGE);
+      void recoverStreamState(sessionId, sideChannel, 'stall');
+    }, STREAM_STALL_TIMEOUT_MS);
+  };
+  const markMeaningful = (eventType: string) => {
+    if (eventType !== 'heartbeat') {
+      stalled = false;
+      armTimer();
+    }
+  };
+  const markTerminal = (eventType: string) => {
+    if (['turn_complete', 'approval_required', 'error', 'stream_error', 'interrupted', 'shutdown'].includes(eventType)) {
+      terminalSeen = true;
+      clearTimer();
+    }
+  };
+
+  return new TransformStream<AgentEvent, AgentEvent>({
+    start() {
+      armTimer();
+    },
+    transform(event, controller) {
+      markMeaningful(event.event_type);
+      markTerminal(event.event_type);
+      controller.enqueue(event);
+    },
+    async flush() {
+      clearTimer();
+      if (!terminalSeen && !stalled) {
+        sideChannel.onStreamStalled(STREAM_STALLED_MESSAGE);
+        await recoverStreamState(sessionId, sideChannel, 'close');
+      }
+    },
+  });
 }
 
 /** Parse an SSE text stream into AgentEvent objects. */
@@ -152,6 +248,9 @@ function createEventToChunkStream(
         // -- Side-channel only events ----------------------------------------
         case 'ready':
           sideChannel.onReady();
+          break;
+
+        case 'heartbeat':
           break;
 
         case 'shutdown':
@@ -343,6 +442,7 @@ function createEventToChunkStream(
           sideChannel.onProcessingDone();
           break;
 
+        case 'stream_error':
         case 'error': {
           const errorMsg = (event.data?.error as string) || 'Unknown error';
           endTextPart(controller);
@@ -350,6 +450,7 @@ function createEventToChunkStream(
           controller.enqueue({ type: 'finish', finishReason: 'error' });
           sideChannel.onError(errorMsg, {
             ...(event.data ?? {}),
+            event_type: event.event_type,
             request_id: event.data?.request_id ?? requestId,
             session_id: event.data?.session_id ?? sessionId,
           });
@@ -493,6 +594,7 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
     return response.body
       .pipeThrough(new TextDecoderStream())
       .pipeThrough(createSSEParserStream(sessionId))
+      .pipeThrough(createStreamRecoveryMonitor(sessionId, this.sideChannel))
       .pipeThrough(createEventToChunkStream(this.sideChannel, requestId, sessionId));
   }
 
@@ -520,6 +622,7 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       return response.body
         .pipeThrough(new TextDecoderStream())
         .pipeThrough(createSSEParserStream(this.sessionId))
+        .pipeThrough(createStreamRecoveryMonitor(this.sessionId, this.sideChannel))
         .pipeThrough(createEventToChunkStream(this.sideChannel, requestId, this.sessionId));
     } catch {
       return null;
