@@ -9,6 +9,11 @@ jobs. It displays estimates from approval metadata and conservative static
 pricing, provider job metadata from `tool_state_change` events, and readiness or
 quota warnings already reported by provider tools.
 
+Phase 5 static post-training evaluation is cost-free by default. It does not call
+live inference endpoints or paid judge models, so it does not add usage ledger
+entries. Future paid/live evaluation modes must be opt-in, separately approved,
+and recorded with their own usage entries.
+
 ## Tracked Fields
 
 Each usage entry stores:

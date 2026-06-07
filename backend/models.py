@@ -366,6 +366,53 @@ class AuditSummary(BaseModel):
     audit_store: AuditStoreHealth | None = None
 
 
+class EvaluationScores(BaseModel):
+    overall_score: float | None = None
+    task_relevance_score: float | None = None
+    safety_score: float | None = None
+    privacy_score: float | None = None
+    metric_quality_score: float | None = None
+    confidence: float | None = None
+
+
+class PostTrainingEvaluation(BaseModel):
+    evaluation_id: str
+    session_id: str
+    run_id: str
+    provider: str = "unknown"
+    job_id: str | None = None
+    model_ref: str | None = None
+    artifact_ref: str | None = None
+    dataset_ref: str | None = None
+    status: str = "not_started"
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    updated_at: str | None = None
+    evaluation_type: str = "static_result_review"
+    domain: str = "unknown"
+    task_type: str = "sft"
+    test_prompts: list[str] = Field(default_factory=list)
+    results: dict[str, Any] = Field(default_factory=dict)
+    scores: EvaluationScores = Field(default_factory=EvaluationScores)
+    safety_findings: list[dict[str, Any]] = Field(default_factory=list)
+    privacy_findings: list[dict[str, Any]] = Field(default_factory=list)
+    quality_summary: str | None = None
+    failure_summary: str | None = None
+    recommendation: str | None = None
+    report_markdown: str | None = None
+    artifact_paths: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationSummary(BaseModel):
+    total_evaluations: int = 0
+    counts_by_status: dict[str, int] = Field(default_factory=dict)
+    average_overall_score: float | None = None
+    latest_evaluation: PostTrainingEvaluation | None = None
+    evaluations: list[PostTrainingEvaluation] = Field(default_factory=list)
+
+
 class RunProviderMetadata(BaseModel):
     provider: str = "none"
     status: str | None = None
@@ -393,6 +440,9 @@ class RunSummary(BaseModel):
     error_summary: str | None = None
     result_summary: str | None = None
     provider_metadata: RunProviderMetadata = Field(default_factory=RunProviderMetadata)
+    evaluation_id: str | None = None
+    evaluation_status: str | None = None
+    evaluation_score: float | None = None
     estimated_cost_usd: float | None = None
     known_cost_usd: float | None = None
     usage_status: str = "unknown"

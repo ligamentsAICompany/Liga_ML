@@ -1,4 +1,5 @@
 import { redactJsonLike, redactText } from '../lib/redaction.js';
+import type { PostTrainingEvaluation } from '../lib/post-training-evaluation.js';
 
 export interface TrainingResult {
   status?: string;
@@ -19,6 +20,7 @@ export interface TrainingResult {
   s3OutputDir?: string;
   cloudWatchLogsUrl?: string;
   evalResult?: Record<string, unknown> | null;
+  postTrainingEvaluation?: Partial<PostTrainingEvaluation> | null;
   resultFile?: string;
 }
 
@@ -41,6 +43,7 @@ const MARKERS = {
   s3OutputDir: 'LIGA_S3_OUTPUT_DIR',
   cloudWatchLogsUrl: 'LIGA_CLOUDWATCH_LOGS_URL',
   evalResult: 'LIGA_EVAL_RESULT_JSON',
+  postTrainingEvaluation: 'LIGA_POST_TRAINING_EVALUATION_JSON',
   resultFile: 'LIGA_RESULT_FILE',
 } as const;
 
@@ -73,6 +76,21 @@ function parseEvalResult(value: string | undefined): Record<string, unknown> | n
   }
 }
 
+function parsePostTrainingEvaluation(
+  value: string | undefined,
+): Partial<PostTrainingEvaluation> | null | undefined {
+  if (value === undefined) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return redactJsonLike(parsed as Record<string, unknown>) as Partial<PostTrainingEvaluation>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function parseLigaTrainingResult(output: string | undefined): TrainingResult | null {
   if (!output) return null;
 
@@ -98,6 +116,9 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   const s3OutputDir = markerValue(output, MARKERS.s3OutputDir);
   const cloudWatchLogsUrl = cleanUrl(markerValue(output, MARKERS.cloudWatchLogsUrl));
   const evalResult = parseEvalResult(markerValue(output, MARKERS.evalResult));
+  const postTrainingEvaluation = parsePostTrainingEvaluation(
+    markerValue(output, MARKERS.postTrainingEvaluation),
+  );
   const resultFile = markerValue(output, MARKERS.resultFile);
 
   if (status) result.status = status;
@@ -118,6 +139,9 @@ export function parseLigaTrainingResult(output: string | undefined): TrainingRes
   if (s3OutputDir) result.s3OutputDir = s3OutputDir;
   if (cloudWatchLogsUrl) result.cloudWatchLogsUrl = cloudWatchLogsUrl;
   if (evalResult !== undefined) result.evalResult = evalResult;
+  if (postTrainingEvaluation !== undefined) {
+    result.postTrainingEvaluation = postTrainingEvaluation;
+  }
   if (resultFile) result.resultFile = resultFile;
 
   return Object.keys(result).length > 0 ? result : null;

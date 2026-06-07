@@ -441,6 +441,9 @@ class SessionManager:
                 or run.get("provider_output_policy"),
                 "last_checked_at": provider_metadata.get("last_checked_at"),
             },
+            "evaluation_id": run.get("evaluation_id"),
+            "evaluation_status": run.get("evaluation_status"),
+            "evaluation_score": run.get("evaluation_score"),
             "estimated_cost_usd": run.get("estimated_cost_usd"),
             "known_cost_usd": run.get("known_cost_usd"),
             "usage_status": run.get("usage_status") or "unknown",
@@ -579,6 +582,21 @@ class SessionManager:
 
     async def audit_summary(self, **filters: Any) -> dict[str, Any]:
         return await self._store().audit_summary(**filters)
+
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        return sanitize_for_frontend(await self._store().upsert_evaluation(evaluation))
+
+    async def list_evaluations(self, **filters: Any) -> list[dict[str, Any]]:
+        return sanitize_for_frontend(await self._store().list_evaluations(**filters))
+
+    async def get_evaluation_for_run(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        evaluation = await self._store().get_evaluation_for_run(session_id, run_id)
+        return sanitize_for_frontend(evaluation) if evaluation else None
+
+    async def evaluation_summary(self, **filters: Any) -> dict[str, Any]:
+        return sanitize_for_frontend(await self._store().evaluation_summary(**filters))
 
     async def load_run_events_after(
         self, session_id: str, run_id: str, after_seq: int = 0

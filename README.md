@@ -311,6 +311,11 @@ path when MongoDB is configured. `RUN_WORKER_MODE=external_worker` is reserved
 and not implemented yet. Set `SESSION_TOKEN_ENCRYPTION_KEY` before any future
 encrypted token handoff is enabled; Phase 1 does not persist provider tokens in
 the run ledger. See `docs/background-runs.md` for the run APIs and replay model.
+Post-training evaluation is static and cost-free by default:
+`POST_TRAINING_EVAL_ENABLED=true`, `POST_TRAINING_EVAL_MODE=static`, and
+`POST_TRAINING_EVAL_USE_PAID_JUDGE=false`. It reviews completed training metadata
+and metrics without loading models or calling live endpoints; see
+[`docs/post-training-evaluation.md`](docs/post-training-evaluation.md).
 Do not use
 `GOOGLE_APPLICATION_CREDENTIALS` for Cloud Run production; attach an appropriate
 service account instead. Never commit `.env`, credential files, local datasets,

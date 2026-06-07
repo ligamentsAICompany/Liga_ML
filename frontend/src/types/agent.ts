@@ -68,6 +68,9 @@ export interface BackgroundRunSummary {
   error_summary?: string | null;
   result_summary?: string | null;
   provider_metadata?: BackgroundRunProviderMetadata;
+  evaluation_id?: string | null;
+  evaluation_status?: 'not_started' | 'planned' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'unavailable' | string | null;
+  evaluation_score?: number | null;
   audit_event_count?: number;
   audit_warning_count?: number;
   audit_error_count?: number;

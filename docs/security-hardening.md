@@ -18,9 +18,10 @@ responses. It redacts:
 
 The frontend has a defensive helper in `frontend/src/lib/redaction.ts` and
 applies it to tool output panels, approval arguments, audit timeline data, usage
-dashboard data, error text, and parsed training result markers. Normal artifact
-locations such as `s3://...`, `gs://...`, and `https://huggingface.co/...` are
-preserved unless they contain signed credential query parameters.
+dashboard data, evaluation reports, error text, and parsed training result
+markers. Normal artifact locations such as `s3://...`, `gs://...`, and
+`https://huggingface.co/...` are preserved unless they contain signed credential
+query parameters.
 
 ## Sandbox Privacy
 
@@ -63,6 +64,14 @@ cloud secret managers when required by the provider, but they must not print
 environment variables, write credentials to result JSON, upload credential files,
 or emit secrets in `LIGA_*` markers. Result JSON should contain status, metrics,
 artifact paths, row counts, provider IDs, and policy metadata only.
+
+## Post-Training Evaluation Reports
+
+Phase 5 evaluation reports are static by default and are sanitized before
+persistence and frontend rendering. Reports may include provider ids, artifact
+paths, metric summaries, generated prompts, findings, recommendations, and
+limitations. They must not include tokens, bearer headers, signed URL
+credentials, raw private datasets, or credential files.
 
 ## Health Status
 

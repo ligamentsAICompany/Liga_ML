@@ -22,6 +22,10 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
 - Phase 3 derives audit timeline events from the same run and usage signals.
   MongoDB stores them in `audit_events`; the local fallback is in-memory and
   reported as `audit_store.durable=false`.
+- Phase 5 derives static post-training evaluations from the same replayable
+  final result markers. MongoDB stores them in `evaluations`; the local fallback
+  is in-memory and run summaries include `evaluation_status`,
+  `evaluation_score`, and `evaluation_id`.
 
 ## APIs
 
@@ -37,6 +41,9 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
 - `GET /api/audit/summary`
 - `GET /api/session/{session_id}/audit`
 - `GET /api/session/{session_id}/runs/{run_id}/audit`
+- `GET /api/session/{session_id}/evaluations`
+- `GET /api/session/{session_id}/runs/{run_id}/evaluation`
+- `POST /api/session/{session_id}/runs/{run_id}/evaluation`
 
 `POST /api/chat/{session_id}` remains backward compatible. It creates a run for
 new user messages when Phase 1 is enabled and attaches approval continuations to
@@ -87,6 +94,9 @@ redaction behavior, and frontend usage.
 
 See `docs/security-hardening.md` for Phase 4 redaction, sandbox privacy, and
 token handoff rules.
+
+See `docs/post-training-evaluation.md` for Phase 5 static evaluation, scoring,
+audit events, and limitations.
 
 ## Limitations
 

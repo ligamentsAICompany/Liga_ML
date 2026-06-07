@@ -10,7 +10,9 @@ Audit events cover session lifecycle, provider settings, model changes, prompt
 submission, dataset uploads, run start/completion/interruption/failure, planner
 state, approval required/approved/rejected, provider job start/running/success/
 failure, artifacts, usage estimates, budget/quota warnings, final results, and
-stream/provider errors.
+stream/provider errors. Phase 5 also records post-training evaluation lifecycle
+events: `evaluation_planned`, `evaluation_started`, `evaluation_completed`,
+`evaluation_skipped`, `evaluation_unavailable`, and `evaluation_failed`.
 
 Noisy events are skipped: `assistant_chunk`, `heartbeat`, and low-level logs do
 not create timeline entries. Repeated provider monitoring is idempotent by
@@ -49,6 +51,8 @@ intended retention window for later cleanup work.
 - `GET /api/audit/providers`
 - `GET /api/session/{session_id}/audit`
 - `GET /api/session/{session_id}/runs/{run_id}/audit`
+- Evaluation events can also be inspected through
+  `GET /api/session/{session_id}/runs/{run_id}/evaluation`.
 
 Supported query params are `session_id`, `run_id`, `provider`, `category`,
 `severity`, `status`, `limit`, `since`, and `until`.

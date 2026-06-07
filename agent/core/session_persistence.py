@@ -20,8 +20,14 @@ from agent.core.background_runs import (
 )
 from agent.core.audit import (
     audit_timeline_enabled,
+    build_audit_event,
     event_from_run_event,
     summarize_audit_events,
+)
+from agent.core.post_training_evaluation import (
+    build_post_training_evaluation,
+    evaluation_context_from_liga_output,
+    summarize_evaluations,
 )
 from agent.core.usage import (
     summarize_usage,
@@ -99,6 +105,7 @@ class NoopSessionStore:
         self._run_events: dict[str, list[dict[str, Any]]] = {}
         self._usage_entries: dict[str, dict[str, Any]] = {}
         self._audit_events: dict[str, dict[str, Any]] = {}
+        self._evaluations: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -212,6 +219,142 @@ class NoopSessionStore:
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self._runs.get(run_id)
         return dict(run) if run else None
+
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        clean = sanitize_for_persistence(
+            {key: value for key, value in evaluation.items() if value is not None}
+        )
+        evaluation_id = str(clean.get("evaluation_id") or clean.get("_id") or "")
+        if not evaluation_id:
+            evaluation_id = str(uuid.uuid4())
+            clean["evaluation_id"] = evaluation_id
+        clean["_id"] = evaluation_id
+        clean.setdefault("created_at", now)
+        clean["updated_at"] = now
+        current = dict(self._evaluations.get(evaluation_id) or {})
+        current.update(clean)
+        self._evaluations[evaluation_id] = current
+        run_id = str(current.get("run_id") or "")
+        if run_id in self._runs:
+            scores = (
+                current.get("scores") if isinstance(current.get("scores"), dict) else {}
+            )
+            self._runs[run_id].update(
+                {
+                    "evaluation_status": current.get("status"),
+                    "evaluation_score": scores.get("overall_score"),
+                    "evaluation_id": evaluation_id,
+                    "updated_at": now,
+                }
+            )
+        await self._record_evaluation_audit_events(current)
+        return dict(current)
+
+    async def list_evaluations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        evaluations = list(self._evaluations.values())
+        if session_id:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("session_id") == session_id
+            ]
+        if run_id:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("run_id") == run_id
+            ]
+        if provider:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("provider") == provider
+            ]
+        if status:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("status") == status
+            ]
+        evaluations = sorted(
+            (dict(evaluation) for evaluation in evaluations),
+            key=lambda item: (
+                _parse_dt(item.get("updated_at"))
+                or _parse_dt(item.get("completed_at"))
+                or _now()
+            ),
+            reverse=True,
+        )
+        return evaluations[: max(1, min(int(limit or 100), 500))]
+
+    async def get_evaluation_for_run(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        evaluations = await self.list_evaluations(
+            session_id=session_id, run_id=run_id, limit=1
+        )
+        return evaluations[0] if evaluations else None
+
+    async def evaluation_summary(self, **filters: Any) -> dict[str, Any]:
+        evaluations = await self.list_evaluations(**filters)
+        return {**summarize_evaluations(evaluations), "evaluations": evaluations}
+
+    async def _record_evaluation_audit_events(self, evaluation: dict[str, Any]) -> None:
+        session_id = str(evaluation.get("session_id") or "")
+        run_id = str(evaluation.get("run_id") or "")
+        if not session_id or not run_id:
+            return
+        status = str(evaluation.get("status") or "unknown")
+        provider = str(evaluation.get("provider") or "unknown")
+        evaluation_id = str(evaluation.get("evaluation_id") or "")
+        lifecycle = [
+            ("evaluation_planned", "planned", "Evaluation planned"),
+            ("evaluation_started", "running", "Evaluation started"),
+        ]
+        if status == "succeeded":
+            lifecycle.append(
+                ("evaluation_completed", "succeeded", "Evaluation completed")
+            )
+        elif status == "skipped":
+            lifecycle.append(("evaluation_skipped", "skipped", "Evaluation skipped"))
+        elif status == "failed":
+            lifecycle.append(("evaluation_failed", "failed", "Evaluation failed"))
+        else:
+            lifecycle.append(
+                ("evaluation_unavailable", status, "Evaluation unavailable")
+            )
+        for event_type, event_status, title in lifecycle:
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=event_type,
+                    category="result",
+                    severity="error" if event_status == "failed" else "info",
+                    status=event_status,
+                    actor="system",
+                    title=title,
+                    message=str(evaluation.get("recommendation") or title),
+                    provider=provider,
+                    entity_type="evaluation",
+                    entity_id=evaluation_id,
+                    artifact_url=evaluation.get("artifact_ref"),
+                    model_name=evaluation.get("model_ref"),
+                    safe_metadata={
+                        "evaluation_id": evaluation_id,
+                        "scores": evaluation.get("scores"),
+                    },
+                )
+            )
 
     async def upsert_usage_entry(
         self, usage_id: str, fields: dict[str, Any]
@@ -444,6 +587,32 @@ class NoopSessionStore:
                 update["result_summary"] = summary
         run.update(update)
         await self._apply_usage_event_update(run_id, event_type, payload, update)
+        await self._apply_evaluation_event_update(run_id, event_type, payload)
+
+    async def _apply_evaluation_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        if event_type not in {"tool_output", "assistant_message", "turn_complete"}:
+            return
+        run = self._runs.get(run_id)
+        if not run:
+            return
+        text = ""
+        for key in ("output", "content", "final_response", "formatted"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value
+                break
+        context = evaluation_context_from_liga_output(
+            session_id=str(run.get("session_id") or ""),
+            run_id=run_id,
+            output=text,
+            fallback_provider=str(run.get("provider") or ""),
+        )
+        if not context:
+            return
+        evaluation = build_post_training_evaluation(context)
+        await self.upsert_evaluation(evaluation)
 
     async def _apply_usage_event_update(
         self,
@@ -579,6 +748,11 @@ class MongoSessionStore(NoopSessionStore):
         await self.db.audit_events.create_index([("provider", 1), ("timestamp", -1)])
         await self.db.audit_events.create_index([("category", 1), ("timestamp", -1)])
         await self.db.audit_events.create_index([("severity", 1), ("timestamp", -1)])
+        await self.db.evaluations.create_index([("evaluation_id", 1)], unique=True)
+        await self.db.evaluations.create_index([("session_id", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("run_id", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("provider", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("status", 1), ("updated_at", -1)])
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
 
     def _ready(self) -> bool:
@@ -898,6 +1072,81 @@ class MongoSessionStore(NoopSessionStore):
         cursor = self.db.runs.find({"session_id": session_id}).sort("updated_at", -1)
         return [row async for row in cursor]
 
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        if not self._ready():
+            return await super().upsert_evaluation(evaluation)
+        now = _now()
+        clean = sanitize_for_persistence(
+            {key: value for key, value in evaluation.items() if value is not None}
+        )
+        evaluation_id = str(
+            clean.get("evaluation_id") or clean.get("_id") or uuid.uuid4()
+        )
+        clean["_id"] = evaluation_id
+        clean["evaluation_id"] = evaluation_id
+        clean["updated_at"] = now
+        doc = await self.db.evaluations.find_one_and_update(
+            {"evaluation_id": evaluation_id},
+            {
+                "$setOnInsert": {
+                    "_id": evaluation_id,
+                    "evaluation_id": evaluation_id,
+                    "created_at": clean.get("created_at") or now,
+                    "schema_version": SCHEMA_VERSION,
+                },
+                "$set": clean,
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        current = doc or clean
+        run_id = str(current.get("run_id") or "")
+        if run_id:
+            scores = (
+                current.get("scores") if isinstance(current.get("scores"), dict) else {}
+            )
+            await self.update_run(
+                run_id,
+                evaluation_status=current.get("status"),
+                evaluation_score=scores.get("overall_score"),
+                evaluation_id=evaluation_id,
+            )
+        await self._record_evaluation_audit_events(current)
+        return current
+
+    async def list_evaluations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_evaluations(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                status=status,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if provider:
+            query["provider"] = provider
+        if status:
+            query["status"] = status
+        cursor = (
+            self.db.evaluations.find(query)
+            .sort("updated_at", -1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
     async def upsert_usage_entry(
         self, usage_id: str, fields: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1148,6 +1397,31 @@ class MongoSessionStore(NoopSessionStore):
         await self._apply_persisted_usage_event_update(
             run_id, event_type, payload, update
         )
+        await self._apply_persisted_evaluation_event_update(run_id, event_type, payload)
+
+    async def _apply_persisted_evaluation_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        if event_type not in {"tool_output", "assistant_message", "turn_complete"}:
+            return
+        run = await self.get_run(run_id)
+        if not run:
+            return
+        text = ""
+        for key in ("output", "content", "final_response", "formatted"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value
+                break
+        context = evaluation_context_from_liga_output(
+            session_id=str(run.get("session_id") or ""),
+            run_id=run_id,
+            output=text,
+            fallback_provider=str(run.get("provider") or ""),
+        )
+        if not context:
+            return
+        await self.upsert_evaluation(build_post_training_evaluation(context))
 
     async def _apply_persisted_usage_event_update(
         self,

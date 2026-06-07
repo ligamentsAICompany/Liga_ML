@@ -43,6 +43,8 @@ from models import (
     DatasetUploadResponse,
     HealthResponse,
     LLMHealthResponse,
+    EvaluationSummary,
+    PostTrainingEvaluation,
     RunEventInfo,
     RunSummary,
     SecurityHealth,
@@ -76,6 +78,7 @@ from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.post_training_evaluation import build_post_training_evaluation
 from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
@@ -531,6 +534,40 @@ def _audit_summary_response(raw: dict[str, Any]) -> AuditSummary:
     )
 
 
+def _serialize_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return sanitize_for_frontend(
+        {
+            key: (iso(value) if key.endswith("_at") else value)
+            for key, value in evaluation.items()
+            if key not in {"_id", "schema_version"}
+        }
+    )
+
+
+def _evaluation_summary_response(raw: dict[str, Any]) -> EvaluationSummary:
+    evaluations = [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in raw.get("evaluations", [])
+    ]
+    latest = raw.get("latest_evaluation")
+    return EvaluationSummary(
+        total_evaluations=raw.get("total_evaluations", 0),
+        counts_by_status=raw.get("counts_by_status", {}),
+        average_overall_score=raw.get("average_overall_score"),
+        latest_evaluation=PostTrainingEvaluation(**_serialize_evaluation(latest))
+        if isinstance(latest, dict)
+        else None,
+        evaluations=evaluations,
+    )
+
+
 def _usage_summary_payload(
     raw: dict[str, Any], provider_readiness: dict[str, Any] | None = None
 ) -> UsageSummary:
@@ -777,6 +814,147 @@ async def audit_providers(user: dict = Depends(get_current_user)) -> dict[str, A
             "Sensitive metadata is redacted before persistence",
         ],
     }
+
+
+@router.get("/evaluations", response_model=list[PostTrainingEvaluation])
+async def list_evaluations(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[PostTrainingEvaluation]:
+    """List safe static post-training evaluations."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluations = await session_manager.list_evaluations(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in evaluations
+    ]
+
+
+@router.get("/evaluations/summary", response_model=EvaluationSummary)
+async def evaluations_summary(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> EvaluationSummary:
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    raw = await session_manager.evaluation_summary(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return _evaluation_summary_response(raw)
+
+
+@router.get(
+    "/session/{session_id}/evaluations", response_model=list[PostTrainingEvaluation]
+)
+async def list_session_evaluations(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> list[PostTrainingEvaluation]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluations = await session_manager.list_evaluations(
+        session_id=session_id, limit=500
+    )
+    return [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in evaluations
+    ]
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/evaluation",
+    response_model=PostTrainingEvaluation,
+)
+async def get_run_evaluation(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> PostTrainingEvaluation:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluation = await session_manager.get_evaluation_for_run(session_id, run_id)
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+    return PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+
+
+@router.get("/session/{session_id}/runs/{run_id}/evaluation/report")
+async def get_run_evaluation_report(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    evaluation = await get_run_evaluation(session_id, run_id, user)
+    return {
+        "evaluation_id": evaluation.evaluation_id,
+        "status": evaluation.status,
+        "report_markdown": evaluation.report_markdown or "",
+    }
+
+
+@router.post(
+    "/session/{session_id}/runs/{run_id}/evaluation",
+    response_model=PostTrainingEvaluation,
+)
+async def trigger_run_evaluation(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> PostTrainingEvaluation:
+    """Idempotently create a static evaluation without paid inference."""
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    existing = await session_manager.get_evaluation_for_run(session_id, run_id)
+    if existing:
+        return PostTrainingEvaluation(**_serialize_evaluation(existing))
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    provider_metadata = (
+        run.get("provider_metadata")
+        if isinstance(run.get("provider_metadata"), dict)
+        else {}
+    )
+    artifact_ref = (
+        provider_metadata.get("artifact_path")
+        or run.get("provider_artifact_path")
+        or run.get("result_summary")
+    )
+    evaluation = build_post_training_evaluation(
+        {
+            "session_id": session_id,
+            "run_id": run_id,
+            "provider": run.get("provider"),
+            "job_id": run.get("active_provider_job_id"),
+            "model_ref": run.get("result_summary"),
+            "artifact_ref": artifact_ref,
+            "dataset_ref": provider_metadata.get("dataset_name"),
+            "training_status": run.get("status"),
+            "metadata": {
+                "manual_trigger": True,
+                "mode": "static",
+                "provider_metadata": provider_metadata,
+            },
+        }
+    )
+    saved = await session_manager.upsert_evaluation(evaluation)
+    return PostTrainingEvaluation(**_serialize_evaluation(saved))
 
 
 @router.get("/session/{session_id}/audit", response_model=AuditTimelineResponse)
