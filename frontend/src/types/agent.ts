@@ -40,6 +40,35 @@ export interface UploadedDatasetInfo {
   load_dataset_snippet?: string;
 }
 
+export interface BackgroundRunProviderMetadata {
+  provider: 'hf-jobs' | 'gcp-vertex' | 'aws-sagemaker' | 'none' | string;
+  status?: string | null;
+  job_id?: string | null;
+  console_url?: string | null;
+  logs_url?: string | null;
+  artifact_path?: string | null;
+  output_policy?: string | null;
+  last_checked_at?: string | null;
+}
+
+export interface BackgroundRunSummary {
+  run_id: string;
+  session_id: string;
+  status: 'queued' | 'running' | 'waiting_approval' | 'waiting_provider' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted' | string;
+  provider: 'hf-jobs' | 'gcp-vertex' | 'aws-sagemaker' | 'none' | string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  last_event_seq?: number;
+  active_tool?: string | null;
+  active_provider_job_id?: string | null;
+  approval_id?: string | null;
+  error_summary?: string | null;
+  result_summary?: string | null;
+  provider_metadata?: BackgroundRunProviderMetadata;
+}
+
 export interface UnavailableModelInfo {
   model: string;
   errorType: 'quota' | 'billing' | 'auth' | 'rate_limit' | 'network' | 'empty_response' | 'unknown';
@@ -77,6 +106,7 @@ export interface SessionMeta {
   autoApprovalEstimatedSpendUsd?: number;
   autoApprovalRemainingUsd?: number | null;
   uploadedDatasets?: UploadedDatasetInfo[];
+  runs?: BackgroundRunSummary[];
   unavailableModels?: Record<string, UnavailableModelInfo>;
 }
 

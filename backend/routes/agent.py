@@ -39,6 +39,8 @@ from models import (
     DatasetUploadResponse,
     HealthResponse,
     LLMHealthResponse,
+    RunEventInfo,
+    RunSummary,
     SessionInfo,
     SessionNotificationsRequest,
     SessionResponse,
@@ -56,6 +58,7 @@ from session_manager import (
 import user_quotas
 
 from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
+from agent.core.background_runs import background_run_status, background_runs_in_process
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
@@ -340,11 +343,13 @@ async def _check_session_access(
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
     store = session_manager.persistence_store
+    store_status = session_store_status(store)
     return HealthResponse(
         status="ok",
         active_sessions=session_manager.active_session_count,
         max_sessions=MAX_SESSIONS,
-        session_store=session_store_status(store),
+        session_store=store_status,
+        background_runs=background_run_status(store_status),
         cloud_run_revision=os.environ.get("K_REVISION"),
     )
 
@@ -642,6 +647,7 @@ async def get_session(
     """Get session information. Only accessible by the session owner."""
     await _check_session_access(session_id, user)
     info = session_manager.get_session_info(session_id)
+    info["runs"] = await session_manager.list_runs(session_id)
     return SessionInfo(**info)
 
 
@@ -873,7 +879,64 @@ async def get_jobs_access_info(
 async def list_sessions(user: dict = Depends(get_current_user)) -> list[SessionInfo]:
     """List sessions belonging to the authenticated user."""
     sessions = await session_manager.list_sessions(user_id=user["user_id"])
+    for session in sessions:
+        session["runs"] = await session_manager.list_runs(session["session_id"])
     return [SessionInfo(**s) for s in sessions]
+
+
+@router.post("/session/{session_id}/runs", response_model=RunSummary)
+async def create_session_run(
+    session_id: str,
+    body: dict[str, Any] | None = None,
+    user: dict = Depends(get_current_user),
+) -> RunSummary:
+    """Create a durable run record without launching provider work."""
+    await _check_session_access(session_id, user)
+    payload = body or {}
+    run = await session_manager.create_run(
+        session_id,
+        provider=str(payload.get("provider") or "none"),
+        request_id=str(payload.get("request_id") or uuid.uuid4()),
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return RunSummary(**run)
+
+
+@router.get("/session/{session_id}/runs", response_model=list[RunSummary])
+async def list_session_runs(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> list[RunSummary]:
+    await _check_session_access(session_id, user)
+    return [RunSummary(**run) for run in await session_manager.list_runs(session_id)]
+
+
+@router.get("/session/{session_id}/runs/{run_id}", response_model=RunSummary)
+async def get_session_run(
+    session_id: str, run_id: str, user: dict = Depends(get_current_user)
+) -> RunSummary:
+    await _check_session_access(session_id, user)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunSummary(**run)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/events",
+    response_model=list[RunEventInfo],
+)
+async def get_session_run_events(
+    session_id: str,
+    run_id: str,
+    since: int = 0,
+    user: dict = Depends(get_current_user),
+) -> list[RunEventInfo]:
+    await _check_session_access(session_id, user)
+    events = await session_manager.load_run_events_after(session_id, run_id, since)
+    if events is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return [RunEventInfo(**event) for event in events]
 
 
 @router.post("/session/{session_id}/sandbox/teardown")
@@ -939,6 +1002,7 @@ async def submit_input(
         body.cloud_provider,
         body.training_goal,
         body.output_policy,
+        request_id=str(payload.get("request_id") or uuid.uuid4()),
     )
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
@@ -1030,6 +1094,7 @@ async def chat_sse(
             agent_session.session.config.model_name,
         )
         if approvals:
+            latest_run = await session_manager.latest_attachable_run(session_id)
             formatted = [
                 {
                     "tool_call_id": a["tool_call_id"],
@@ -1041,10 +1106,19 @@ async def chat_sse(
                 }
                 for a in approvals
             ]
-            success = await session_manager.submit_approval(session_id, formatted)
+            success = await session_manager.submit_approval(
+                session_id,
+                formatted,
+                run_id=latest_run["run_id"] if latest_run else None,
+            )
         elif text is not None:
             success = await session_manager.submit_user_input(
-                session_id, text, cloud_provider, training_goal, output_policy
+                session_id,
+                text,
+                cloud_provider,
+                training_goal,
+                output_policy,
+                request_id=request_id,
             )
         else:
             broadcaster.unsubscribe(sub_id)
@@ -1147,7 +1221,7 @@ def _format_sse(msg: dict[str, Any]) -> str:
 def _event_doc_to_msg(doc: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_type": doc.get("event_type"),
-        "data": doc.get("data") or {},
+        "data": doc.get("data") or doc.get("payload") or {},
         "seq": doc.get("seq"),
     }
 
@@ -1263,6 +1337,36 @@ def _sse_response(
     )
 
 
+@router.get("/session/{session_id}/runs/{run_id}/stream")
+async def stream_session_run(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    since: int = 0,
+    user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """Replay persisted run events, then attach to the live session broadcaster."""
+    agent_session = await _check_session_access(session_id, user, request)
+    replay_events = await session_manager.load_run_events_after(
+        session_id, run_id, since
+    )
+    if replay_events is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    broadcaster = agent_session.broadcaster
+    sub_id, event_queue = broadcaster.subscribe()
+    return _sse_response(
+        broadcaster,
+        event_queue,
+        sub_id,
+        request=request,
+        session_id=session_id,
+        request_id=f"run-reconnect-{uuid.uuid4()}",
+        stream_started_at=time.monotonic(),
+        replay_events=replay_events,
+        after_seq=since,
+    )
+
+
 @router.get("/events/{session_id}")
 async def subscribe_events(
     session_id: str,
@@ -1279,9 +1383,11 @@ async def subscribe_events(
         raise HTTPException(status_code=404, detail="Session not found or inactive")
 
     after_seq = _last_event_seq(request)
-    replay_events = await session_manager._store().load_events_after(
-        session_id, after_seq
-    )
+    replay_events = []
+    if background_runs_in_process():
+        replay_events = await session_manager._store().load_events_after(
+            session_id, after_seq
+        )
     broadcaster = agent_session.broadcaster
     sub_id, event_queue = broadcaster.subscribe()
     return _sse_response(
@@ -1307,6 +1413,23 @@ async def interrupt_session(
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return {"status": "interrupted", "session_id": session_id}
+
+
+@router.post("/session/{session_id}/runs/{run_id}/interrupt")
+async def interrupt_session_run(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Interrupt a running durable run and mark its event log."""
+    agent_session = await _check_session_access(session_id, user)
+    if not await session_manager.get_run(session_id, run_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    agent_session.session.current_run_id = run_id
+    success = await session_manager.interrupt(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "interrupted", "session_id": session_id, "run_id": run_id}
 
 
 @router.get("/session/{session_id}/messages")

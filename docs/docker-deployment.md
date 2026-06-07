@@ -61,6 +61,8 @@ OPENAI_API_KEY=
 GITHUB_TOKEN=
 ML_INTERN_DEFAULT_MODEL_ID=
 ML_INTERN_KPIS_DISABLED=
+BACKGROUND_RUNS_ENABLED=false
+RUN_WORKER_MODE=disabled
 HF_TOKEN=
 HUGGINGFACE_HUB_TOKEN=
 ```
@@ -84,6 +86,8 @@ Session persistence:
 
 ```text
 MONGODB_URI=
+MONGODB_DB=liga_ml
+SESSION_TOKEN_ENCRYPTION_KEY=
 SESSION_STORE_PATH=/tmp/liga-ml-sessions
 ```
 
@@ -91,6 +95,14 @@ Use `MONGODB_URI` for durable hosted-session persistence across restarts. In
 production, `/api/health` and `/api/health/providers` report
 `session_store.durable=false` with a warning when MongoDB is not configured. The
 `SESSION_STORE_PATH` default is an ephemeral local path for Docker runtime files.
+Local/dev should keep `BACKGROUND_RUNS_ENABLED=false` and
+`RUN_WORKER_MODE=disabled` for the old chat flow. Cloud Run production can set
+`BACKGROUND_RUNS_ENABLED=true` with `RUN_WORKER_MODE=in_process` to persist
+`run_events`, support SSE replay/reconnect, and continue background-safe
+monitoring inside the same service when MongoDB is durable. `external_worker` is
+reserved for a future separate worker and is reported as not implemented. Phase 1
+does not persist provider tokens; configure `SESSION_TOKEN_ENCRYPTION_KEY` before
+any later encrypted token handoff is enabled. See `docs/background-runs.md`.
 
 AWS SageMaker AI:
 
@@ -139,6 +151,9 @@ instances `1`, and port `8080`. Grant the Cloud Run service account the required
 Vertex AI, GCS, Artifact Registry, Cloud Logging, and Secret Manager permissions
 documented in `docs/google-cloud-deployment.md`, plus AWS runtime credentials
 documented in `docs/aws-sagemaker-deployment.md`.
+The default `cloudbuild.yaml` deployment enables Phase 1 background runs with
+`BACKGROUND_RUNS_ENABLED=true` and `RUN_WORKER_MODE=in_process`; durable replay
+still requires the `MONGODB_URI` Secret Manager mapping.
 
 After deploy, verify:
 

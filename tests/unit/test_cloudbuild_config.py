@@ -63,9 +63,13 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
         "AWS_DEFAULT_MAX_RUN_SECONDS",
         "AWS_OUTPUT_POLICY",
         "ML_INTERN_KPIS_DISABLED",
+        "BACKGROUND_RUNS_ENABLED",
+        "RUN_WORKER_MODE",
     ]:
         assert f"{name}=" in env_vars
 
+    assert "BACKGROUND_RUNS_ENABLED=true" in env_vars
+    assert "RUN_WORKER_MODE=in_process" in env_vars
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in deploy_args
 
 
@@ -82,6 +86,7 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert substitutions["_AWS_SECRET_ACCESS_KEY_SECRET"] == "aws-secret-access-key"
     assert substitutions["_AWS_SESSION_TOKEN_SECRET"] == ""
     assert "_MONGODB_URI_SECRET" in substitutions
+    assert "_SESSION_TOKEN_ENCRYPTION_KEY_SECRET" in substitutions
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg
@@ -97,6 +102,11 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert "AWS_SESSION_TOKEN=${_AWS_SESSION_TOKEN_SECRET}:latest" in secrets_arg
     assert 'if [ -n "${_MONGODB_URI_SECRET}" ]; then' in secrets_arg
     assert "MONGODB_URI=${_MONGODB_URI_SECRET}:latest" in secrets_arg
+    assert 'if [ -n "${_SESSION_TOKEN_ENCRYPTION_KEY_SECRET}" ]; then' in secrets_arg
+    assert (
+        "SESSION_TOKEN_ENCRYPTION_KEY=${_SESSION_TOKEN_ENCRYPTION_KEY_SECRET}:latest"
+        in secrets_arg
+    )
 
     forbidden = ["hf_", "github_pat_", "ghp_", "sk-"]
     assert all(marker not in rendered for marker in forbidden)

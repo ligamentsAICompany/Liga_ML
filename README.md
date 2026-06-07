@@ -34,6 +34,8 @@ HF_TOKEN=<your-hugging-face-token>
 GITHUB_TOKEN=<github-personal-access-token>
 ML_INTERN_DEFAULT_MODEL_ID=moonshotai/Kimi-K2.6
 ML_INTERN_KPIS_DISABLED=1
+BACKGROUND_RUNS_ENABLED=false
+RUN_WORKER_MODE=disabled
 
 # Optional: durable web sessions for hosted/Cloud Run deployments
 MONGODB_URI=<mongodb-connection-string>
@@ -278,7 +280,15 @@ Cloud Run should use at least 2 GiB memory, 2 CPU, a 3600 second timeout,
 concurrency around 20, port `8080`, Secret Manager for `OPENAI_API_KEY`,
 `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`, plus normal env vars
-for non-secret provider configuration. Do not use
+for non-secret provider configuration. Local development keeps
+`BACKGROUND_RUNS_ENABLED=false` and `RUN_WORKER_MODE=disabled` for the old chat
+flow. Cloud Run production sets `BACKGROUND_RUNS_ENABLED=true` and
+`RUN_WORKER_MODE=in_process` to use the Phase 1 durable session/event replay
+path when MongoDB is configured. `RUN_WORKER_MODE=external_worker` is reserved
+and not implemented yet. Set `SESSION_TOKEN_ENCRYPTION_KEY` before any future
+encrypted token handoff is enabled; Phase 1 does not persist provider tokens in
+the run ledger. See `docs/background-runs.md` for the run APIs and replay model.
+Do not use
 `GOOGLE_APPLICATION_CREDENTIALS` for Cloud Run production; attach an appropriate
 service account instead. Never commit `.env`, credential files, local datasets,
 `.playwright-mcp`, caches, or generated artifacts.

@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from agent.config import load_config
 from agent.core.agent_loop import process_submission
+from agent.core.background_runs import RUN_TERMINAL_STATUSES, background_runs_in_process
 from agent.core.session import Event, OpType, Session
 from agent.core.session_persistence import get_session_store
 from agent.core.tools import ToolRouter
@@ -40,6 +41,14 @@ class Submission:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_or_none(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)
 
 
 class EventBroadcaster:
@@ -392,6 +401,110 @@ class SessionManager:
             "estimated_spend_usd": round(estimated, 4),
             "remaining_usd": remaining,
         }
+
+    @staticmethod
+    def _serialize_run(run: dict[str, Any]) -> dict[str, Any]:
+        provider_metadata = dict(run.get("provider_metadata") or {})
+        return {
+            "run_id": str(run.get("run_id") or run.get("_id") or ""),
+            "session_id": str(run.get("session_id") or ""),
+            "status": str(run.get("status") or "queued"),
+            "provider": str(
+                provider_metadata.get("provider") or run.get("provider") or "none"
+            ),
+            "created_at": _iso_or_none(run.get("created_at")),
+            "updated_at": _iso_or_none(run.get("updated_at")),
+            "started_at": _iso_or_none(run.get("started_at")),
+            "completed_at": _iso_or_none(run.get("completed_at")),
+            "last_event_seq": int(run.get("last_event_seq") or 0),
+            "active_tool": run.get("active_tool"),
+            "active_provider_job_id": run.get("active_provider_job_id"),
+            "approval_id": run.get("approval_id"),
+            "error_summary": run.get("error_summary"),
+            "result_summary": run.get("result_summary"),
+            "provider_metadata": {
+                "provider": str(
+                    provider_metadata.get("provider") or run.get("provider") or "none"
+                ),
+                "status": provider_metadata.get("provider_status")
+                or run.get("provider_status"),
+                "job_id": run.get("active_provider_job_id"),
+                "console_url": provider_metadata.get("provider_console_url")
+                or run.get("provider_console_url"),
+                "logs_url": provider_metadata.get("provider_logs_url")
+                or run.get("provider_logs_url"),
+                "artifact_path": provider_metadata.get("provider_artifact_path")
+                or run.get("provider_artifact_path"),
+                "output_policy": provider_metadata.get("provider_output_policy")
+                or run.get("provider_output_policy"),
+                "last_checked_at": provider_metadata.get("last_checked_at"),
+            },
+        }
+
+    @staticmethod
+    def _serialize_run_event(event: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "run_id": str(event.get("run_id") or ""),
+            "session_id": str(event.get("session_id") or ""),
+            "seq": int(event.get("seq") or 0),
+            "timestamp": _iso_or_none(
+                event.get("timestamp") or event.get("created_at")
+            ),
+            "event_type": str(event.get("event_type") or ""),
+            "payload": event.get("payload") or event.get("data") or {},
+            "safe_summary": event.get("safe_summary"),
+        }
+
+    async def create_run(
+        self,
+        session_id: str,
+        *,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            return None
+        run = await self._store().create_run(
+            session_id=session_id,
+            provider=provider,
+            request_id=request_id,
+            status=status,
+        )
+        run_id = str(run.get("run_id") or run.get("_id"))
+        agent_session.session.current_run_id = run_id
+        return self._serialize_run(run)
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        return [
+            self._serialize_run(run)
+            for run in await self._store().list_runs(session_id)
+        ]
+
+    async def get_run(self, session_id: str, run_id: str) -> dict[str, Any] | None:
+        run = await self._store().get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        return self._serialize_run(run)
+
+    async def load_run_events_after(
+        self, session_id: str, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]] | None:
+        run = await self._store().get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        return [
+            self._serialize_run_event(event)
+            for event in await self._store().load_run_events_after(run_id, after_seq)
+        ]
+
+    async def latest_attachable_run(self, session_id: str) -> dict[str, Any] | None:
+        for run in await self.list_runs(session_id):
+            if run["status"] not in RUN_TERMINAL_STATUSES:
+                return run
+        runs = await self.list_runs(session_id)
+        return runs[0] if runs else None
 
     async def _start_agent_session(
         self,
@@ -1055,6 +1168,18 @@ class SessionManager:
                         )
                         agent_session.is_processing = True
                         try:
+                            if getattr(session, "current_run_id", None):
+                                await self._store().append_run_event(
+                                    run_id=session.current_run_id,
+                                    session_id=session_id,
+                                    event_type="run_started",
+                                    payload={
+                                        "submission_id": submission.id,
+                                        "provider": getattr(
+                                            session, "cloud_provider", "none"
+                                        ),
+                                    },
+                                )
                             should_continue = await process_submission(
                                 session, submission
                             )
@@ -1134,6 +1259,9 @@ class SessionManager:
         cloud_provider: str | None = None,
         training_goal: str | None = None,
         output_policy: str | None = None,
+        *,
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> bool:
         """Submit user input to a session."""
         agent_session = self.sessions.get(session_id)
@@ -1155,21 +1283,47 @@ class SessionManager:
         ):
             agent_session.output_policy = output_policy
             agent_session.session.output_policy = output_policy
-        operation = Operation(
-            op_type=OpType.USER_INPUT,
-            data={
-                "text": text,
-                "cloud_provider": cloud_provider,
-                "training_goal": training_goal,
-                "output_policy": output_policy,
-            },
-        )
+        if agent_session and background_runs_in_process():
+            if run_id:
+                agent_session.session.current_run_id = run_id
+            else:
+                run = await self.create_run(
+                    session_id,
+                    provider=cloud_provider
+                    or getattr(agent_session.session, "cloud_provider", "none"),
+                    request_id=request_id,
+                )
+                if run:
+                    run_id = run["run_id"]
+        data = {
+            "text": text,
+            "cloud_provider": cloud_provider,
+            "training_goal": training_goal,
+            "output_policy": output_policy,
+        }
+        if run_id:
+            data["run_id"] = run_id
+        operation = Operation(op_type=OpType.USER_INPUT, data=data)
         return await self.submit(session_id, operation)
 
     async def submit_approval(
-        self, session_id: str, approvals: list[dict[str, Any]]
+        self,
+        session_id: str,
+        approvals: list[dict[str, Any]],
+        *,
+        run_id: str | None = None,
     ) -> bool:
         """Submit tool approvals to a session."""
+        agent_session = self.sessions.get(session_id)
+        if agent_session and run_id:
+            agent_session.session.current_run_id = run_id
+        if agent_session and getattr(agent_session.session, "current_run_id", None):
+            await self._store().append_run_event(
+                run_id=agent_session.session.current_run_id,
+                session_id=session_id,
+                event_type="approval_resolved",
+                payload={"approvals": approvals},
+            )
         operation = Operation(
             op_type=OpType.EXEC_APPROVAL, data={"approvals": approvals}
         )
@@ -1181,6 +1335,13 @@ class SessionManager:
         if not agent_session or not agent_session.is_active:
             return False
         agent_session.session.cancel()
+        if getattr(agent_session.session, "current_run_id", None):
+            await self._store().append_run_event(
+                run_id=agent_session.session.current_run_id,
+                session_id=session_id,
+                event_type="interrupted",
+                payload={"reason": "user_interrupt"},
+            )
         return True
 
     async def undo(self, session_id: str) -> bool:

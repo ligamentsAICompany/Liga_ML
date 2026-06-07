@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from agent.core.background_runs import (
+    provider_metadata_from_event,
+    run_status_from_event,
+    safe_event_summary,
+)
 from bson import BSON
 from pymongo import AsyncMongoClient, DeleteMany, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, InvalidDocument, PyMongoError
@@ -59,6 +65,10 @@ class NoopSessionStore:
 
     enabled = False
 
+    def __init__(self) -> None:
+        self._runs: dict[str, dict[str, Any]] = {}
+        self._run_events: dict[str, list[dict[str, Any]]] = {}
+
     async def init(self) -> None:
         return None
 
@@ -83,7 +93,20 @@ class NoopSessionStore:
     async def update_session_fields(self, *_: Any, **__: Any) -> None:
         return None
 
-    async def append_event(self, *_: Any, **__: Any) -> int | None:
+    async def append_event(
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict[str, Any] | None,
+        run_id: str | None = None,
+    ) -> int | None:
+        if run_id:
+            return await self.append_run_event(
+                run_id=run_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=data or {},
+            )
         return None
 
     async def load_events_after(self, *_: Any, **__: Any) -> list[dict[str, Any]]:
@@ -104,6 +127,148 @@ class NoopSessionStore:
     async def mark_pro_seen(self, *_: Any, **__: Any) -> dict[str, Any] | None:
         return None
 
+    async def create_run(
+        self,
+        *,
+        session_id: str,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        now = _now()
+        run_id = str(uuid.uuid4())
+        run = {
+            "_id": run_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": status,
+            "provider": provider or "none",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "last_event_seq": 0,
+            "active_tool": None,
+            "active_provider_job_id": None,
+            "approval_id": None,
+            "error_summary": None,
+            "result_summary": None,
+            "request_id": request_id,
+            "provider_metadata": {},
+        }
+        self._runs[run_id] = run
+        self._run_events[run_id] = []
+        await self.append_run_event(
+            run_id=run_id,
+            session_id=session_id,
+            event_type="run_created",
+            payload={"request_id": request_id, "provider": provider},
+        )
+        return dict(run)
+
+    async def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
+        run = self._runs.get(run_id)
+        if not run:
+            return None
+        fields = {k: v for k, v in fields.items() if v is not None}
+        if fields:
+            run.update(fields)
+        run["updated_at"] = _now()
+        return dict(run)
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        run = self._runs.get(run_id)
+        return dict(run) if run else None
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        runs = [
+            dict(run)
+            for run in self._runs.values()
+            if run.get("session_id") == session_id
+        ]
+        return sorted(
+            runs, key=lambda item: item.get("created_at") or _now(), reverse=True
+        )
+
+    async def append_run_event(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int | None:
+        if run_id not in self._runs:
+            return None
+        events = self._run_events.setdefault(run_id, [])
+        seq = len(events) + 1
+        doc = {
+            "_id": _doc_id(run_id, seq),
+            "run_id": run_id,
+            "session_id": session_id,
+            "seq": seq,
+            "timestamp": _now(),
+            "event_type": event_type,
+            "payload": payload or {},
+            "safe_summary": safe_event_summary(event_type, payload),
+        }
+        events.append(doc)
+        await self._apply_run_event_update(run_id, event_type, payload or {}, seq)
+        return seq
+
+    async def load_run_events_after(
+        self, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(event)
+            for event in self._run_events.get(run_id, [])
+            if int(event.get("seq") or 0) > int(after_seq or 0)
+        ]
+
+    async def _apply_run_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any], seq: int
+    ) -> None:
+        run = self._runs.get(run_id)
+        if not run:
+            return
+        now = _now()
+        update: dict[str, Any] = {
+            "last_event_seq": seq,
+            "updated_at": now,
+        }
+        if status := run_status_from_event(event_type, payload):
+            update["status"] = status
+            if status == "running" and run.get("started_at") is None:
+                update["started_at"] = now
+            if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+                update["completed_at"] = now
+        provider_fields = provider_metadata_from_event(event_type, payload)
+        provider_metadata = dict(run.get("provider_metadata") or {})
+        if provider_fields:
+            if provider := provider_fields.pop("provider", None):
+                update["provider"] = provider
+                provider_metadata["provider"] = provider
+            for key, value in provider_fields.items():
+                update[key] = value
+                provider_metadata[key] = value
+            provider_metadata["last_checked_at"] = now.isoformat()
+            update["provider_metadata"] = provider_metadata
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            first = tools[0] if isinstance(tools, list) and tools else {}
+            if isinstance(first, dict):
+                update["approval_id"] = first.get("approval_id") or first.get(
+                    "tool_call_id"
+                )
+                update["active_tool"] = first.get("tool")
+        if event_type in {"error", "stream_error"}:
+            update["error_summary"] = str(payload.get("error") or "")[:500]
+        if event_type in {"assistant_message", "turn_complete"}:
+            summary = safe_event_summary(event_type, payload)
+            if summary:
+                update["result_summary"] = summary
+        run.update(update)
+
 
 class MongoSessionStore(NoopSessionStore):
     """MongoDB-backed session store."""
@@ -111,6 +276,7 @@ class MongoSessionStore(NoopSessionStore):
     enabled = True
 
     def __init__(self, uri: str, db_name: str) -> None:
+        super().__init__()
         self.uri = uri
         self.db_name = db_name
         self.enabled = False
@@ -158,6 +324,9 @@ class MongoSessionStore(NoopSessionStore):
             [("session_id", 1), ("seq", 1)], unique=True
         )
         await self.db.session_trace_messages.create_index([("created_at", -1)])
+        await self.db.runs.create_index([("session_id", 1), ("updated_at", -1)])
+        await self.db.runs.create_index([("status", 1), ("updated_at", -1)])
+        await self.db.run_events.create_index([("run_id", 1), ("seq", 1)], unique=True)
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
 
     def _ready(self) -> bool:
@@ -358,7 +527,11 @@ class MongoSessionStore(NoopSessionStore):
         return int(doc["seq"])
 
     async def append_event(
-        self, session_id: str, event_type: str, data: dict[str, Any] | None
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict[str, Any] | None,
+        run_id: str | None = None,
     ) -> int | None:
         if not self._ready():
             return None
@@ -374,6 +547,13 @@ class MongoSessionStore(NoopSessionStore):
                     "created_at": _now(),
                 }
             )
+            if run_id:
+                return await self.append_run_event(
+                    run_id=run_id,
+                    session_id=session_id,
+                    event_type=event_type,
+                    payload=data or {},
+                )
             return seq
         except PyMongoError as e:
             logger.debug("Failed to append event for %s: %s", session_id, e)
@@ -386,6 +566,161 @@ class MongoSessionStore(NoopSessionStore):
             return []
         cursor = self.db.session_events.find(
             {"session_id": session_id, "seq": {"$gt": int(after_seq or 0)}}
+        ).sort("seq", 1)
+        return [row async for row in cursor]
+
+    async def create_run(
+        self,
+        *,
+        session_id: str,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().create_run(
+                session_id=session_id,
+                provider=provider,
+                request_id=request_id,
+                status=status,
+            )
+        now = _now()
+        run_id = str(uuid.uuid4())
+        run = {
+            "_id": run_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": status,
+            "provider": provider or "none",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "last_event_seq": 0,
+            "active_tool": None,
+            "active_provider_job_id": None,
+            "approval_id": None,
+            "error_summary": None,
+            "result_summary": None,
+            "request_id": request_id,
+            "provider_metadata": {},
+            "schema_version": SCHEMA_VERSION,
+        }
+        await self.db.runs.insert_one(run)
+        await self.append_run_event(
+            run_id=run_id,
+            session_id=session_id,
+            event_type="run_created",
+            payload={"request_id": request_id, "provider": provider},
+        )
+        return run
+
+    async def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().update_run(run_id, **fields)
+        fields = {k: v for k, v in fields.items() if v is not None}
+        fields["updated_at"] = _now()
+        doc = await self.db.runs.find_one_and_update(
+            {"_id": run_id},
+            {"$set": fields},
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_run(run_id)
+        return await self.db.runs.find_one({"_id": run_id})
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_runs(session_id)
+        cursor = self.db.runs.find({"session_id": session_id}).sort("updated_at", -1)
+        return [row async for row in cursor]
+
+    async def append_run_event(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int | None:
+        if not self._ready():
+            return await super().append_run_event(
+                run_id=run_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=payload,
+            )
+        try:
+            seq = await self._next_seq(f"run_event:{run_id}")
+            doc = {
+                "_id": _doc_id(run_id, seq),
+                "run_id": run_id,
+                "session_id": session_id,
+                "seq": seq,
+                "timestamp": _now(),
+                "event_type": event_type,
+                "payload": payload or {},
+                "safe_summary": safe_event_summary(event_type, payload),
+                "schema_version": SCHEMA_VERSION,
+            }
+            await self.db.run_events.insert_one(doc)
+            await self._apply_persisted_run_event_update(
+                run_id, event_type, payload or {}, seq
+            )
+            return seq
+        except PyMongoError as e:
+            logger.debug("Failed to append run event for %s: %s", run_id, e)
+            return None
+
+    async def _apply_persisted_run_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any], seq: int
+    ) -> None:
+        now = _now()
+        update: dict[str, Any] = {"last_event_seq": seq, "updated_at": now}
+        run = await self.get_run(run_id)
+        if status := run_status_from_event(event_type, payload):
+            update["status"] = status
+            if status == "running" and not (run or {}).get("started_at"):
+                update["started_at"] = now
+            if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+                update["completed_at"] = now
+        provider_fields = provider_metadata_from_event(event_type, payload)
+        provider_metadata = dict((run or {}).get("provider_metadata") or {})
+        if provider_fields:
+            if provider := provider_fields.pop("provider", None):
+                update["provider"] = provider
+                provider_metadata["provider"] = provider
+            for key, value in provider_fields.items():
+                update[key] = value
+                provider_metadata[key] = value
+            provider_metadata["last_checked_at"] = now.isoformat()
+            update["provider_metadata"] = provider_metadata
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            first = tools[0] if isinstance(tools, list) and tools else {}
+            if isinstance(first, dict):
+                update["approval_id"] = first.get("approval_id") or first.get(
+                    "tool_call_id"
+                )
+                update["active_tool"] = first.get("tool")
+        if event_type in {"error", "stream_error"}:
+            update["error_summary"] = str(payload.get("error") or "")[:500]
+        if event_type in {"assistant_message", "turn_complete"}:
+            summary = safe_event_summary(event_type, payload)
+            if summary:
+                update["result_summary"] = summary
+        await self.update_run(run_id, **update)
+
+    async def load_run_events_after(
+        self, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().load_run_events_after(run_id, after_seq)
+        cursor = self.db.run_events.find(
+            {"run_id": run_id, "seq": {"$gt": int(after_seq or 0)}}
         ).sort("seq", 1)
         return [row async for row in cursor]
 
@@ -516,7 +851,7 @@ def get_session_store() -> NoopSessionStore | MongoSessionStore:
     global _store
     if _store is None:
         uri = os.environ.get("MONGODB_URI")
-        db_name = os.environ.get("MONGODB_DB", "ml-intern")
+        db_name = os.environ.get("MONGODB_DB", "liga_ml")
         _store = MongoSessionStore(uri, db_name) if uri else NoopSessionStore()
     return _store
 

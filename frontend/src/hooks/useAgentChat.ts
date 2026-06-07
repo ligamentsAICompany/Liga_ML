@@ -777,8 +777,17 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       try {
         const lastEventKey = `hf-agent-last-event:${sessionId}`;
         const lastSeq = localStorage.getItem(lastEventKey);
+        const runsRes = await apiFetch(`/api/session/${sessionId}/runs`, { signal });
+        const runs = runsRes.ok ? await runsRes.json().catch(() => []) : [];
+        const run = Array.isArray(runs)
+          ? runs.find((item) => item?.run_id && !['succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(item.status))) ||
+            runs.find((item) => item?.run_id)
+          : null;
         const qs = lastSeq ? `?after=${encodeURIComponent(lastSeq)}` : '';
-        const res = await apiFetch(`/api/events/${sessionId}${qs}`, {
+        const runQs = lastSeq ? `?since=${encodeURIComponent(lastSeq)}` : '';
+        const res = await apiFetch(run?.run_id
+          ? `/api/session/${sessionId}/runs/${run.run_id}/stream${runQs}`
+          : `/api/events/${sessionId}${qs}`, {
           headers: { 'Accept': 'text/event-stream' },
           signal,
         });

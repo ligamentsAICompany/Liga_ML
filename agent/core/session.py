@@ -15,6 +15,7 @@ from litellm import Message
 
 from agent.config import Config
 from agent.context_manager.manager import ContextManager
+from agent.core.background_runs import background_runs_in_process
 from agent.messaging.gateway import NotificationGateway
 from agent.messaging.models import NotificationRequest
 
@@ -127,6 +128,7 @@ class Session:
         self.current_plan: list[dict[str, str]] = []
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
+        self.current_run_id: str | None = None
         self.sandbox = None
         self.sandbox_hardware: Optional[str] = None
         self.sandbox_preload_task: Optional[asyncio.Task] = None
@@ -173,10 +175,13 @@ class Session:
                 "data": event.data,
             }
         )
-        if self.persistence_store is not None:
+        if self.persistence_store is not None and background_runs_in_process():
             try:
                 event.seq = await self.persistence_store.append_event(
-                    self.session_id, event.event_type, event.data
+                    self.session_id,
+                    event.event_type,
+                    event.data,
+                    run_id=self.current_run_id,
                 )
             except Exception as e:
                 logger.debug("Event persistence failed for %s: %s", self.session_id, e)

@@ -150,6 +150,7 @@ class SessionInfo(BaseModel):
         default_factory=SessionAutoApprovalInfo
     )
     uploaded_datasets: list[UploadedDatasetInfo] = Field(default_factory=list)
+    runs: list["RunSummary"] = Field(default_factory=list)
 
 
 class SessionNotificationsRequest(BaseModel):
@@ -198,6 +199,57 @@ class SessionStoreHealth(BaseModel):
     warning: str | None = None
 
 
+class BackgroundRunsHealth(BaseModel):
+    """Non-secret background run feature-flag status."""
+
+    enabled: bool
+    worker_mode: Literal["disabled", "in_process", "external_worker"]
+    implemented: bool
+    durable: bool
+    store: str
+    token_handoff_configured: bool = False
+    warning: str | None = None
+
+
+class RunProviderMetadata(BaseModel):
+    provider: str = "none"
+    status: str | None = None
+    job_id: str | None = None
+    console_url: str | None = None
+    logs_url: str | None = None
+    artifact_path: str | None = None
+    output_policy: str | None = None
+    last_checked_at: str | None = None
+
+
+class RunSummary(BaseModel):
+    run_id: str
+    session_id: str
+    status: str
+    provider: str = "none"
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    last_event_seq: int = 0
+    active_tool: str | None = None
+    active_provider_job_id: str | None = None
+    approval_id: str | None = None
+    error_summary: str | None = None
+    result_summary: str | None = None
+    provider_metadata: RunProviderMetadata = Field(default_factory=RunProviderMetadata)
+
+
+class RunEventInfo(BaseModel):
+    run_id: str
+    session_id: str
+    seq: int
+    timestamp: str | None = None
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    safe_summary: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 
@@ -205,6 +257,7 @@ class HealthResponse(BaseModel):
     active_sessions: int = 0
     max_sessions: int = 0
     session_store: SessionStoreHealth | None = None
+    background_runs: BackgroundRunsHealth | None = None
     cloud_run_revision: str | None = None
 
 
