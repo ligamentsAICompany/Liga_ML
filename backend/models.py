@@ -7,6 +7,21 @@ from pydantic import BaseModel, Field
 
 CloudProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker"]
 UsageProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker", "llm", "unknown"]
+AuditCategory = Literal[
+    "session",
+    "dataset",
+    "chat",
+    "planner",
+    "approval",
+    "tool",
+    "provider_job",
+    "usage",
+    "result",
+    "error",
+    "system",
+    "security",
+]
+AuditSeverity = Literal["info", "warning", "error", "critical"]
 CostSource = Literal[
     "static_estimate",
     "provider_estimate",
@@ -229,6 +244,15 @@ class UsageStoreHealth(BaseModel):
     warning: str | None = None
 
 
+class AuditStoreHealth(BaseModel):
+    """Non-secret audit timeline persistence status."""
+
+    type: str
+    durable: bool
+    enabled: bool = True
+    warning: str | None = None
+
+
 class UsageEntry(BaseModel):
     usage_id: str
     session_id: str
@@ -278,6 +302,60 @@ class UsageSummary(BaseModel):
     usage_store: UsageStoreHealth | None = None
 
 
+class AuditEvent(BaseModel):
+    audit_id: str
+    session_id: str
+    run_id: str | None = None
+    usage_id: str | None = None
+    provider: str = "unknown"
+    event_type: str
+    category: AuditCategory | str
+    severity: AuditSeverity | str = "info"
+    status: str = "unknown"
+    title: str
+    message: str = ""
+    timestamp: str | None = None
+    actor: str = "system"
+    entity_type: str | None = None
+    entity_id: str | None = None
+    tool_name: str | None = None
+    operation: str | None = None
+    approval_id: str | None = None
+    job_id: str | None = None
+    job_url: str | None = None
+    artifact_url: str | None = None
+    dataset_name: str | None = None
+    model_name: str | None = None
+    output_policy: str | None = None
+    estimated_cost_usd: float | None = None
+    known_cost_usd: float | None = None
+    error_code: str | None = None
+    error_summary: str | None = None
+    safe_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditTimelineResponse(BaseModel):
+    enabled: bool = True
+    audit_store: AuditStoreHealth | None = None
+    events: list[AuditEvent] = Field(default_factory=list)
+
+
+class AuditSummary(BaseModel):
+    enabled: bool = True
+    total_events: int = 0
+    counts_by_category: dict[str, int] = Field(default_factory=dict)
+    counts_by_severity: dict[str, int] = Field(default_factory=dict)
+    counts_by_provider: dict[str, int] = Field(default_factory=dict)
+    latest_warnings_errors: list[AuditEvent] = Field(default_factory=list)
+    provider_job_timeline: list[AuditEvent] = Field(default_factory=list)
+    approval_timeline: list[AuditEvent] = Field(default_factory=list)
+    dataset_timeline: list[AuditEvent] = Field(default_factory=list)
+    usage_cost_timeline: list[AuditEvent] = Field(default_factory=list)
+    timeline_by_session: dict[str, list[AuditEvent]] = Field(default_factory=dict)
+    timeline_by_run: dict[str, list[AuditEvent]] = Field(default_factory=dict)
+    audit_store: AuditStoreHealth | None = None
+
+
 class RunProviderMetadata(BaseModel):
     provider: str = "none"
     status: str | None = None
@@ -310,6 +388,10 @@ class RunSummary(BaseModel):
     usage_status: str = "unknown"
     budget_warning: str | None = None
     quota_warning: str | None = None
+    audit_event_count: int = 0
+    audit_warning_count: int = 0
+    audit_error_count: int = 0
+    latest_audit_event: AuditEvent | None = None
 
 
 class RunEventInfo(BaseModel):
@@ -331,6 +413,7 @@ class HealthResponse(BaseModel):
     session_store: SessionStoreHealth | None = None
     background_runs: BackgroundRunsHealth | None = None
     usage_store: UsageStoreHealth | None = None
+    audit_store: AuditStoreHealth | None = None
     cloud_run_revision: str | None = None
 
 

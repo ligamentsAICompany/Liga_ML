@@ -66,6 +66,8 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
         "BACKGROUND_RUNS_ENABLED",
         "RUN_WORKER_MODE",
         "USAGE_DASHBOARD_ENABLED",
+        "AUDIT_TIMELINE_ENABLED",
+        "AUDIT_EVENT_RETENTION_DAYS",
         "DEFAULT_DAILY_BUDGET_USD",
         "DEFAULT_MONTHLY_BUDGET_USD",
         "HF_DAILY_BUDGET_USD",
@@ -77,6 +79,8 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
     assert "BACKGROUND_RUNS_ENABLED=true" in env_vars
     assert "RUN_WORKER_MODE=in_process" in env_vars
     assert "USAGE_DASHBOARD_ENABLED=true" in env_vars
+    assert "AUDIT_TIMELINE_ENABLED=${_AUDIT_TIMELINE_ENABLED}" in env_vars
+    assert "AUDIT_EVENT_RETENTION_DAYS=${_AUDIT_EVENT_RETENTION_DAYS}" in env_vars
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in deploy_args
 
 
@@ -99,6 +103,8 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert "_HF_DAILY_BUDGET_USD" in substitutions
     assert "_GCLOUD_DAILY_BUDGET_USD" in substitutions
     assert "_AWS_DAILY_BUDGET_USD" in substitutions
+    assert substitutions["_AUDIT_TIMELINE_ENABLED"] == "true"
+    assert substitutions["_AUDIT_EVENT_RETENTION_DAYS"] == "30"
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg

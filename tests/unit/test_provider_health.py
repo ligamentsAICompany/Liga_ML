@@ -89,7 +89,13 @@ async def test_provider_health_returns_hf_gcp_and_aws(monkeypatch):
 
     response = await agent.provider_health()
 
-    assert set(response) == {"hf_jobs", "gcp_vertex", "aws_sagemaker", "session_store"}
+    assert set(response) == {
+        "hf_jobs",
+        "gcp_vertex",
+        "aws_sagemaker",
+        "session_store",
+        "audit_store",
+    }
     assert response["hf_jobs"]["configured"] is True
     assert response["hf_jobs"]["hf_token_configured"] is True
     assert response["gcp_vertex"]["configured"] is False
@@ -99,4 +105,5 @@ async def test_provider_health_returns_hf_gcp_and_aws(monkeypatch):
     assert response["aws_sagemaker"]["region"] == "us-east-1"
     assert response["session_store"]["type"] in {"mongodb", "noop"}
     assert isinstance(response["session_store"]["durable"], bool)
+    assert response["audit_store"]["enabled"] is True
     assert "hf-secret" not in str(response)

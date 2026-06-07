@@ -4,6 +4,7 @@
  * Message and tool-call types are now provided by the Vercel AI SDK
  * (UIMessage, UIMessagePart, etc.). Only non-SDK types remain here.
  */
+import type { AuditEvent } from './audit.js';
 
 /** Custom metadata attached to every UIMessage via the `metadata` field. */
 export interface MessageMeta {
@@ -67,6 +68,10 @@ export interface BackgroundRunSummary {
   error_summary?: string | null;
   result_summary?: string | null;
   provider_metadata?: BackgroundRunProviderMetadata;
+  audit_event_count?: number;
+  audit_warning_count?: number;
+  audit_error_count?: number;
+  latest_audit_event?: AuditEvent | null;
 }
 
 export interface UnavailableModelInfo {

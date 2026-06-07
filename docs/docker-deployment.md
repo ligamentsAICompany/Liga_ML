@@ -64,6 +64,8 @@ ML_INTERN_KPIS_DISABLED=
 BACKGROUND_RUNS_ENABLED=false
 RUN_WORKER_MODE=disabled
 USAGE_DASHBOARD_ENABLED=true
+AUDIT_TIMELINE_ENABLED=true
+AUDIT_EVENT_RETENTION_DAYS=30
 DEFAULT_DAILY_BUDGET_USD=
 DEFAULT_MONTHLY_BUDGET_USD=
 HF_DAILY_BUDGET_USD=
@@ -115,6 +117,13 @@ optional budget env vars above. These are not secrets. Missing budgets display
 `No budget configured`; estimates never require AWS Cost Explorer, GCP Cloud
 Billing, or Hugging Face billing APIs. See `docs/usage-dashboard.md`.
 
+The internal Audit Timeline is controlled by `AUDIT_TIMELINE_ENABLED` and
+`AUDIT_EVENT_RETENTION_DAYS`. It stores sanitized session, approval, provider
+job, usage, dataset, result, and error history in MongoDB when durable
+persistence is configured; otherwise it uses in-memory local fallback. It does
+not configure Sentry, Datadog, OpenTelemetry exporters, or billing APIs. See
+`docs/audit-timeline.md`.
+
 AWS SageMaker AI:
 
 ```text
@@ -164,7 +173,8 @@ documented in `docs/google-cloud-deployment.md`, plus AWS runtime credentials
 documented in `docs/aws-sagemaker-deployment.md`.
 The default `cloudbuild.yaml` deployment enables Phase 1 background runs with
 `BACKGROUND_RUNS_ENABLED=true` and `RUN_WORKER_MODE=in_process`; durable replay
-still requires the `MONGODB_URI` Secret Manager mapping.
+still requires the `MONGODB_URI` Secret Manager mapping. It also enables the
+Usage dashboard and Audit Timeline with read-only internal stores.
 
 After deploy, verify:
 
@@ -176,7 +186,8 @@ curl "$SERVICE_URL/"
 
 Confirm the UI exposes Hugging Face Jobs, Google Cloud Vertex AI, AWS SageMaker
 AI, uploaded data controls, goal/storage controls, provider panels, and the
-Usage/Billing dashboard without submitting or approving any paid training job.
+Usage/Billing dashboard plus Audit Timeline without submitting or approving any
+paid training job.
 
 ## Troubleshooting
 

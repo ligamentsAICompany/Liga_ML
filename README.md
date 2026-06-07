@@ -37,6 +37,8 @@ ML_INTERN_KPIS_DISABLED=1
 BACKGROUND_RUNS_ENABLED=false
 RUN_WORKER_MODE=disabled
 USAGE_DASHBOARD_ENABLED=true
+AUDIT_TIMELINE_ENABLED=true
+AUDIT_EVENT_RETENTION_DAYS=30
 DEFAULT_DAILY_BUDGET_USD=
 DEFAULT_MONTHLY_BUDGET_USD=
 HF_DAILY_BUDGET_USD=
@@ -71,6 +73,11 @@ The hosted UI includes a Usage/Billing dashboard for HF Jobs, Vertex AI,
 SageMaker AI, and agent model usage. It uses approval estimates, conservative
 provider pricing metadata, and run events; it does not require live billing APIs
 or add payment subscriptions. See [`docs/usage-dashboard.md`](docs/usage-dashboard.md).
+
+The hosted UI also includes an internal Audit Timeline for session, dataset,
+approval, provider job, result, usage, and error history. It uses the same
+durable run/usage records, redacts secret-like metadata, and does not export to
+external observability vendors. See [`docs/audit-timeline.md`](docs/audit-timeline.md).
 
 ### Usage
 

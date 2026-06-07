@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from agent.config import load_config
 from agent.core.agent_loop import process_submission
+from agent.core.audit import build_audit_event
 from agent.core.background_runs import RUN_TERMINAL_STATUSES, background_runs_in_process
 from agent.core.session import Event, OpType, Session
 from agent.core.session_persistence import get_session_store
@@ -444,6 +445,10 @@ class SessionManager:
             "usage_status": run.get("usage_status") or "unknown",
             "budget_warning": run.get("budget_warning"),
             "quota_warning": run.get("quota_warning"),
+            "audit_event_count": int(run.get("audit_event_count") or 0),
+            "audit_warning_count": int(run.get("audit_warning_count") or 0),
+            "audit_error_count": int(run.get("audit_error_count") or 0),
+            "latest_audit_event": run.get("latest_audit_event"),
         }
 
     @staticmethod
@@ -486,10 +491,29 @@ class SessionManager:
         )
         return run
 
+    @staticmethod
+    def _audit_totals_for_run(
+        run: dict[str, Any], events: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        run = dict(run)
+        run["audit_event_count"] = len(events)
+        run["audit_warning_count"] = sum(
+            1 for event in events if event.get("severity") == "warning"
+        )
+        run["audit_error_count"] = sum(
+            1 for event in events if event.get("severity") in {"error", "critical"}
+        )
+        latest = events[-1] if events else None
+        run["latest_audit_event"] = latest
+        return run
+
     async def _serialize_run_with_usage(self, run: dict[str, Any]) -> dict[str, Any]:
         run_id = str(run.get("run_id") or run.get("_id") or "")
         entries = await self._store().list_usage_entries(run_id=run_id, limit=50)
-        return self._serialize_run(self._usage_totals_for_run(run, entries))
+        audit_events = await self._store().list_audit_events(run_id=run_id, limit=500)
+        enriched = self._usage_totals_for_run(run, entries)
+        enriched = self._audit_totals_for_run(enriched, audit_events)
+        return self._serialize_run(enriched)
 
     @staticmethod
     def _serialize_run_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -543,6 +567,15 @@ class SessionManager:
 
     async def usage_summary(self, **filters: Any) -> dict[str, Any]:
         return await self._store().usage_summary(**filters)
+
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        return await self._store().record_audit_event(event)
+
+    async def list_audit_events(self, **filters: Any) -> list[dict[str, Any]]:
+        return await self._store().list_audit_events(**filters)
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        return await self._store().audit_summary(**filters)
 
     async def load_run_events_after(
         self, session_id: str, run_id: str, after_seq: int = 0
@@ -951,6 +984,23 @@ class SessionManager:
         if preload_sandbox:
             self._start_cpu_sandbox_preload(agent_session)
         logger.info("Restored session %s for user %s", session_id, owner or user_id)
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_restored",
+                category="session",
+                status="created",
+                actor="system",
+                title="Session restored",
+                message="Session state was restored from durable storage.",
+                provider=cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+                model_name=str(model),
+                output_policy=output_policy,
+                safe_metadata={"training_goal": training_goal},
+            )
+        )
         return agent_session
 
     async def create_session(
@@ -1045,6 +1095,23 @@ class SessionManager:
         if is_pro is not None and user_id and user_id != "dev":
             await self._track_pro_status(agent_session, is_pro=is_pro)
 
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_created",
+                category="session",
+                status="created",
+                actor="user",
+                title="Session created",
+                message="A new chat session was created.",
+                provider=cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+                model_name=session.config.model_name,
+                output_policy=output_policy,
+                safe_metadata={"training_goal": training_goal},
+            )
+        )
         logger.info(f"Created session {session_id} for user {user_id}")
         return session_id
 
@@ -1359,6 +1426,32 @@ class SessionManager:
         }
         if run_id:
             data["run_id"] = run_id
+        if agent_session:
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type="chat_prompt_submitted",
+                    category="chat",
+                    status="started",
+                    actor="user",
+                    title="Prompt submitted",
+                    message="User submitted a prompt for agent processing.",
+                    provider=getattr(
+                        agent_session.session, "cloud_provider", "unknown"
+                    ),
+                    entity_type="prompt",
+                    entity_id=request_id or run_id,
+                    output_policy=getattr(agent_session.session, "output_policy", None),
+                    safe_metadata={
+                        "request_id": request_id,
+                        "text_length": len(text or ""),
+                        "training_goal": getattr(
+                            agent_session.session, "training_goal", None
+                        ),
+                    },
+                )
+            )
         operation = Operation(op_type=OpType.USER_INPUT, data=data)
         return await self.submit(session_id, operation)
 
@@ -1447,9 +1540,38 @@ class SessionManager:
 
         if not agent_session:
             await self._store().soft_delete_session(session_id)
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    event_type="session_deleted",
+                    category="session",
+                    severity="warning",
+                    status="completed",
+                    actor="user",
+                    title="Session deleted",
+                    message="The session was deleted.",
+                    entity_type="session",
+                    entity_id=session_id,
+                )
+            )
             return True
 
         await self._store().soft_delete_session(session_id)
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_deleted",
+                category="session",
+                severity="warning",
+                status="completed",
+                actor="user",
+                title="Session deleted",
+                message="The session was deleted.",
+                provider=agent_session.cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+            )
+        )
 
         # Clean up sandbox Space before cancelling the task
         await self._cleanup_sandbox(agent_session.session)
@@ -1487,8 +1609,25 @@ class SessionManager:
         agent_session = self.sessions.get(session_id)
         if not agent_session or not agent_session.is_active:
             return False
+        previous_model = agent_session.session.config.model_name
         agent_session.session.update_model(model_id)
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="model_changed",
+                category="session",
+                status="completed",
+                actor="user",
+                title="Model changed",
+                message=f"Model changed from {previous_model} to {model_id}.",
+                provider=agent_session.cloud_provider,
+                entity_type="model",
+                entity_id=model_id,
+                model_name=model_id,
+                safe_metadata={"previous_model": previous_model},
+            )
+        )
         return True
 
     async def update_session_cloud_provider(
@@ -1501,6 +1640,11 @@ class SessionManager:
         agent_session = self.sessions.get(session_id)
         if not agent_session or not agent_session.is_active:
             return False
+        previous = {
+            "cloud_provider": agent_session.cloud_provider,
+            "training_goal": agent_session.training_goal,
+            "output_policy": agent_session.output_policy,
+        }
         agent_session.cloud_provider = cloud_provider
         agent_session.session.cloud_provider = cloud_provider
         if training_goal in {"smoke-test", "production", "agent-decide"}:
@@ -1510,6 +1654,28 @@ class SessionManager:
             agent_session.output_policy = output_policy
             agent_session.session.output_policy = output_policy
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="provider_settings_changed",
+                category="session",
+                status="completed",
+                actor="user",
+                title="Provider settings changed",
+                message=(
+                    f"Provider set to {cloud_provider}; training goal "
+                    f"{agent_session.training_goal}; output policy {agent_session.output_policy}."
+                ),
+                provider=cloud_provider,
+                entity_type="provider_settings",
+                entity_id=cloud_provider,
+                output_policy=agent_session.output_policy,
+                safe_metadata={
+                    "previous": previous,
+                    "training_goal": agent_session.training_goal,
+                },
+            )
+        )
         return True
 
     async def update_session_auto_approval(

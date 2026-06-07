@@ -25,6 +25,7 @@ import CodePanel from '@/components/CodePanel/CodePanel';
 import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
 import UsageDashboardButton from '@/components/UsageDashboard/UsageDashboardButton';
+import AuditTimelineButton from '@/components/AuditTimeline/AuditTimelineButton';
 import { apiFetch } from '@/utils/api';
 import {
   LLM_ERROR_SELECT_MODEL_ACTION,
@@ -303,6 +304,7 @@ export default function AppLayout() {
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
             <UsageDashboardButton />
+            <AuditTimelineButton />
             <YoloControl />
 
             {user?.picture ? (

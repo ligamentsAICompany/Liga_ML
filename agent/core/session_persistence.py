@@ -18,6 +18,11 @@ from agent.core.background_runs import (
     run_status_from_event,
     safe_event_summary,
 )
+from agent.core.audit import (
+    audit_timeline_enabled,
+    event_from_run_event,
+    summarize_audit_events,
+)
 from agent.core.usage import (
     summarize_usage,
     usage_from_approval_tool,
@@ -39,6 +44,22 @@ NO_DURABLE_STORE_WARNING = (
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
+    return None
 
 
 def _doc_id(session_id: str, idx: int) -> str:
@@ -75,6 +96,7 @@ class NoopSessionStore:
         self._runs: dict[str, dict[str, Any]] = {}
         self._run_events: dict[str, list[dict[str, Any]]] = {}
         self._usage_entries: dict[str, dict[str, Any]] = {}
+        self._audit_events: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -235,6 +257,89 @@ class NoopSessionStore:
         entries = await self.list_usage_entries(**filters)
         return {**summarize_usage(entries), "entries": entries}
 
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not audit_timeline_enabled():
+            return None
+        if not hasattr(self, "_audit_events"):
+            self._audit_events = {}
+        audit_id = str(event.get("audit_id") or event.get("_id") or "")
+        if not audit_id:
+            return None
+        current = self._audit_events.get(audit_id)
+        if current:
+            return dict(current)
+        event = {key: value for key, value in event.items() if value is not None}
+        event.setdefault("_id", audit_id)
+        event.setdefault("audit_id", audit_id)
+        self._audit_events[audit_id] = dict(event)
+        logger.info(
+            "audit_event audit_id=%s session_id=%s run_id=%s category=%s "
+            "event_type=%s provider=%s severity=%s status=%s",
+            event.get("audit_id"),
+            event.get("session_id"),
+            event.get("run_id"),
+            event.get("category"),
+            event.get("event_type"),
+            event.get("provider"),
+            event.get("severity"),
+            event.get("status"),
+        )
+        return dict(event)
+
+    async def list_audit_events(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        category: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not hasattr(self, "_audit_events"):
+            self._audit_events = {}
+        events = list(self._audit_events.values())
+        if session_id:
+            events = [
+                event for event in events if event.get("session_id") == session_id
+            ]
+        if run_id:
+            events = [event for event in events if event.get("run_id") == run_id]
+        if provider:
+            events = [event for event in events if event.get("provider") == provider]
+        if category:
+            events = [event for event in events if event.get("category") == category]
+        if severity:
+            events = [event for event in events if event.get("severity") == severity]
+        if status:
+            events = [event for event in events if event.get("status") == status]
+        since_dt = _parse_dt(since)
+        until_dt = _parse_dt(until)
+        if since_dt:
+            events = [
+                event
+                for event in events
+                if (_parse_dt(event.get("timestamp")) or _now()) >= since_dt
+            ]
+        if until_dt:
+            events = [
+                event
+                for event in events
+                if (_parse_dt(event.get("timestamp")) or _now()) <= until_dt
+            ]
+        events = sorted(
+            (dict(event) for event in events),
+            key=lambda item: _parse_dt(item.get("timestamp")) or _now(),
+        )
+        return events[: max(1, min(int(limit or 100), 500))]
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        events = await self.list_audit_events(**filters)
+        return {**summarize_audit_events(events), "events": events}
+
     async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
         runs = [
             dict(run)
@@ -269,6 +374,12 @@ class NoopSessionStore:
         }
         events.append(doc)
         await self._apply_run_event_update(run_id, event_type, payload or {}, seq)
+        await self._record_audit_from_run_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type=event_type,
+            payload=payload or {},
+        )
         return seq
 
     async def load_run_events_after(
@@ -373,6 +484,22 @@ class NoopSessionStore:
             for entry in existing:
                 await self.upsert_usage_entry(str(entry["usage_id"]), fields)
 
+    async def _record_audit_from_run_event(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        for event in event_from_run_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type=event_type,
+            payload=payload,
+        ):
+            await self.record_audit_event(event)
+
 
 class MongoSessionStore(NoopSessionStore):
     """MongoDB-backed session store."""
@@ -437,6 +564,12 @@ class MongoSessionStore(NoopSessionStore):
         )
         await self.db.usage_entries.create_index([("run_id", 1), ("updated_at", -1)])
         await self.db.usage_entries.create_index([("provider", 1), ("updated_at", -1)])
+        await self.db.audit_events.create_index([("audit_id", 1)], unique=True)
+        await self.db.audit_events.create_index([("session_id", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("run_id", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("provider", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("category", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("severity", 1), ("timestamp", -1)])
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
 
     def _ready(self) -> bool:
@@ -810,6 +943,105 @@ class MongoSessionStore(NoopSessionStore):
         entries = await self.list_usage_entries(**filters)
         return {**summarize_usage(entries), "entries": entries}
 
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().record_audit_event(event)
+        if not audit_timeline_enabled():
+            return None
+        audit_id = str(event.get("audit_id") or event.get("_id") or "")
+        if not audit_id:
+            return None
+        cleaned = {key: value for key, value in event.items() if value is not None}
+        cleaned["_id"] = audit_id
+        cleaned["audit_id"] = audit_id
+        try:
+            result = await self.db.audit_events.find_one_and_update(
+                {"audit_id": audit_id},
+                {
+                    "$setOnInsert": {
+                        **cleaned,
+                        "created_at": _now(),
+                        "schema_version": SCHEMA_VERSION,
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            logger.info(
+                "audit_event audit_id=%s session_id=%s run_id=%s category=%s "
+                "event_type=%s provider=%s severity=%s status=%s",
+                cleaned.get("audit_id"),
+                cleaned.get("session_id"),
+                cleaned.get("run_id"),
+                cleaned.get("category"),
+                cleaned.get("event_type"),
+                cleaned.get("provider"),
+                cleaned.get("severity"),
+                cleaned.get("status"),
+            )
+            return result or cleaned
+        except DuplicateKeyError:
+            return await self.db.audit_events.find_one({"audit_id": audit_id})
+        except PyMongoError as e:
+            logger.debug("Failed to record audit event %s: %s", audit_id, e)
+            return None
+
+    async def list_audit_events(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        category: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_audit_events(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                category=category,
+                severity=severity,
+                status=status,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if provider:
+            query["provider"] = provider
+        if category:
+            query["category"] = category
+        if severity:
+            query["severity"] = severity
+        if status:
+            query["status"] = status
+        timestamp_query: dict[str, Any] = {}
+        if since_dt := _parse_dt(since):
+            timestamp_query["$gte"] = since_dt
+        if until_dt := _parse_dt(until):
+            timestamp_query["$lte"] = until_dt
+        if timestamp_query:
+            query["timestamp"] = timestamp_query
+        cursor = (
+            self.db.audit_events.find(query)
+            .sort("timestamp", 1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        events = await self.list_audit_events(**filters)
+        return {**summarize_audit_events(events), "events": events}
+
     async def append_run_event(
         self,
         *,
@@ -841,6 +1073,12 @@ class MongoSessionStore(NoopSessionStore):
             await self.db.run_events.insert_one(doc)
             await self._apply_persisted_run_event_update(
                 run_id, event_type, payload or {}, seq
+            )
+            await self._record_audit_from_run_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type=event_type,
+                payload=payload or {},
             )
             return seq
         except PyMongoError as e:

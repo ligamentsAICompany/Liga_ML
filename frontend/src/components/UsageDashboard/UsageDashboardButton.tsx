@@ -108,6 +108,13 @@ export default function UsageDashboardButton() {
                     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                       <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>{card.label}</Typography>
                       <Chip size="small" label={card.ready ? 'Ready' : card.configured ? 'Check quota' : 'Not configured'} color={card.ready ? 'success' : 'warning'} variant="outlined" />
+                      <Button
+                        size="small"
+                        onClick={() => window.dispatchEvent(new CustomEvent('liga-open-audit-timeline'))}
+                        sx={{ ml: 'auto', textTransform: 'none' }}
+                      >
+                        View timeline
+                      </Button>
                     </Box>
                     <Typography variant="body2">Estimated: <strong>{formatUsd(card.estimatedCostUsd)}</strong></Typography>
                     <Typography variant="body2">Known: <strong>{formatUsd(card.knownCostUsd)}</strong></Typography>
@@ -145,6 +152,13 @@ export default function UsageDashboardButton() {
                         <Box sx={{ flex: 1 }} />
                         <Typography variant="body2">Estimate: {formatUsd(entry.estimated_cost_usd)}</Typography>
                         <Typography variant="body2">Approved: {entry.approved ? 'yes' : 'no'}</Typography>
+                        <Button
+                          size="small"
+                          onClick={() => window.dispatchEvent(new CustomEvent('liga-open-audit-timeline'))}
+                          sx={{ textTransform: 'none' }}
+                        >
+                          View timeline
+                        </Button>
                       </Box>
                       <Typography variant="caption" color="text.secondary">
                         Session {entry.session_id} {entry.run_id ? `· Run ${entry.run_id}` : ''} · Actual provider billing may differ

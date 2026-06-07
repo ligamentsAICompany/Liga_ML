@@ -19,6 +19,9 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
 - Phase 2 derives usage entries from the same replayable events. MongoDB stores
   them in `usage_entries`; the local fallback is in-memory and reported as
   `usage_store.durable=false`.
+- Phase 3 derives audit timeline events from the same run and usage signals.
+  MongoDB stores them in `audit_events`; the local fallback is in-memory and
+  reported as `audit_store.durable=false`.
 
 ## APIs
 
@@ -30,6 +33,10 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
 - `POST /api/session/{session_id}/runs/{run_id}/interrupt`
 - `GET /api/session/{session_id}/usage`
 - `GET /api/session/{session_id}/runs/{run_id}/usage`
+- `GET /api/audit`
+- `GET /api/audit/summary`
+- `GET /api/session/{session_id}/audit`
+- `GET /api/session/{session_id}/runs/{run_id}/audit`
 
 `POST /api/chat/{session_id}` remains backward compatible. It creates a run for
 new user messages when Phase 1 is enabled and attaches approval continuations to
@@ -60,12 +67,18 @@ caches, frontend build output, or generated artifacts.
 - `usage_store.enabled`
 - `usage_store.durable`
 - `usage_store.store`
+- `audit_store.enabled`
+- `audit_store.durable`
+- `audit_store.type`
 - `session_store.type`
 - `session_store.durable`
 
 See `docs/usage-dashboard.md` for budget env vars, estimated-vs-actual cost
 wording, and quota warning behavior. Phase 2 does not call live billing APIs or
 block runs beyond the existing approval policy.
+
+See `docs/audit-timeline.md` for timeline categories, retention settings,
+redaction behavior, and frontend usage.
 
 ## Limitations
 

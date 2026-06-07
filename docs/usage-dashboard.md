@@ -46,6 +46,11 @@ Usage collection is event-driven and idempotent. Approval events create entries,
 approval/job state events update those entries, and repeated monitoring events
 reuse the same usage id instead of double-counting.
 
+Phase 3 records related usage audit events such as `usage_estimated`,
+`budget_warning`, and provider job transitions in the Audit Timeline. The Usage
+dashboard includes `View timeline` actions for drilling into that operational
+history. See `docs/audit-timeline.md`.
+
 ## APIs
 
 - `GET /api/usage`
@@ -84,6 +89,9 @@ than inferred from credentials.
 Usage responses are read-only and redact secret-like metadata keys. They do not
 include provider tokens, OAuth tokens, MongoDB URIs, AWS credentials, GCP
 credential files, or payment data.
+
+Audit timeline responses apply the same privacy posture before persistence and
+do not add external observability or billing integrations.
 
 ## Future Work
 

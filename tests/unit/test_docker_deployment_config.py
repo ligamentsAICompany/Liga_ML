@@ -91,8 +91,11 @@ def test_docker_docs_are_linked_from_readme() -> None:
         "GOOGLE_APPLICATION_CREDENTIALS",
         "MONGODB_URI",
         "USAGE_DASHBOARD_ENABLED",
+        "AUDIT_TIMELINE_ENABLED",
+        "AUDIT_EVENT_RETENTION_DAYS",
         "DEFAULT_DAILY_BUDGET_USD",
         "docs/usage-dashboard.md",
+        "docs/audit-timeline.md",
     ]:
         assert expected in docs
 

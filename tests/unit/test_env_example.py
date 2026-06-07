@@ -23,6 +23,8 @@ def test_env_example_includes_cloud_run_and_vertex_placeholders() -> None:
         "BACKGROUND_RUNS_ENABLED=false",
         "RUN_WORKER_MODE=disabled",
         "USAGE_DASHBOARD_ENABLED=true",
+        "AUDIT_TIMELINE_ENABLED=true",
+        "AUDIT_EVENT_RETENTION_DAYS=30",
         "DEFAULT_DAILY_BUDGET_USD=",
         "DEFAULT_MONTHLY_BUDGET_USD=",
         "HF_DAILY_BUDGET_USD=",

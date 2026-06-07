@@ -35,6 +35,10 @@ from dataset_uploads import (
     push_dataset_upload_to_hub,
 )
 from models import (
+    AuditEvent,
+    AuditStoreHealth,
+    AuditSummary,
+    AuditTimelineResponse,
     ApprovalRequest,
     DatasetUploadResponse,
     HealthResponse,
@@ -61,6 +65,11 @@ from session_manager import (
 import user_quotas
 
 from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
+from agent.core.audit import (
+    audit_store_status,
+    audit_timeline_enabled,
+    build_audit_event,
+)
 from agent.core.background_runs import background_run_status, background_runs_in_process
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
@@ -355,6 +364,7 @@ async def health_check() -> HealthResponse:
         session_store=store_status,
         background_runs=background_run_status(store_status),
         usage_store=usage_store_status(),
+        audit_store=audit_store_health(),
         cloud_run_revision=os.environ.get("K_REVISION"),
     )
 
@@ -375,6 +385,13 @@ def usage_store_status() -> UsageStoreHealth:
     )
 
 
+def audit_store_health() -> AuditStoreHealth:
+    """Return non-secret audit timeline durability for health/API payloads."""
+    return AuditStoreHealth(
+        **audit_store_status(session_store_status(session_manager.persistence_store))
+    )
+
+
 def _safe_limit(limit: int = 100) -> int:
     return max(1, min(int(limit or 100), 500))
 
@@ -392,6 +409,97 @@ def _serialize_usage_entry(entry: dict[str, Any]) -> dict[str, Any]:
         for key, value in entry.items()
         if key not in {"_id", "schema_version"}
     }
+
+
+def _serialize_audit_event(event: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return {
+        key: (iso(value) if key in {"timestamp", "created_at", "updated_at"} else value)
+        for key, value in event.items()
+        if key
+        not in {"_id", "schema_version", "idempotency_key", "created_at", "updated_at"}
+    }
+
+
+def _audit_filters(
+    *,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "run_id": run_id,
+        "provider": provider,
+        "category": category,
+        "severity": severity,
+        "status": status,
+        "since": since,
+        "until": until,
+        "limit": _safe_limit(limit),
+    }
+
+
+def _audit_timeline_response(events: list[dict[str, Any]]) -> AuditTimelineResponse:
+    return AuditTimelineResponse(
+        enabled=audit_timeline_enabled(),
+        audit_store=audit_store_health(),
+        events=[AuditEvent(**_serialize_audit_event(event)) for event in events],
+    )
+
+
+def _audit_summary_response(raw: dict[str, Any]) -> AuditSummary:
+    events = [
+        AuditEvent(**_serialize_audit_event(event)) for event in raw.get("events", [])
+    ]
+    by_session: dict[str, list[AuditEvent]] = {}
+    by_run: dict[str, list[AuditEvent]] = {}
+    for event in events:
+        by_session.setdefault(event.session_id, []).append(event)
+        if event.run_id:
+            by_run.setdefault(event.run_id, []).append(event)
+    return AuditSummary(
+        enabled=audit_timeline_enabled(),
+        total_events=raw.get("total_events", 0),
+        counts_by_category=raw.get("counts_by_category", {}),
+        counts_by_severity=raw.get("counts_by_severity", {}),
+        counts_by_provider=raw.get("counts_by_provider", {}),
+        latest_warnings_errors=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("latest_warnings_errors", [])
+        ],
+        provider_job_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("provider_job_timeline", [])
+        ],
+        approval_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("approval_timeline", [])
+        ],
+        dataset_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("dataset_timeline", [])
+        ],
+        usage_cost_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("usage_cost_timeline", [])
+        ],
+        timeline_by_session=by_session,
+        timeline_by_run=by_run,
+        audit_store=audit_store_health(),
+    )
 
 
 def _usage_summary_payload(
@@ -484,6 +592,7 @@ async def provider_health() -> dict[str, Any]:
         "gcp_vertex": build_gcp_vertex_readiness_snapshot(),
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
         "session_store": session_store_status(session_manager.persistence_store),
+        "audit_store": audit_store_health().model_dump(),
     }
 
 
@@ -548,6 +657,163 @@ async def usage_providers(user: dict = Depends(get_current_user)) -> dict[str, A
             "Quota status may be unknown unless provider reports it",
         ],
     }
+
+
+@router.get("/audit", response_model=AuditTimelineResponse)
+async def list_audit(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    """List sanitized audit events for the internal timeline."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
+
+
+@router.get("/audit/summary", response_model=AuditSummary)
+async def audit_summary(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditSummary:
+    """Summarize sanitized audit events by category, severity, and provider."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_summary_response({"events": [], "total_events": 0})
+    raw = await session_manager.audit_summary(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_summary_response(raw)
+
+
+@router.get("/audit/providers")
+async def audit_providers(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Provider readiness and audit-store durability for the timeline UI."""
+    _ = user
+    raw = (
+        await session_manager.audit_summary(limit=500)
+        if audit_timeline_enabled()
+        else {"counts_by_provider": {}}
+    )
+    return {
+        "enabled": audit_timeline_enabled(),
+        "audit_store": audit_store_health().model_dump(),
+        "provider_readiness": await provider_health(),
+        "counts_by_provider": raw.get("counts_by_provider", {}),
+        "notes": [
+            "Internal audit timeline only",
+            "No external observability exporter configured",
+            "Sensitive metadata is redacted before persistence",
+        ],
+    }
+
+
+@router.get("/session/{session_id}/audit", response_model=AuditTimelineResponse)
+async def list_session_audit(
+    session_id: str,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/audit", response_model=AuditTimelineResponse
+)
+async def list_run_audit(
+    session_id: str,
+    run_id: str,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
 
 
 @router.get("/session/{session_id}/usage", response_model=list[UsageEntry])
@@ -907,6 +1173,7 @@ async def upload_session_dataset(
 ) -> DatasetUploadResponse:
     """Upload a CSV/JSON dataset file to a private Hub dataset for this session."""
     file: UploadFile | None = None
+    filename_for_audit: str | None = None
     try:
         _reject_oversize_dataset_upload(request)
         agent_session = await _check_session_access(session_id, user, request)
@@ -940,6 +1207,22 @@ async def upload_session_dataset(
             max_part_size=MAX_DATASET_UPLOAD_BYTES,
         )
         file = _dataset_upload_file_from_form(form)
+        filename_for_audit = file.filename
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_started",
+                category="dataset",
+                status="started",
+                actor="user",
+                title="Dataset upload started",
+                message=f"Dataset upload started for {filename_for_audit}.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+            )
+        )
         hf_username = user.get("username") or agent_session.hf_username
         uploaded = await push_dataset_upload_to_hub(
             upload=file,
@@ -962,8 +1245,48 @@ async def upload_session_dataset(
             uploaded.repo_id,
             session_id,
         )
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_succeeded",
+                category="dataset",
+                status="succeeded",
+                actor="system",
+                title="Dataset uploaded",
+                message=f"Dataset {uploaded.filename} uploaded and normalized.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=uploaded.upload_id,
+                dataset_name=uploaded.filename,
+                artifact_url=uploaded.hub_url,
+                safe_metadata={
+                    "repo_id": uploaded.repo_id,
+                    "normalized_row_count": uploaded.normalized_row_count,
+                    "source_format": uploaded.source_format,
+                    "size_bytes": uploaded.size_bytes,
+                },
+            )
+        )
         return DatasetUploadResponse(**uploaded.response_payload())
-    except HTTPException:
+    except HTTPException as e:
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="warning" if e.status_code < 500 else "error",
+                status="failed",
+                actor="system",
+                title="Dataset upload failed",
+                message=str(e.detail),
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=str(e.status_code),
+                error_summary=str(e.detail)[:500],
+            )
+        )
         raise
     except HfHubHTTPError as e:
         logger.warning(
@@ -972,9 +1295,45 @@ async def upload_session_dataset(
             getattr(e.response, "status_code", None),
             getattr(e, "request_id", None),
         )
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="error",
+                status="failed",
+                actor="provider",
+                title="Dataset upload failed",
+                message="Hugging Face Hub rejected the dataset upload.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=str(getattr(e.response, "status_code", "") or "hub_error"),
+                error_summary=str(e)[:500],
+            )
+        )
         raise _dataset_upload_hub_http_exception(e)
-    except Exception:
+    except Exception as e:
         logger.exception("Dataset upload failed for session %s", session_id)
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="error",
+                status="failed",
+                actor="system",
+                title="Dataset upload failed",
+                message="Dataset upload failed before it could be attached.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=type(e).__name__,
+                error_summary=str(e)[:500],
+            )
+        )
         raise HTTPException(
             status_code=502,
             detail="Dataset upload failed. Please try again.",
