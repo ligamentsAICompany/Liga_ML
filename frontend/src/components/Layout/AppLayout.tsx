@@ -283,7 +283,7 @@ export default function AppLayout() {
           <Box sx={{ flex: 1, display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 0.75 }}>
             <Box
               component="img"
-              src="/liga-ml-logo.png"
+              src="/logo-x.png"
               alt="Liga ML Intern"
               sx={{ width: { xs: 20, md: 22 }, height: { xs: 20, md: 22 } }}
             />

@@ -51,14 +51,14 @@ Embedded trackio dashboard for ml-intern runs.
 _REQUIREMENTS = "trackio\n"
 _APP_PY = "import trackio\ntrackio.show()\n"
 
-# ml-intern brand mark surfaced inside the trackio dashboard. Trackio reads
+# Liga ML Intern brand mark surfaced inside the trackio dashboard. Trackio reads
 # `TRACKIO_LOGO_LIGHT_URL` / `TRACKIO_LOGO_DARK_URL` from Space variables and
 # renders them in place of its own logo. We point at the publicly-resolvable
 # copy on the smolagents/ml-intern Space repo so any seeded dashboard inherits
-# the ml-intern branding without each user having to host the asset.
+# the Liga ML Intern branding without each user having to host the asset.
 _LOGO_URL = (
     "https://huggingface.co/spaces/smolagents/ml-intern/"
-    "resolve/main/frontend/public/smolagents.webp"
+    "resolve/main/frontend/public/logo-x.png"
 )
 
 _FILES = {
