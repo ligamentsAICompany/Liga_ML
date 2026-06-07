@@ -6,6 +6,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 CloudProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker"]
+UsageProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker", "llm", "unknown"]
+CostSource = Literal[
+    "static_estimate",
+    "provider_estimate",
+    "approval_estimate",
+    "actual_provider_billing",
+    "unknown",
+]
+CostConfidence = Literal["known", "estimated", "unknown"]
 TrainingGoal = Literal["smoke-test", "production", "agent-decide"]
 OutputPolicy = Literal["cloud-private", "hf-hub", "cloud-and-hf-hub"]
 DatasetSourceFormat = Literal["csv", "json", "jsonl", "pdf", "docx", "xlsx", "md"]
@@ -211,6 +220,64 @@ class BackgroundRunsHealth(BaseModel):
     warning: str | None = None
 
 
+class UsageStoreHealth(BaseModel):
+    """Non-secret usage ledger persistence status."""
+
+    enabled: bool = True
+    durable: bool
+    store: str
+    warning: str | None = None
+
+
+class UsageEntry(BaseModel):
+    usage_id: str
+    session_id: str
+    run_id: str | None = None
+    provider: UsageProviderId | str = "unknown"
+    tool_name: str | None = None
+    operation: str = "unknown"
+    job_id: str | None = None
+    job_url: str | None = None
+    artifact_url: str | None = None
+    status: str = "pending"
+    created_at: str | None = None
+    updated_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    currency: str = "USD"
+    estimated_cost_usd: float | None = None
+    known_cost_usd: float | None = None
+    cost_source: CostSource | str = "unknown"
+    cost_confidence: CostConfidence | str = "unknown"
+    instance_type: str | None = None
+    instance_count: int | None = None
+    max_runtime_seconds: int | None = None
+    actual_runtime_seconds: int | None = None
+    dataset_name: str | None = None
+    model_name: str | None = None
+    output_policy: str | None = None
+    approval_id: str | None = None
+    approved: bool = False
+    budget_cap_usd: float | None = None
+    quota_status: str = "unknown"
+    warning: str | None = None
+    error_summary: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class UsageSummary(BaseModel):
+    total_estimated_cost_usd: float = 0.0
+    total_known_cost_usd: float = 0.0
+    cost_by_provider: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    cost_by_session: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    cost_by_run: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    recent_usage_entries: list[UsageEntry] = Field(default_factory=list)
+    quota_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    budget_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    provider_readiness: dict[str, Any] = Field(default_factory=dict)
+    usage_store: UsageStoreHealth | None = None
+
+
 class RunProviderMetadata(BaseModel):
     provider: str = "none"
     status: str | None = None
@@ -238,6 +305,11 @@ class RunSummary(BaseModel):
     error_summary: str | None = None
     result_summary: str | None = None
     provider_metadata: RunProviderMetadata = Field(default_factory=RunProviderMetadata)
+    estimated_cost_usd: float | None = None
+    known_cost_usd: float | None = None
+    usage_status: str = "unknown"
+    budget_warning: str | None = None
+    quota_warning: str | None = None
 
 
 class RunEventInfo(BaseModel):
@@ -258,6 +330,7 @@ class HealthResponse(BaseModel):
     max_sessions: int = 0
     session_store: SessionStoreHealth | None = None
     background_runs: BackgroundRunsHealth | None = None
+    usage_store: UsageStoreHealth | None = None
     cloud_run_revision: str | None = None
 
 

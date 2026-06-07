@@ -439,7 +439,57 @@ class SessionManager:
                 or run.get("provider_output_policy"),
                 "last_checked_at": provider_metadata.get("last_checked_at"),
             },
+            "estimated_cost_usd": run.get("estimated_cost_usd"),
+            "known_cost_usd": run.get("known_cost_usd"),
+            "usage_status": run.get("usage_status") or "unknown",
+            "budget_warning": run.get("budget_warning"),
+            "quota_warning": run.get("quota_warning"),
         }
+
+    @staticmethod
+    def _usage_totals_for_run(
+        run: dict[str, Any], entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if not entries:
+            return run
+        estimated = round(
+            sum(float(entry.get("estimated_cost_usd") or 0.0) for entry in entries), 4
+        )
+        known_values = [
+            entry.get("known_cost_usd")
+            for entry in entries
+            if entry.get("known_cost_usd") is not None
+        ]
+        known = (
+            round(sum(float(value or 0.0) for value in known_values), 4)
+            if known_values
+            else None
+        )
+        statuses = [str(entry.get("status") or "unknown") for entry in entries]
+        run = dict(run)
+        run["estimated_cost_usd"] = estimated
+        run["known_cost_usd"] = known
+        run["usage_status"] = next(
+            (status for status in statuses if status not in {"succeeded", "unknown"}),
+            statuses[0],
+        )
+        run["budget_warning"] = next(
+            (entry.get("warning") for entry in entries if entry.get("warning")), None
+        )
+        run["quota_warning"] = next(
+            (
+                entry.get("error_summary") or entry.get("warning")
+                for entry in entries
+                if entry.get("quota_status") == "blocked" or entry.get("error_summary")
+            ),
+            None,
+        )
+        return run
+
+    async def _serialize_run_with_usage(self, run: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(run.get("run_id") or run.get("_id") or "")
+        entries = await self._store().list_usage_entries(run_id=run_id, limit=50)
+        return self._serialize_run(self._usage_totals_for_run(run, entries))
 
     @staticmethod
     def _serialize_run_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -474,11 +524,11 @@ class SessionManager:
         )
         run_id = str(run.get("run_id") or run.get("_id"))
         agent_session.session.current_run_id = run_id
-        return self._serialize_run(run)
+        return await self._serialize_run_with_usage(run)
 
     async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
         return [
-            self._serialize_run(run)
+            await self._serialize_run_with_usage(run)
             for run in await self._store().list_runs(session_id)
         ]
 
@@ -486,7 +536,13 @@ class SessionManager:
         run = await self._store().get_run(run_id)
         if not run or str(run.get("session_id")) != session_id:
             return None
-        return self._serialize_run(run)
+        return await self._serialize_run_with_usage(run)
+
+    async def list_usage_entries(self, **filters: Any) -> list[dict[str, Any]]:
+        return await self._store().list_usage_entries(**filters)
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        return await self._store().usage_summary(**filters)
 
     async def load_run_events_after(
         self, session_id: str, run_id: str, after_seq: int = 0

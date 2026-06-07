@@ -2471,11 +2471,27 @@ class Handlers:
                             "tool_call_id": tc.id,
                         }
                         approval_record = _approval_record(tc, tool_name, tool_args)
+                        approval_record.update(
+                            {
+                                "estimated_cost_usd": decision.estimated_cost_usd,
+                                "remaining_cap_usd": decision.remaining_cap_usd,
+                                "billable": decision.billable,
+                            }
+                        )
                         approval_records.append(approval_record)
                         tool_payload.update(approval_record)
                         metadata = _approval_metadata(session, tool_name, tool_args)
                         if metadata:
                             tool_payload["metadata"] = metadata
+                        if decision.estimated_cost_usd is not None:
+                            tool_payload["estimated_cost_usd"] = (
+                                decision.estimated_cost_usd
+                            )
+                        if decision.remaining_cap_usd is not None:
+                            tool_payload["remaining_cap_usd"] = (
+                                decision.remaining_cap_usd
+                            )
+                        tool_payload["billable"] = decision.billable
                         if decision.auto_approval_blocked:
                             tool_payload.update(
                                 {

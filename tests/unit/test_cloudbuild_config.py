@@ -65,11 +65,18 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
         "ML_INTERN_KPIS_DISABLED",
         "BACKGROUND_RUNS_ENABLED",
         "RUN_WORKER_MODE",
+        "USAGE_DASHBOARD_ENABLED",
+        "DEFAULT_DAILY_BUDGET_USD",
+        "DEFAULT_MONTHLY_BUDGET_USD",
+        "HF_DAILY_BUDGET_USD",
+        "GCLOUD_DAILY_BUDGET_USD",
+        "AWS_DAILY_BUDGET_USD",
     ]:
         assert f"{name}=" in env_vars
 
     assert "BACKGROUND_RUNS_ENABLED=true" in env_vars
     assert "RUN_WORKER_MODE=in_process" in env_vars
+    assert "USAGE_DASHBOARD_ENABLED=true" in env_vars
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in deploy_args
 
 
@@ -87,6 +94,11 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert substitutions["_AWS_SESSION_TOKEN_SECRET"] == ""
     assert "_MONGODB_URI_SECRET" in substitutions
     assert "_SESSION_TOKEN_ENCRYPTION_KEY_SECRET" in substitutions
+    assert "_DEFAULT_DAILY_BUDGET_USD" in substitutions
+    assert "_DEFAULT_MONTHLY_BUDGET_USD" in substitutions
+    assert "_HF_DAILY_BUDGET_USD" in substitutions
+    assert "_GCLOUD_DAILY_BUDGET_USD" in substitutions
+    assert "_AWS_DAILY_BUDGET_USD" in substitutions
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg

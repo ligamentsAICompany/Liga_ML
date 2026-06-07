@@ -24,6 +24,7 @@ import SessionChat from '@/components/SessionChat';
 import CodePanel from '@/components/CodePanel/CodePanel';
 import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
+import UsageDashboardButton from '@/components/UsageDashboard/UsageDashboardButton';
 import { apiFetch } from '@/utils/api';
 import {
   LLM_ERROR_SELECT_MODEL_ACTION,
@@ -301,6 +302,7 @@ export default function AppLayout() {
           </Box>
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <UsageDashboardButton />
             <YoloControl />
 
             {user?.picture ? (

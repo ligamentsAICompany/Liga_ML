@@ -273,7 +273,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         for (const tool of tools) {
           store.setToolBudgetBlock(
             tool.tool_call_id,
-            tool.auto_approval_blocked
+            tool.auto_approval_blocked || tool.estimated_cost_usd !== undefined || tool.remaining_cap_usd !== undefined
               ? {
                   reason: tool.block_reason ?? null,
                   estimatedCostUsd: tool.estimated_cost_usd ?? null,

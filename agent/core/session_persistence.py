@@ -18,6 +18,12 @@ from agent.core.background_runs import (
     run_status_from_event,
     safe_event_summary,
 )
+from agent.core.usage import (
+    summarize_usage,
+    usage_from_approval_tool,
+    usage_from_run_terminal,
+    usage_from_tool_state,
+)
 from bson import BSON
 from pymongo import AsyncMongoClient, DeleteMany, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, InvalidDocument, PyMongoError
@@ -68,6 +74,7 @@ class NoopSessionStore:
     def __init__(self) -> None:
         self._runs: dict[str, dict[str, Any]] = {}
         self._run_events: dict[str, list[dict[str, Any]]] = {}
+        self._usage_entries: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -180,6 +187,54 @@ class NoopSessionStore:
         run = self._runs.get(run_id)
         return dict(run) if run else None
 
+    async def upsert_usage_entry(
+        self, usage_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = _now()
+        current = dict(self._usage_entries.get(usage_id) or {})
+        if not current:
+            current = {
+                "_id": usage_id,
+                "usage_id": usage_id,
+                "created_at": fields.get("created_at") or now,
+            }
+        cleaned = {key: value for key, value in fields.items() if value is not None}
+        current.update(cleaned)
+        current["updated_at"] = now
+        self._usage_entries[usage_id] = current
+        return dict(current)
+
+    async def list_usage_entries(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        entries = list(self._usage_entries.values())
+        if provider:
+            entries = [entry for entry in entries if entry.get("provider") == provider]
+        if session_id:
+            entries = [
+                entry for entry in entries if entry.get("session_id") == session_id
+            ]
+        if run_id:
+            entries = [entry for entry in entries if entry.get("run_id") == run_id]
+        if status:
+            entries = [entry for entry in entries if entry.get("status") == status]
+        entries = sorted(
+            (dict(entry) for entry in entries),
+            key=lambda item: item.get("updated_at") or item.get("created_at") or _now(),
+            reverse=True,
+        )
+        return entries[: max(1, min(int(limit or 100), 500))]
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        entries = await self.list_usage_entries(**filters)
+        return {**summarize_usage(entries), "entries": entries}
+
     async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
         runs = [
             dict(run)
@@ -268,6 +323,55 @@ class NoopSessionStore:
             if summary:
                 update["result_summary"] = summary
         run.update(update)
+        await self._apply_usage_event_update(run_id, event_type, payload, update)
+
+    async def _apply_usage_event_update(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        run_update: dict[str, Any],
+    ) -> None:
+        run = self._runs.get(run_id)
+        session_id = str(
+            (run or {}).get("session_id") or payload.get("session_id") or ""
+        )
+        if not session_id:
+            return
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            if isinstance(tools, list):
+                for tool_payload in tools:
+                    if isinstance(tool_payload, dict):
+                        usage_id, entry = usage_from_approval_tool(
+                            session_id=session_id,
+                            run_id=run_id,
+                            tool_payload=tool_payload,
+                            event_payload=payload,
+                        )
+                        await self.upsert_usage_entry(usage_id, entry)
+            return
+        existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
+        if event_type == "tool_state_change":
+            usage_update = usage_from_tool_state(
+                session_id=session_id,
+                run_id=run_id,
+                payload=payload,
+                existing=existing,
+            )
+            if usage_update:
+                usage_id, fields = usage_update
+                await self.upsert_usage_entry(usage_id, fields)
+            return
+        status = run_update.get("status")
+        if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+            fields = usage_from_run_terminal(
+                run_id=run_id,
+                status=str(status),
+                error_summary=run_update.get("error_summary"),
+            )
+            for entry in existing:
+                await self.upsert_usage_entry(str(entry["usage_id"]), fields)
 
 
 class MongoSessionStore(NoopSessionStore):
@@ -327,6 +431,12 @@ class MongoSessionStore(NoopSessionStore):
         await self.db.runs.create_index([("session_id", 1), ("updated_at", -1)])
         await self.db.runs.create_index([("status", 1), ("updated_at", -1)])
         await self.db.run_events.create_index([("run_id", 1), ("seq", 1)], unique=True)
+        await self.db.usage_entries.create_index([("usage_id", 1)], unique=True)
+        await self.db.usage_entries.create_index(
+            [("session_id", 1), ("updated_at", -1)]
+        )
+        await self.db.usage_entries.create_index([("run_id", 1), ("updated_at", -1)])
+        await self.db.usage_entries.create_index([("provider", 1), ("updated_at", -1)])
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
 
     def _ready(self) -> bool:
@@ -638,6 +748,68 @@ class MongoSessionStore(NoopSessionStore):
         cursor = self.db.runs.find({"session_id": session_id}).sort("updated_at", -1)
         return [row async for row in cursor]
 
+    async def upsert_usage_entry(
+        self, usage_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().upsert_usage_entry(usage_id, fields)
+        now = _now()
+        cleaned = {key: value for key, value in fields.items() if value is not None}
+        cleaned["usage_id"] = usage_id
+        cleaned["updated_at"] = now
+        doc = await self.db.usage_entries.find_one_and_update(
+            {"usage_id": usage_id},
+            {
+                "$setOnInsert": {
+                    "_id": usage_id,
+                    "usage_id": usage_id,
+                    "created_at": cleaned.get("created_at") or now,
+                    "schema_version": SCHEMA_VERSION,
+                },
+                "$set": cleaned,
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc or cleaned
+
+    async def list_usage_entries(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_usage_entries(
+                provider=provider,
+                session_id=session_id,
+                run_id=run_id,
+                status=status,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if provider:
+            query["provider"] = provider
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if status:
+            query["status"] = status
+        cursor = (
+            self.db.usage_entries.find(query)
+            .sort("updated_at", -1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        entries = await self.list_usage_entries(**filters)
+        return {**summarize_usage(entries), "entries": entries}
+
     async def append_run_event(
         self,
         *,
@@ -713,6 +885,57 @@ class MongoSessionStore(NoopSessionStore):
             if summary:
                 update["result_summary"] = summary
         await self.update_run(run_id, **update)
+        await self._apply_persisted_usage_event_update(
+            run_id, event_type, payload, update
+        )
+
+    async def _apply_persisted_usage_event_update(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        run_update: dict[str, Any],
+    ) -> None:
+        run = await self.get_run(run_id)
+        session_id = str(
+            (run or {}).get("session_id") or payload.get("session_id") or ""
+        )
+        if not session_id:
+            return
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            if isinstance(tools, list):
+                for tool_payload in tools:
+                    if isinstance(tool_payload, dict):
+                        usage_id, entry = usage_from_approval_tool(
+                            session_id=session_id,
+                            run_id=run_id,
+                            tool_payload=tool_payload,
+                            event_payload=payload,
+                        )
+                        await self.upsert_usage_entry(usage_id, entry)
+            return
+        existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
+        if event_type == "tool_state_change":
+            usage_update = usage_from_tool_state(
+                session_id=session_id,
+                run_id=run_id,
+                payload=payload,
+                existing=existing,
+            )
+            if usage_update:
+                usage_id, fields = usage_update
+                await self.upsert_usage_entry(usage_id, fields)
+            return
+        status = run_update.get("status")
+        if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+            fields = usage_from_run_terminal(
+                run_id=run_id,
+                status=str(status),
+                error_summary=run_update.get("error_summary"),
+            )
+            for entry in existing:
+                await self.upsert_usage_entry(str(entry["usage_id"]), fields)
 
     async def load_run_events_after(
         self, run_id: str, after_seq: int = 0

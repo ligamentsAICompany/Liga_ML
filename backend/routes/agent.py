@@ -47,6 +47,9 @@ from models import (
     SessionYoloRequest,
     SubmitRequest,
     TruncateRequest,
+    UsageEntry,
+    UsageStoreHealth,
+    UsageSummary,
 )
 from session_manager import (
     MAX_SESSIONS,
@@ -65,6 +68,7 @@ from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_tok
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
+from agent.core.usage import usage_dashboard_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -350,7 +354,61 @@ async def health_check() -> HealthResponse:
         max_sessions=MAX_SESSIONS,
         session_store=store_status,
         background_runs=background_run_status(store_status),
+        usage_store=usage_store_status(),
         cloud_run_revision=os.environ.get("K_REVISION"),
+    )
+
+
+def usage_store_status() -> UsageStoreHealth:
+    """Return non-secret usage ledger durability for health/API payloads."""
+    store_status = session_store_status(session_manager.persistence_store)
+    warning = (
+        None
+        if store_status["durable"]
+        else ("MONGODB_URI is not configured; usage entries are in-memory only.")
+    )
+    return UsageStoreHealth(
+        enabled=usage_dashboard_enabled(),
+        durable=bool(store_status["durable"]),
+        store=str(store_status["type"]),
+        warning=warning,
+    )
+
+
+def _safe_limit(limit: int = 100) -> int:
+    return max(1, min(int(limit or 100), 500))
+
+
+def _serialize_usage_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return {
+        key: (iso(value) if key.endswith("_at") else value)
+        for key, value in entry.items()
+        if key not in {"_id", "schema_version"}
+    }
+
+
+def _usage_summary_payload(
+    raw: dict[str, Any], provider_readiness: dict[str, Any] | None = None
+) -> UsageSummary:
+    entries = [_serialize_usage_entry(item) for item in raw.get("entries", [])]
+    return UsageSummary(
+        total_estimated_cost_usd=raw.get("total_estimated_cost_usd", 0.0),
+        total_known_cost_usd=raw.get("total_known_cost_usd", 0.0),
+        cost_by_provider=raw.get("cost_by_provider", {}),
+        cost_by_session=raw.get("cost_by_session", {}),
+        cost_by_run=raw.get("cost_by_run", {}),
+        recent_usage_entries=[UsageEntry(**entry) for entry in entries],
+        quota_warnings=raw.get("quota_warnings", []),
+        budget_warnings=raw.get("budget_warnings", []),
+        provider_readiness=provider_readiness or {},
+        usage_store=usage_store_status(),
     )
 
 
@@ -427,6 +485,112 @@ async def provider_health() -> dict[str, Any]:
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
         "session_store": session_store_status(session_manager.persistence_store),
     }
+
+
+@router.get("/usage", response_model=list[UsageEntry])
+async def list_usage(
+    provider: str | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    """List non-secret usage ledger entries."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
+
+
+@router.get("/usage/summary", response_model=UsageSummary)
+async def usage_summary(
+    provider: str | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> UsageSummary:
+    """Summarize estimated/known usage without live billing API calls."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    raw = await session_manager.usage_summary(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return _usage_summary_payload(raw, provider_readiness=await provider_health())
+
+
+@router.get("/usage/providers")
+async def usage_providers(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Provider readiness and usage-store durability for the dashboard."""
+    _ = user
+    summary = await session_manager.usage_summary(limit=500)
+    return {
+        "enabled": usage_dashboard_enabled(),
+        "usage_store": usage_store_status().model_dump(),
+        "provider_readiness": await provider_health(),
+        "cost_by_provider": summary.get("cost_by_provider", {}),
+        "no_live_billing_api_configured": True,
+        "notes": [
+            "Estimated cost, not final bill",
+            "Actual provider billing may differ",
+            "Quota status may be unknown unless provider reports it",
+        ],
+    }
+
+
+@router.get("/session/{session_id}/usage", response_model=list[UsageEntry])
+async def list_session_usage(
+    session_id: str,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/usage", response_model=list[UsageEntry]
+)
+async def list_run_usage(
+    session_id: str,
+    run_id: str,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
 
 
 @router.get("/config/model")

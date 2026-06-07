@@ -594,7 +594,31 @@ function InlineApproval({
           }}
         >
           <Typography variant="body2" sx={{ fontSize: '0.72rem' }}>
-            YOLO paused: {autoApproval.reason || 'manual approval required.'}
+            {autoApproval.reason ? `Budget warning: ${autoApproval.reason}` : 'Estimated cost is shown for manual approval.'}
+          </Typography>
+        </Alert>
+      )}
+
+      {autoApproval?.estimatedCostUsd !== undefined && autoApproval.estimatedCostUsd !== null && (
+        <Alert
+          severity="info"
+          sx={{
+            mb: 1.5,
+            py: 0.5,
+            bgcolor: 'rgba(59,130,246,0.08)',
+            border: '1px solid rgba(59,130,246,0.18)',
+            color: 'var(--text)',
+          }}
+        >
+          <Typography variant="body2" sx={{ fontSize: '0.72rem' }}>
+            Estimated cost, not final bill:{' '}
+            <Box component="span" sx={{ color: 'var(--accent-yellow)', fontWeight: 600 }}>
+              ${autoApproval.estimatedCostUsd.toFixed(2)}
+            </Box>
+            {autoApproval.remainingCapUsd !== undefined && autoApproval.remainingCapUsd !== null && (
+              <> · Budget cap remaining: ${autoApproval.remainingCapUsd.toFixed(2)}</>
+            )}
+            {' '}· Actual cost tracking unavailable until provider billing integration is added.
           </Typography>
         </Alert>
       )}

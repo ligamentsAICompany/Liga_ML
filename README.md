@@ -36,6 +36,12 @@ ML_INTERN_DEFAULT_MODEL_ID=moonshotai/Kimi-K2.6
 ML_INTERN_KPIS_DISABLED=1
 BACKGROUND_RUNS_ENABLED=false
 RUN_WORKER_MODE=disabled
+USAGE_DASHBOARD_ENABLED=true
+DEFAULT_DAILY_BUDGET_USD=
+DEFAULT_MONTHLY_BUDGET_USD=
+HF_DAILY_BUDGET_USD=
+GCLOUD_DAILY_BUDGET_USD=
+AWS_DAILY_BUDGET_USD=
 
 # Optional: durable web sessions for hosted/Cloud Run deployments
 MONGODB_URI=<mongodb-connection-string>
@@ -60,6 +66,11 @@ AWS_OUTPUT_POLICY=aws-private
 ```
 
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+
+The hosted UI includes a Usage/Billing dashboard for HF Jobs, Vertex AI,
+SageMaker AI, and agent model usage. It uses approval estimates, conservative
+provider pricing metadata, and run events; it does not require live billing APIs
+or add payment subscriptions. See [`docs/usage-dashboard.md`](docs/usage-dashboard.md).
 
 ### Usage
 

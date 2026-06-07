@@ -63,6 +63,12 @@ ML_INTERN_DEFAULT_MODEL_ID=
 ML_INTERN_KPIS_DISABLED=
 BACKGROUND_RUNS_ENABLED=false
 RUN_WORKER_MODE=disabled
+USAGE_DASHBOARD_ENABLED=true
+DEFAULT_DAILY_BUDGET_USD=
+DEFAULT_MONTHLY_BUDGET_USD=
+HF_DAILY_BUDGET_USD=
+GCLOUD_DAILY_BUDGET_USD=
+AWS_DAILY_BUDGET_USD=
 HF_TOKEN=
 HUGGINGFACE_HUB_TOKEN=
 ```
@@ -103,6 +109,11 @@ monitoring inside the same service when MongoDB is durable. `external_worker` is
 reserved for a future separate worker and is reported as not implemented. Phase 1
 does not persist provider tokens; configure `SESSION_TOKEN_ENCRYPTION_KEY` before
 any later encrypted token handoff is enabled. See `docs/background-runs.md`.
+
+The Usage/Billing dashboard is controlled by `USAGE_DASHBOARD_ENABLED` and the
+optional budget env vars above. These are not secrets. Missing budgets display
+`No budget configured`; estimates never require AWS Cost Explorer, GCP Cloud
+Billing, or Hugging Face billing APIs. See `docs/usage-dashboard.md`.
 
 AWS SageMaker AI:
 
@@ -164,8 +175,8 @@ curl "$SERVICE_URL/"
 ```
 
 Confirm the UI exposes Hugging Face Jobs, Google Cloud Vertex AI, AWS SageMaker
-AI, uploaded data controls, goal/storage controls, and provider panels without
-submitting or approving any paid training job.
+AI, uploaded data controls, goal/storage controls, provider panels, and the
+Usage/Billing dashboard without submitting or approving any paid training job.
 
 ## Troubleshooting
 
