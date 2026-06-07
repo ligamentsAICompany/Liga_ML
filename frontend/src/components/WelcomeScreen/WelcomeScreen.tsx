@@ -263,7 +263,7 @@ export default function WelcomeScreen() {
         {/* Logo */}
         <Box
           component="img"
-          src="/liga-ml-logo.png"
+          src="/logo-x.png"
           alt="Liga ML Intern"
           sx={{ width: 80, height: 80, mb: 2.5, display: 'block' }}
         />
