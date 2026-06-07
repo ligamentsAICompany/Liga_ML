@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="frontend/public/logo-x.png" alt="Liga ML Intern logo" width="160" />
+  <img src="frontend/public/logo-x-v2.png" alt="Liga ML Intern logo" width="160" />
 </p>
 
 # Liga ML Intern
