@@ -186,7 +186,9 @@ async def test_submit_user_input_preserves_hf_training_metadata():
         "cloud_provider": "hf-jobs",
         "training_goal": "production",
         "output_policy": "hf-hub",
+        "run_id": existing.session.current_run_id,
     }
+    assert isinstance(submitted[0].data["run_id"], str)
 
 
 def _install_fake_runtime(manager: SessionManager) -> asyncio.Event:
