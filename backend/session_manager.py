@@ -509,6 +509,9 @@ class SessionManager:
             1 for event in events if event.get("severity") in {"error", "critical"}
         )
         latest = events[-1] if events else None
+        if latest:
+            latest = dict(latest)
+            latest["timestamp"] = _iso_or_none(latest.get("timestamp"))
         run["latest_audit_event"] = latest
         return run
 

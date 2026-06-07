@@ -200,3 +200,28 @@ async def test_evaluation_api_endpoints_and_manual_trigger_are_static_idempotent
     assert by_run.evaluation_id == triggered.evaluation_id
     assert report["report_markdown"] == by_run.report_markdown
     assert triggered.metadata["mode"] == "static"
+
+
+@pytest.mark.asyncio
+async def test_create_run_response_serializes_latest_audit_timestamp(monkeypatch):
+    store = NoopSessionStore()
+
+    async def _allow_access(session_id, user, request=None, preload_sandbox=True):
+        return SimpleNamespace(session_id=session_id, user_id=user["user_id"])
+
+    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+    monkeypatch.setattr(agent.session_manager, "_store", lambda: store)
+    monkeypatch.setitem(
+        agent.session_manager.sessions,
+        "s1",
+        SimpleNamespace(is_active=True, session=SimpleNamespace(current_run_id=None)),
+    )
+
+    response = await agent.create_session_run(
+        "s1", {"provider": "aws-sagemaker"}, user={"user_id": "dev"}
+    )
+
+    assert response.latest_audit_event is not None
+    assert isinstance(response.latest_audit_event.timestamp, str)
+    agent.session_manager.sessions.pop("s1", None)
