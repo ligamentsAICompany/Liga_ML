@@ -64,8 +64,8 @@ chronological timeline with provider/category/severity/status filters, session
 and run labels, approvals, datasets, provider jobs, errors/warnings, artifacts,
 and usage/cost metadata. Usage cards and entries include `View timeline`.
 
-The UI hides secret-like values defensively and only renders safe `http`,
-`https`, `s3`, and `gs` links.
+The UI applies defensive redaction before rendering event text and only renders
+safe `http`, `https`, `s3`, and `gs` links.
 
 ## Environment
 
@@ -79,7 +79,8 @@ provider readiness include `audit_store`.
 
 ## Security
 
-Audit responses are read-only and sanitized before persistence. They must not
+Audit responses are read-only and sanitized before persistence using the shared
+redaction policy documented in `docs/security-hardening.md`. They must not
 include OAuth tokens, provider tokens, MongoDB URIs, AWS keys, GCP credential
 files, OpenAI keys, local dataset contents, or payment data. Structured audit
 logs include only safe identifiers: audit id, session id, run id, category,

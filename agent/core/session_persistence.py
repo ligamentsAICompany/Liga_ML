@@ -29,6 +29,7 @@ from agent.core.usage import (
     usage_from_run_terminal,
     usage_from_tool_state,
 )
+from agent.core.redact import sanitize_for_persistence
 from bson import BSON
 from pymongo import AsyncMongoClient, DeleteMany, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, InvalidDocument, PyMongoError
@@ -72,9 +73,10 @@ def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
     Mongo's hard document limit is 16 MB.  We stay below that and store an
     explicit marker rather than failing the whole snapshot for one huge tool log.
     """
+    safe_message = sanitize_for_persistence(message)
     try:
-        if len(BSON.encode({"message": message})) <= MAX_BSON_BYTES:
-            return message
+        if len(BSON.encode({"message": safe_message})) <= MAX_BSON_BYTES:
+            return safe_message
     except (InvalidDocument, OverflowError):
         pass
     return {
@@ -134,7 +136,7 @@ class NoopSessionStore:
                 run_id=run_id,
                 session_id=session_id,
                 event_type=event_type,
-                payload=data or {},
+                payload=sanitize_for_persistence(data or {}),
             )
         return None
 
@@ -199,7 +201,9 @@ class NoopSessionStore:
         run = self._runs.get(run_id)
         if not run:
             return None
-        fields = {k: v for k, v in fields.items() if v is not None}
+        fields = sanitize_for_persistence(
+            {k: v for k, v in fields.items() if v is not None}
+        )
         if fields:
             run.update(fields)
         run["updated_at"] = _now()
@@ -220,7 +224,9 @@ class NoopSessionStore:
                 "usage_id": usage_id,
                 "created_at": fields.get("created_at") or now,
             }
-        cleaned = {key: value for key, value in fields.items() if value is not None}
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in fields.items() if value is not None}
+        )
         current.update(cleaned)
         current["updated_at"] = now
         self._usage_entries[usage_id] = current
@@ -268,7 +274,9 @@ class NoopSessionStore:
         current = self._audit_events.get(audit_id)
         if current:
             return dict(current)
-        event = {key: value for key, value in event.items() if value is not None}
+        event = sanitize_for_persistence(
+            {key: value for key, value in event.items() if value is not None}
+        )
         event.setdefault("_id", audit_id)
         event.setdefault("audit_id", audit_id)
         self._audit_events[audit_id] = dict(event)
@@ -362,6 +370,7 @@ class NoopSessionStore:
             return None
         events = self._run_events.setdefault(run_id, [])
         seq = len(events) + 1
+        safe_payload = sanitize_for_persistence(payload or {})
         doc = {
             "_id": _doc_id(run_id, seq),
             "run_id": run_id,
@@ -369,16 +378,16 @@ class NoopSessionStore:
             "seq": seq,
             "timestamp": _now(),
             "event_type": event_type,
-            "payload": payload or {},
-            "safe_summary": safe_event_summary(event_type, payload),
+            "payload": safe_payload,
+            "safe_summary": safe_event_summary(event_type, safe_payload),
         }
         events.append(doc)
-        await self._apply_run_event_update(run_id, event_type, payload or {}, seq)
+        await self._apply_run_event_update(run_id, event_type, safe_payload, seq)
         await self._record_audit_from_run_event(
             session_id=session_id,
             run_id=run_id,
             event_type=event_type,
-            payload=payload or {},
+            payload=safe_payload,
         )
         return seq
 
@@ -623,7 +632,9 @@ class MongoSessionStore(NoopSessionStore):
                     "last_active_at": now,
                     "message_count": message_count,
                     "turn_count": turn_count,
-                    "pending_approval": pending_approval or [],
+                    "pending_approval": sanitize_for_persistence(
+                        pending_approval or []
+                    ),
                     "claude_counted": claude_counted,
                     "notification_destinations": notification_destinations or [],
                     "auto_approval_enabled": auto_approval_enabled,
@@ -632,7 +643,9 @@ class MongoSessionStore(NoopSessionStore):
                     "cloud_provider": cloud_provider,
                     "training_goal": training_goal,
                     "output_policy": output_policy,
-                    "uploaded_datasets": uploaded_datasets or [],
+                    "uploaded_datasets": sanitize_for_persistence(
+                        uploaded_datasets or []
+                    ),
                 },
             },
             upsert=True,
@@ -757,6 +770,7 @@ class MongoSessionStore(NoopSessionStore):
     async def update_session_fields(self, session_id: str, **fields: Any) -> None:
         if not self._ready() or not fields:
             return
+        fields = sanitize_for_persistence(fields)
         fields["updated_at"] = _now()
         await self.db.sessions.update_one({"_id": session_id}, {"$set": fields})
 
@@ -780,13 +794,14 @@ class MongoSessionStore(NoopSessionStore):
             return None
         try:
             seq = await self._next_seq(f"event:{session_id}")
+            safe_data = sanitize_for_persistence(data or {})
             await self.db.session_events.insert_one(
                 {
                     "_id": _doc_id(session_id, seq),
                     "session_id": session_id,
                     "seq": seq,
                     "event_type": event_type,
-                    "data": data or {},
+                    "data": safe_data,
                     "created_at": _now(),
                 }
             )
@@ -795,7 +810,7 @@ class MongoSessionStore(NoopSessionStore):
                     run_id=run_id,
                     session_id=session_id,
                     event_type=event_type,
-                    payload=data or {},
+                    payload=safe_data,
                 )
             return seq
         except PyMongoError as e:
@@ -861,7 +876,9 @@ class MongoSessionStore(NoopSessionStore):
     async def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
         if not self._ready():
             return await super().update_run(run_id, **fields)
-        fields = {k: v for k, v in fields.items() if v is not None}
+        fields = sanitize_for_persistence(
+            {k: v for k, v in fields.items() if v is not None}
+        )
         fields["updated_at"] = _now()
         doc = await self.db.runs.find_one_and_update(
             {"_id": run_id},
@@ -887,7 +904,9 @@ class MongoSessionStore(NoopSessionStore):
         if not self._ready():
             return await super().upsert_usage_entry(usage_id, fields)
         now = _now()
-        cleaned = {key: value for key, value in fields.items() if value is not None}
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in fields.items() if value is not None}
+        )
         cleaned["usage_id"] = usage_id
         cleaned["updated_at"] = now
         doc = await self.db.usage_entries.find_one_and_update(
@@ -951,7 +970,9 @@ class MongoSessionStore(NoopSessionStore):
         audit_id = str(event.get("audit_id") or event.get("_id") or "")
         if not audit_id:
             return None
-        cleaned = {key: value for key, value in event.items() if value is not None}
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in event.items() if value is not None}
+        )
         cleaned["_id"] = audit_id
         cleaned["audit_id"] = audit_id
         try:
@@ -1059,6 +1080,7 @@ class MongoSessionStore(NoopSessionStore):
             )
         try:
             seq = await self._next_seq(f"run_event:{run_id}")
+            safe_payload = sanitize_for_persistence(payload or {})
             doc = {
                 "_id": _doc_id(run_id, seq),
                 "run_id": run_id,
@@ -1066,19 +1088,19 @@ class MongoSessionStore(NoopSessionStore):
                 "seq": seq,
                 "timestamp": _now(),
                 "event_type": event_type,
-                "payload": payload or {},
-                "safe_summary": safe_event_summary(event_type, payload),
+                "payload": safe_payload,
+                "safe_summary": safe_event_summary(event_type, safe_payload),
                 "schema_version": SCHEMA_VERSION,
             }
             await self.db.run_events.insert_one(doc)
             await self._apply_persisted_run_event_update(
-                run_id, event_type, payload or {}, seq
+                run_id, event_type, safe_payload, seq
             )
             await self._record_audit_from_run_event(
                 session_id=session_id,
                 run_id=run_id,
                 event_type=event_type,
-                payload=payload or {},
+                payload=safe_payload,
             )
             return seq
         except PyMongoError as e:

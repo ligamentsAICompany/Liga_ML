@@ -16,6 +16,7 @@ import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflig
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
+import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
 import type { OutputPolicy, TrainingGoal } from '@/types/agent';
 import type { UIMessage } from 'ai';
 
@@ -25,16 +26,8 @@ import type { UIMessage } from 'ai';
 type DynamicToolPart = Extract<UIMessage['parts'][number], { type: 'dynamic-tool' }>;
 
 type ToolPartState = DynamicToolPart['state'];
-const SECRET_KEY_PATTERN = /token|secret|password|credential|private_key/i;
-
 function maskSensitiveParameters(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(maskSensitiveParameters);
-  if (!value || typeof value !== 'object') return value;
-  const masked: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    masked[key] = SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : maskSensitiveParameters(entry);
-  }
-  return masked;
+  return redactJsonLike(value);
 }
 
 /** Check if a tool part was cancelled (output-error with cancellation message). */
@@ -548,7 +541,7 @@ function InlineApproval({
 
   const handleScriptClick = useCallback(() => {
     if (toolName === 'hf_jobs' && args?.script) {
-      const scriptContent = getEditedScript(toolCallId) || String(args.script);
+      const scriptContent = redactText(getEditedScript(toolCallId) || String(args.script));
       setPanel(
         { title: scriptLabel, script: { content: scriptContent, language: 'python' }, parameters: { tool_call_id: toolCallId } },
         'script',
@@ -570,7 +563,7 @@ function InlineApproval({
       const awsPanel = createAwsSageMakerRunPanel(args);
       if (!awsPanel) return;
       setPanel(
-        { ...awsPanel.data, parameters: { ...args, tool_call_id: toolCallId } },
+        { ...awsPanel.data, parameters: redactJsonLike({ ...args, tool_call_id: toolCallId }) as Record<string, unknown> },
         awsPanel.view,
         awsPanel.editable,
       );
@@ -698,7 +691,7 @@ function InlineApproval({
                   wordBreak: 'break-all',
                 }}
               >
-                {String(args.script).trim()}
+                {redactText(String(args.script)).trim()}
               </Box>
               <Typography
                 variant="caption"
@@ -1072,12 +1065,12 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       if (tool.toolName === 'hf_jobs' && args?.script) {
         const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
         const hasOutput = (tool.state === 'output-available' || tool.state === 'output-error') && jobOutput;
-        const scriptContent = getEditedScript(tool.toolCallId) || String(args.script);
+        const scriptContent = redactText(getEditedScript(tool.toolCallId) || String(args.script));
         setPanel(
           {
             title: displayName,
             script: { content: scriptContent, language: 'python' },
-            ...(hasOutput ? { output: { content: String(jobOutput), language: 'markdown' } } : {}),
+            ...(hasOutput ? { output: { content: redactText(String(jobOutput)), language: 'markdown' } } : {}),
             parameters: { tool_call_id: tool.toolCallId },
           },
           hasOutput ? 'output' : 'script',
@@ -1105,7 +1098,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 : vertexPanel.data.output
                   ? { output: vertexPanel.data.output }
                   : {}),
-              parameters: { ...args, tool_call_id: tool.toolCallId },
+              parameters: redactJsonLike({ ...args, tool_call_id: tool.toolCallId }) as Record<string, unknown>,
             },
             outputContent && tool.state === 'output-error' ? 'output' : vertexPanel.view,
             false,
@@ -1120,7 +1113,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
-              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+              input: { content: redactedJsonString(args), language: 'json' },
             },
             'output',
           );
@@ -1148,7 +1141,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 : awsPanel.data.output
                   ? { output: awsPanel.data.output }
                   : {}),
-              parameters: { ...args, tool_call_id: tool.toolCallId },
+              parameters: redactJsonLike({ ...args, tool_call_id: tool.toolCallId }) as Record<string, unknown>,
             },
             outputContent && tool.state === 'output-error' ? 'output' : awsPanel.view,
             false,
@@ -1163,7 +1156,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
-              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+              input: { content: redactedJsonString(args), language: 'json' },
             },
             'output',
           );
@@ -1180,14 +1173,14 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         return;
       }
 
-      const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
+      const inputSection = args ? { content: redactedJsonString(args), language: 'json' } : undefined;
 
       const hasCompleted = tool.state === 'output-available' || tool.state === 'output-error' || tool.state === 'output-denied';
 
       if (outputText) {
         // Tool has output - show it (regardless of state)
         let language = 'text';
-        const content = String(outputText);
+        const content = redactText(String(outputText));
         if (content.trim().startsWith('{') || content.trim().startsWith('[')) language = 'json';
         else if (content.includes('```')) language = 'markdown';
 
@@ -1199,7 +1192,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       } else if (hasCompleted && args) {
         // Tool completed but has no output - show input as fallback
-        setPanel({ title: displayName, output: { content: JSON.stringify(args, null, 2), language: 'json' }, input: inputSection }, 'output');
+        setPanel({ title: displayName, output: { content: redactedJsonString(args), language: 'json' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       } else if (args) {
         const runningMessages = [
@@ -1271,8 +1264,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const urlMatch = output.match(/\*\*View at:\*\*\s*(https:\/\/[^\s\n]+)/);
     const statusMatch = output.match(/\*\*Final Status:\*\*\s*([^\n]+)/);
     return {
-      jobUrl: urlMatch?.[1],
-      jobStatus: statusMatch?.[1]?.trim(),
+      jobUrl: urlMatch?.[1] ? redactText(urlMatch[1]) : undefined,
+      jobStatus: statusMatch?.[1] ? redactText(statusMatch[1].trim()) : undefined,
     };
   }
 
@@ -1282,9 +1275,9 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const jobMatch = output.match(/\*\*Job:\*\*\s*([^\n]+)/);
     const outputDirMatch = output.match(/\*\*Output dir:\*\*\s*([^\n]+)/);
     return {
-      jobUrl: urlMatch?.[1],
-      jobName: jobMatch?.[1]?.trim(),
-      outputDir: outputDirMatch?.[1]?.trim(),
+      jobUrl: urlMatch?.[1] ? redactText(urlMatch[1]) : undefined,
+      jobName: jobMatch?.[1] ? redactText(jobMatch[1].trim()) : undefined,
+      outputDir: outputDirMatch?.[1] ? redactText(outputDirMatch[1].trim()) : undefined,
     };
   }
 
@@ -1296,11 +1289,11 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const outputMatch = output.match(/\*\*S3 output URI:\*\*\s*`?([^`\n]+)`?/);
     const artifactMatch = output.match(/\*\*S3 model artifact:\*\*\s*`?([^`\n]+)`?/);
     return {
-      jobUrl: consoleMatch?.[1],
-      jobName: jobMatch?.[1]?.trim(),
-      s3OutputUri: outputMatch?.[1]?.trim(),
-      s3ModelArtifact: artifactMatch?.[1]?.trim(),
-      cloudWatchLogsUrl: logsMatch?.[1],
+      jobUrl: consoleMatch?.[1] ? redactText(consoleMatch[1]) : undefined,
+      jobName: jobMatch?.[1] ? redactText(jobMatch[1].trim()) : undefined,
+      s3OutputUri: outputMatch?.[1] ? redactText(outputMatch[1].trim()) : undefined,
+      s3ModelArtifact: artifactMatch?.[1] ? redactText(artifactMatch[1].trim()) : undefined,
+      cloudWatchLogsUrl: logsMatch?.[1] ? redactText(logsMatch[1]) : undefined,
     };
   }
 

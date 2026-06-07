@@ -23,6 +23,7 @@ from typing import Any
 from huggingface_hub import HfApi, SpaceHardware
 
 from agent.core.hub_artifacts import wrap_shell_command_with_hub_artifact_bootstrap
+from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.tools.sandbox_client import Sandbox
 from agent.tools.trackio_seed import ensure_trackio_dashboard
@@ -69,9 +70,10 @@ def _session_tool_logger(
     loop = asyncio.get_running_loop()
 
     def _log(msg: str) -> None:
+        safe_msg = sanitize_for_frontend(str(msg))
         loop.call_soon_threadsafe(
             event_queue.put_nowait,
-            Event(event_type="tool_log", data={"tool": tool, "log": msg}),
+            Event(event_type="tool_log", data={"tool": tool, "log": safe_msg}),
         )
 
     return _log
@@ -342,7 +344,7 @@ async def _create_sandbox_locked(
 
     watcher_task = asyncio.create_task(_watch_cancel())
 
-    secrets: dict[str, str] = {"HF_TOKEN": token}
+    secrets: dict[str, str] = {}
     if extra_secrets:
         secrets.update({k: v for k, v in extra_secrets.items() if v})
 
@@ -748,16 +750,16 @@ def _make_tool_handler(sandbox_tool_name: str):
                 }
             result = await asyncio.to_thread(sb.call_tool, sandbox_tool_name, args)
             if result.success:
-                output = result.output or "(no output)"
+                output = sanitize_for_frontend(result.output or "(no output)")
                 return output, True
             else:
-                error_msg = result.error or "Unknown error"
-                output = result.output
+                error_msg = sanitize_for_frontend(result.error or "Unknown error")
+                output = sanitize_for_frontend(result.output)
                 if output:
                     return f"{output}\n\nERROR: {error_msg}", False
                 return f"ERROR: {error_msg}", False
         except Exception as e:
-            return f"Sandbox operation failed: {e}", False
+            return f"Sandbox operation failed: {sanitize_for_frontend(str(e))}", False
 
     return handler
 

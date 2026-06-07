@@ -86,12 +86,14 @@ than inferred from credentials.
 
 ## Security
 
-Usage responses are read-only and redact secret-like metadata keys. They do not
-include provider tokens, OAuth tokens, MongoDB URIs, AWS credentials, GCP
-credential files, or payment data.
+Usage responses are read-only and pass through the shared redaction policy before
+persistence and frontend rendering. They do not include provider tokens, OAuth
+tokens, MongoDB URIs, AWS credentials, GCP credential files, authorization
+headers, or payment data.
 
 Audit timeline responses apply the same privacy posture before persistence and
-do not add external observability or billing integrations.
+do not add external observability or billing integrations. See
+`docs/security-hardening.md` for the complete Phase 4 secret handling contract.
 
 ## Future Work
 

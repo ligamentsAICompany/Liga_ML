@@ -15,6 +15,7 @@ from urllib.parse import quote
 from agent.core.aws_dataset_staging import stage_hf_dataset_to_s3
 from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
 from agent.core.cost_estimation import estimate_aws_sagemaker_job_cost
+from agent.core.redact import redact_text, sanitize_for_frontend
 from agent.core.session import Event
 from agent.tools.types import ToolResult
 from agent.training_templates.aws_sft import (
@@ -160,17 +161,7 @@ def _json_value(value: Any) -> str:
 
 
 def _safe_log_message(message: Any) -> str:
-    text = str(message)
-    redactions = [
-        (r"(?i)(aws_secret_access_key\s*=\s*)\S+", r"\1[redacted]"),
-        (r"(?i)(aws_session_token\s*=\s*)\S+", r"\1[redacted]"),
-        (r"(?i)(hf_token\s*=\s*)\S+", r"\1[redacted]"),
-        (r"(?i)(huggingface_hub_token\s*=\s*)\S+", r"\1[redacted]"),
-        (r"AKIA[0-9A-Z]{16}", "[redacted-access-key]"),
-    ]
-    for pattern, replacement in redactions:
-        text = re.sub(pattern, replacement, text)
-    return text
+    return redact_text(str(message))
 
 
 def _aws_error_code(exc: Exception) -> str:
@@ -660,23 +651,26 @@ class AwsSageMakerJobsTool:
             result_json.get("dataset_source") or result_json.get("dataset_name") or ""
         )
         return [
-            f"LIGA_TRAINING_STATUS={map_sagemaker_status(status)}",
-            "LIGA_PROVIDER=aws-sagemaker",
-            f"LIGA_AWS_TRAINING_JOB_NAME={job_name}",
-            f"LIGA_AWS_REGION={region}",
-            f"LIGA_S3_MODEL_ARTIFACT={model_artifact or ''}",
-            f"LIGA_S3_OUTPUT_DIR={output_uri or ''}",
-            f"LIGA_CLOUDWATCH_LOGS_URL={logs_url}",
-            f"LIGA_OUTPUT_POLICY={result_json.get('output_policy', '')}",
-            f"LIGA_DATASET_SOURCE={dataset}",
-            f"LIGA_TRAIN_ROWS={result_json.get('train_rows', '')}",
-            f"LIGA_EVAL_ROWS={result_json.get('eval_rows', '')}",
-            "LIGA_AWS_INSTANCE_TYPE="
-            f"{result_json.get('instance_type') or resource_config.get('InstanceType') or ''}",
-            "LIGA_AWS_INSTANCE_COUNT="
-            f"{result_json.get('instance_count') or resource_config.get('InstanceCount') or ''}",
-            f"LIGA_EVAL_RESULT_JSON={_compact_json(metrics)}",
-            "LIGA_RESULT_FILE=liga_training_result.json",
+            redact_text(line)
+            for line in [
+                f"LIGA_TRAINING_STATUS={map_sagemaker_status(status)}",
+                "LIGA_PROVIDER=aws-sagemaker",
+                f"LIGA_AWS_TRAINING_JOB_NAME={job_name}",
+                f"LIGA_AWS_REGION={region}",
+                f"LIGA_S3_MODEL_ARTIFACT={model_artifact or ''}",
+                f"LIGA_S3_OUTPUT_DIR={output_uri or ''}",
+                f"LIGA_CLOUDWATCH_LOGS_URL={logs_url}",
+                f"LIGA_OUTPUT_POLICY={result_json.get('output_policy', '')}",
+                f"LIGA_DATASET_SOURCE={dataset}",
+                f"LIGA_TRAIN_ROWS={result_json.get('train_rows', '')}",
+                f"LIGA_EVAL_ROWS={result_json.get('eval_rows', '')}",
+                "LIGA_AWS_INSTANCE_TYPE="
+                f"{result_json.get('instance_type') or resource_config.get('InstanceType') or ''}",
+                "LIGA_AWS_INSTANCE_COUNT="
+                f"{result_json.get('instance_count') or resource_config.get('InstanceCount') or ''}",
+                f"LIGA_EVAL_RESULT_JSON={_compact_json(metrics)}",
+                "LIGA_RESULT_FILE=liga_training_result.json",
+            ]
         ]
 
     def _completed_job_result_summary(
@@ -1091,27 +1085,31 @@ class AwsSageMakerJobsTool:
             await send_event(
                 Event(
                     event_type="tool_state_change",
-                    data={
-                        "tool_call_id": self.tool_call_id,
-                        "tool": "aws_sagemaker_jobs",
-                        "state": state,
-                        "jobName": job_name,
-                        "jobUrl": job_url,
-                        **({"s3TrainUri": s3_train_uri} if s3_train_uri else {}),
-                        **({"s3OutputUri": s3_output_uri} if s3_output_uri else {}),
-                        **(
-                            {"s3ModelArtifact": s3_model_artifact}
-                            if s3_model_artifact
-                            else {}
-                        ),
-                        **(
-                            {"cloudWatchLogsUrl": cloudwatch_logs_url}
-                            if cloudwatch_logs_url
-                            else {}
-                        ),
-                        **({"region": region} if region else {}),
-                        **({"outputPolicy": output_policy} if output_policy else {}),
-                    },
+                    data=sanitize_for_frontend(
+                        {
+                            "tool_call_id": self.tool_call_id,
+                            "tool": "aws_sagemaker_jobs",
+                            "state": state,
+                            "jobName": job_name,
+                            "jobUrl": job_url,
+                            **({"s3TrainUri": s3_train_uri} if s3_train_uri else {}),
+                            **({"s3OutputUri": s3_output_uri} if s3_output_uri else {}),
+                            **(
+                                {"s3ModelArtifact": s3_model_artifact}
+                                if s3_model_artifact
+                                else {}
+                            ),
+                            **(
+                                {"cloudWatchLogsUrl": cloudwatch_logs_url}
+                                if cloudwatch_logs_url
+                                else {}
+                            ),
+                            **({"region": region} if region else {}),
+                            **(
+                                {"outputPolicy": output_policy} if output_policy else {}
+                            ),
+                        }
+                    ),
                 )
             )
         except Exception:
@@ -1135,7 +1133,7 @@ class AwsSageMakerJobsTool:
     @staticmethod
     def _error(message: str) -> ToolResult:
         return {
-            "formatted": message,
+            "formatted": redact_text(message),
             "totalResults": 0,
             "resultsShared": 0,
             "isError": True,

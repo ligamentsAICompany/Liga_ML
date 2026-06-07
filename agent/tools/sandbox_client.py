@@ -47,6 +47,8 @@ from typing import Any, Callable
 import httpx
 from huggingface_hub import CommitOperationAdd, HfApi
 
+from agent.core.redact import SECRET_KEY_RE, redact_text
+
 TEMPLATE_SPACE = "burtenshaw/sandbox"
 HARDWARE_OPTIONS = [
     "cpu-basic",
@@ -66,6 +68,17 @@ WAIT_TIMEOUT = 600
 WAIT_INTERVAL = 5
 API_WAIT_TIMEOUT = 180
 CPU_BASIC_HARDWARE = "cpu-basic"
+DANGEROUS_SANDBOX_SECRET_KEYS = {
+    "HF_TOKEN",
+    "HUGGINGFACE_HUB_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "MONGODB_URI",
+}
 
 
 def _is_transient_space_visibility_error(error: Exception) -> bool:
@@ -610,7 +623,7 @@ class Sandbox:
         space_id = f"{owner}/{base}-{suffix}"
         sandbox_api_token = secrets_lib.token_urlsafe(32)
 
-        _log(f"Creating sandbox: {space_id} (from {template})...")
+        _log(redact_text(f"Creating sandbox: {space_id} (from {template})..."))
 
         kwargs = {
             "from_id": template,
@@ -646,7 +659,16 @@ class Sandbox:
         # Inject secrets BEFORE uploading server files (which triggers rebuild).
         # Secrets added after a Space is running aren't available until restart,
         # so they must be set before the build/start cycle.
-        sandbox_secrets = {**(secrets or {}), "SANDBOX_API_TOKEN": sandbox_api_token}
+        safe_requested_secrets = {
+            str(key): val
+            for key, val in (secrets or {}).items()
+            if str(key).upper() not in DANGEROUS_SANDBOX_SECRET_KEYS
+            and not SECRET_KEY_RE.search(str(key))
+        }
+        sandbox_secrets = {
+            **safe_requested_secrets,
+            "SANDBOX_API_TOKEN": sandbox_api_token,
+        }
         if sandbox_secrets:
             for key, val in sandbox_secrets.items():
                 api.add_space_secret(space_id, key, val)

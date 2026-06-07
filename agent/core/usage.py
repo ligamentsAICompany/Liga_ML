@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Iterable, Literal
 
+from agent.core.redact import SECRET_KEY_RE, redact_text
+
 UsageProvider = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker", "llm", "unknown"]
 
 PROVIDER_BY_TOOL = {
@@ -38,10 +40,6 @@ TERMINAL_STATES = {
     "cancelled",
     "rejected",
 }
-SECRET_KEY_RE = re.compile(
-    r"(token|secret|password|credential|api[_-]?key|access[_-]?key|private[_-]?key)",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
@@ -125,6 +123,7 @@ def sanitize_metadata(value: Any, *, depth: int = 0) -> Any:
         for key, item in value.items():
             key_text = str(key)
             if SECRET_KEY_RE.search(key_text):
+                clean[key_text] = "[REDACTED]"
                 continue
             sanitized = sanitize_metadata(item, depth=depth + 1)
             if sanitized is not None:
@@ -139,12 +138,13 @@ def sanitize_metadata(value: Any, *, depth: int = 0) -> Any:
             if item is not None
         ]
     if isinstance(value, str):
-        if SECRET_KEY_RE.search(value) or len(value) > 2000:
-            return value[:200] if not SECRET_KEY_RE.search(value) else "[redacted]"
-        return value
+        redacted = redact_text(value)
+        if len(redacted) > 2000:
+            return redacted[:200]
+        return redacted
     if isinstance(value, int | float | bool) or value is None:
         return value
-    return str(value)[:500]
+    return redact_text(str(value))[:500]
 
 
 def _float_or_none(value: Any) -> float | None:

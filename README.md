@@ -79,6 +79,11 @@ approval, provider job, result, usage, and error history. It uses the same
 durable run/usage records, redacts secret-like metadata, and does not export to
 external observability vendors. See [`docs/audit-timeline.md`](docs/audit-timeline.md).
 
+Production/client deployments use a shared redaction policy for backend
+persistence and frontend rendering, private-by-default sandboxes, and safe
+security health diagnostics. See
+[`docs/security-hardening.md`](docs/security-hardening.md).
+
 ### Usage
 
 **Interactive mode** (start a chat session):

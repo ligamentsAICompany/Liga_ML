@@ -205,6 +205,34 @@ async def test_in_memory_run_events_replay_from_sequence():
 
 
 @pytest.mark.asyncio
+async def test_in_memory_run_events_sanitize_secret_payloads():
+    from agent.core.session_persistence import NoopSessionStore
+
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s1", provider="hf-jobs")
+    run_id = run["run_id"]
+
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s1",
+        event_type="tool_output",
+        payload={
+            "tool": "bash",
+            "output": "HF_TOKEN=hf_" + "A" * 35,
+            "headers": {"Authorization": "Bearer " + "b" * 32},
+        },
+    )
+
+    replay = await store.load_run_events_after(run_id, 0)
+    serialized = str(replay)
+
+    assert "hf_" not in serialized
+    assert "Bearer b" not in serialized
+    assert replay[-1]["payload"]["output"] == "HF_TOKEN=[REDACTED]"
+    assert replay[-1]["payload"]["headers"]["Authorization"] == "Bearer [REDACTED]"
+
+
+@pytest.mark.asyncio
 async def test_approval_pending_and_provider_metadata_survive_replay():
     from agent.core.session_persistence import NoopSessionStore
 

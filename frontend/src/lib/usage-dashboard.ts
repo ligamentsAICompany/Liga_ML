@@ -1,4 +1,5 @@
 import type { UsageEntry, UsageProviderId, UsageSummary } from '../types/usage.js';
+import { redactJsonLike, redactText } from './redaction.js';
 
 export const PROVIDER_LABELS: Record<UsageProviderId, string> = {
   'hf-jobs': 'HF Jobs',
@@ -44,14 +45,15 @@ function readinessFor(summary: UsageSummary, provider: UsageProviderId): { confi
 }
 
 export function buildProviderCards(summary: UsageSummary): ProviderUsageCard[] {
-  const entries = summary.recent_usage_entries || [];
+  const safeSummary = redactJsonLike(summary);
+  const entries = safeSummary.recent_usage_entries || [];
   return (['hf-jobs', 'gcp-vertex', 'aws-sagemaker', 'llm'] as UsageProviderId[]).map((provider) => {
-    const cost = summary.cost_by_provider?.[provider];
-    const readiness = readinessFor(summary, provider);
+    const cost = safeSummary.cost_by_provider?.[provider];
+    const readiness = readinessFor(safeSummary, provider);
     const providerWarnings = [
       ...readiness.warnings,
-      ...summary.budget_warnings.filter((item) => item.provider === provider).map((item) => item.message || ''),
-      ...summary.quota_warnings.filter((item) => item.provider === provider).map((item) => item.message || ''),
+      ...safeSummary.budget_warnings.filter((item) => item.provider === provider).map((item) => item.message || ''),
+      ...safeSummary.quota_warnings.filter((item) => item.provider === provider).map((item) => item.message || ''),
     ].filter(Boolean);
     return {
       provider,
@@ -67,5 +69,5 @@ export function buildProviderCards(summary: UsageSummary): ProviderUsageCard[] {
 }
 
 export function usageEntryTitle(entry: UsageEntry): string {
-  return entry.job_id || entry.run_id || entry.approval_id || entry.usage_id;
+  return redactText(entry.job_id || entry.run_id || entry.approval_id || entry.usage_id);
 }

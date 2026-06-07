@@ -1,3 +1,5 @@
+import { redactJsonLike, redactText } from '../lib/redaction.js';
+
 export interface TrainingResult {
   status?: string;
   provider?: 'gcp-vertex' | 'hf-jobs' | 'aws-sagemaker' | string;
@@ -51,7 +53,7 @@ function markerValue(output: string, marker: string): string | undefined {
   while ((match = pattern.exec(output)) !== null) {
     value = match[1]?.trim();
   }
-  return value || undefined;
+  return value ? redactText(value) : undefined;
 }
 
 function cleanUrl(value: string | undefined): string | undefined {
@@ -63,7 +65,7 @@ function parseEvalResult(value: string | undefined): Record<string, unknown> | n
   try {
     const parsed: unknown = JSON.parse(value);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
+      return redactJsonLike(parsed as Record<string, unknown>);
     }
     return null;
   } catch {

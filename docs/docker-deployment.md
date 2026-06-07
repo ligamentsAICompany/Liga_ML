@@ -42,6 +42,8 @@ curl http://localhost:8080/
 `/api/health` is a local liveness check. `/api/health/providers` reports
 non-secret readiness for Hugging Face Jobs, Google Cloud Vertex AI, and AWS
 SageMaker AI without launching training jobs.
+`/api/health.security` reports only booleans for redaction, sandbox privacy, and
+token-encryption readiness; it never returns credential values.
 
 ## Required Environment Variables
 
@@ -157,6 +159,11 @@ local development only.
 If the app needs a Hugging Face token inside Vertex jobs, use
 `HF_TOKEN_SECRET_RESOURCE` or Secret Manager-backed environment injection rather
 than writing the token into the repository or image.
+
+Sandbox Spaces are private by default and block default injection of provider
+credentials such as HF/OpenAI tokens, AWS keys, Google credential paths, and
+MongoDB URIs. See `docs/security-hardening.md` for the full redaction and
+sandbox contract.
 
 ## Cloud Run Notes
 

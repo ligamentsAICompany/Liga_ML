@@ -16,6 +16,7 @@ from litellm import Message
 from agent.config import Config
 from agent.context_manager.manager import ContextManager
 from agent.core.background_runs import background_runs_in_process
+from agent.core.redact import sanitize_for_frontend, sanitize_for_persistence
 from agent.messaging.gateway import NotificationGateway
 from agent.messaging.models import NotificationRequest
 
@@ -167,12 +168,19 @@ class Session:
 
     async def send_event(self, event: Event) -> None:
         """Send event back to client and log to trajectory"""
+        frontend_data = (
+            sanitize_for_frontend(event.data) if event.data is not None else None
+        )
+        persistence_data = (
+            sanitize_for_persistence(event.data) if event.data is not None else None
+        )
+        event.data = frontend_data
         # Log event to trajectory
         self.logged_events.append(
             {
                 "timestamp": datetime.now().isoformat(),
                 "event_type": event.event_type,
-                "data": event.data,
+                "data": persistence_data,
             }
         )
         if self.persistence_store is not None and background_runs_in_process():
@@ -180,7 +188,7 @@ class Session:
                 event.seq = await self.persistence_store.append_event(
                     self.session_id,
                     event.event_type,
-                    event.data,
+                    persistence_data,
                     run_id=self.current_run_id,
                 )
             except Exception as e:
@@ -536,11 +544,9 @@ class Session:
             # tokens on disk — a log aggregator, crash dump, or filesystem
             # snapshot between heartbeats would otherwise leak them.
             try:
-                from agent.core.redact import scrub
-
                 for key in ("messages", "events", "tools"):
                     if key in trajectory:
-                        trajectory[key] = scrub(trajectory[key])
+                        trajectory[key] = sanitize_for_persistence(trajectory[key])
             except Exception as _e:
                 logger.debug("Redact-on-save failed (non-fatal): %s", _e)
 

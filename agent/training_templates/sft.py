@@ -156,7 +156,7 @@ if not HF_TOKEN and HF_TOKEN_SECRET_RESOURCE:
     except Exception as exc:
         print(
             "Warning: HF_TOKEN_SECRET_RESOURCE could not be read; continuing without injected HF token. "
-            f"{{type(exc).__name__}}: {{exc}}",
+            f"{{type(exc).__name__}}",
             flush=True,
         )
 if PUSH_TO_HUB and not HF_TOKEN:

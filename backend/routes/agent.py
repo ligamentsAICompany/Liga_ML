@@ -45,6 +45,7 @@ from models import (
     LLMHealthResponse,
     RunEventInfo,
     RunSummary,
+    SecurityHealth,
     SessionInfo,
     SessionNotificationsRequest,
     SessionResponse,
@@ -75,6 +76,7 @@ from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
 from agent.core.usage import usage_dashboard_enabled
@@ -266,6 +268,18 @@ def _user_hf_token(user: dict[str, Any] | None) -> str | None:
     return user.get(INTERNAL_HF_TOKEN_KEY)
 
 
+def security_health() -> SecurityHealth:
+    token_encryption_configured = bool(os.environ.get("SESSION_TOKEN_ENCRYPTION_KEY"))
+    return SecurityHealth(
+        redaction_enabled=True,
+        sandbox_private_default=True,
+        secret_persistence_allowed=False,
+        token_encryption_configured=token_encryption_configured,
+        encrypted_handoff_enabled=token_encryption_configured
+        and background_runs_in_process(),
+    )
+
+
 def _reject_oversize_dataset_upload(request: Request) -> None:
     raw_content_length = request.headers.get("content-length")
     if raw_content_length is None:
@@ -365,6 +379,7 @@ async def health_check() -> HealthResponse:
         background_runs=background_run_status(store_status),
         usage_store=usage_store_status(),
         audit_store=audit_store_health(),
+        security=security_health(),
         cloud_run_revision=os.environ.get("K_REVISION"),
     )
 
@@ -404,11 +419,13 @@ def _serialize_usage_entry(entry: dict[str, Any]) -> dict[str, Any]:
             else (str(value) if value else None)
         )
 
-    return {
-        key: (iso(value) if key.endswith("_at") else value)
-        for key, value in entry.items()
-        if key not in {"_id", "schema_version"}
-    }
+    return sanitize_for_frontend(
+        {
+            key: (iso(value) if key.endswith("_at") else value)
+            for key, value in entry.items()
+            if key not in {"_id", "schema_version"}
+        }
+    )
 
 
 def _serialize_audit_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -419,12 +436,24 @@ def _serialize_audit_event(event: dict[str, Any]) -> dict[str, Any]:
             else (str(value) if value else None)
         )
 
-    return {
-        key: (iso(value) if key in {"timestamp", "created_at", "updated_at"} else value)
-        for key, value in event.items()
-        if key
-        not in {"_id", "schema_version", "idempotency_key", "created_at", "updated_at"}
-    }
+    return sanitize_for_frontend(
+        {
+            key: (
+                iso(value)
+                if key in {"timestamp", "created_at", "updated_at"}
+                else value
+            )
+            for key, value in event.items()
+            if key
+            not in {
+                "_id",
+                "schema_version",
+                "idempotency_key",
+                "created_at",
+                "updated_at",
+            }
+        }
+    )
 
 
 def _audit_filters(
@@ -593,6 +622,7 @@ async def provider_health() -> dict[str, Any]:
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
         "session_store": session_store_status(session_manager.persistence_store),
         "audit_store": audit_store_health().model_dump(),
+        "security": security_health().model_dump(),
     }
 
 

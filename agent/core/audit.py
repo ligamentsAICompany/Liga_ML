@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from agent.core.redact import redact_text
 from agent.core.usage import (
     budget_warning_for,
     normalize_provider,
@@ -53,11 +53,6 @@ AUDIT_CATEGORIES: set[str] = {
 }
 AUDIT_SEVERITIES: set[str] = {"info", "warning", "error", "critical"}
 AUDIT_ACTORS: set[str] = {"user", "assistant", "system", "provider", "admin"}
-SECRET_VALUE_RE = re.compile(
-    r"(hf_[A-Za-z0-9]{8,}|sk-[A-Za-z0-9_-]{8,}|"
-    r"(token|secret|password|api[_-]?key|access[_-]?key)\s*[=:])",
-    re.IGNORECASE,
-)
 PROVIDER_TOOL_NAMES = {
     "hf_jobs": "hf-jobs",
     "gcp_vertex_jobs": "gcp-vertex",
@@ -122,7 +117,7 @@ def _redact_secret_values(value: Any) -> Any:
             if (redacted := _redact_secret_values(item)) is not None
         ]
     if isinstance(value, str):
-        return "[redacted]" if SECRET_VALUE_RE.search(value) else value[:2000]
+        return redact_text(value)[:2000]
     return value
 
 
@@ -130,9 +125,7 @@ def _safe_text(value: Any, limit: int = 500) -> str | None:
     if value in (None, ""):
         return None
     text = str(value)
-    if SECRET_VALUE_RE.search(text):
-        return "[redacted]"
-    return text[:limit]
+    return redact_text(text)[:limit]
 
 
 def _audit_hash(parts: list[Any]) -> str:

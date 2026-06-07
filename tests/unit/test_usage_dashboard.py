@@ -188,9 +188,13 @@ def test_usage_metadata_redacts_secrets():
         }
     )
 
-    assert sanitized == {"nested": {}, "safe": "ok"}
+    assert sanitized == {
+        "HF_TOKEN": "[REDACTED]",
+        "nested": {"aws_secret_access_key": "[REDACTED]"},
+        "safe": "ok",
+    }
     assert "hf_secret" not in str(sanitized)
-    assert "secret" not in str(sanitized)
+    assert "'secret'" not in str(sanitized)
 
 
 @pytest.mark.asyncio

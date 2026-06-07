@@ -44,7 +44,7 @@ async def test_audit_event_creation_sanitizes_secret_metadata(monkeypatch):
     assert event["audit_id"]
     assert event["category"] == "provider_job"
     assert event["provider"] == "aws-sagemaker"
-    assert event["safe_metadata"] == {"safe": "ok"}
+    assert event["safe_metadata"] == {"HF_TOKEN": "[REDACTED]", "safe": "ok"}
     assert "hf_secret" not in str(event)
 
 
@@ -222,7 +222,10 @@ async def test_audit_api_response_omits_secrets(monkeypatch):
     response = await agent.list_audit(session_id="s1", user={"user_id": "dev"})
     response_payload = response.model_dump()
 
-    assert response_payload["events"][0]["safe_metadata"] == {"rows": 3}
+    assert response_payload["events"][0]["safe_metadata"] == {
+        "OPENAI_API_KEY": "[REDACTED]",
+        "rows": 3,
+    }
     assert "sk-secret" not in str(response_payload).lower()
 
 
@@ -267,7 +270,7 @@ def test_sanitize_audit_metadata_redacts_secret_like_values():
     )
 
     assert sanitized == {
-        "nested": {},
+        "nested": {"token": "[REDACTED]"},
         "safe_url": "https://huggingface.co/jobs/1",
-        "message": "[redacted]",
+        "message": "AWS_SECRET_ACCESS_KEY=[REDACTED]",
     }

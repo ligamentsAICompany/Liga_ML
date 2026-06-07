@@ -33,6 +33,7 @@ import {
 } from '@/lib/audit-timeline';
 import type { AuditEvent, AuditFilters, AuditTimelineResponse } from '@/types/audit';
 import { apiFetch } from '@/utils/api';
+import { redactJsonLike, redactText } from '@/lib/redaction';
 
 const EMPTY_RESPONSE: AuditTimelineResponse = {
   enabled: true,
@@ -53,9 +54,9 @@ export default function AuditTimelineButton() {
     try {
       const res = await apiFetch('/api/audit?limit=200');
       if (!res.ok) throw new Error(`Audit API returned ${res.status}`);
-      setTimeline(await res.json() as AuditTimelineResponse);
+      setTimeline(redactJsonLike(await res.json() as AuditTimelineResponse));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load audit timeline.');
+      setError(redactText(e instanceof Error ? e.message : 'Failed to load audit timeline.'));
     } finally {
       setLoading(false);
     }

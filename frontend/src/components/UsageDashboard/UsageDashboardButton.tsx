@@ -18,6 +18,7 @@ import CloseIcon from '@mui/icons-material/Close';
 import RefreshIcon from '@mui/icons-material/Refresh';
 
 import { buildProviderCards, formatUsd, providerLabel, usageEntryTitle } from '@/lib/usage-dashboard';
+import { redactJsonLike, redactText } from '@/lib/redaction';
 import type { UsageSummary } from '@/types/usage';
 import { apiFetch } from '@/utils/api';
 
@@ -46,9 +47,9 @@ export default function UsageDashboardButton() {
     try {
       const res = await apiFetch('/api/usage/summary?limit=100');
       if (!res.ok) throw new Error(`Usage API returned ${res.status}`);
-      setSummary(await res.json() as UsageSummary);
+      setSummary(redactJsonLike(await res.json() as UsageSummary));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load usage dashboard.');
+      setError(redactText(e instanceof Error ? e.message : 'Failed to load usage dashboard.'));
     } finally {
       setLoading(false);
     }

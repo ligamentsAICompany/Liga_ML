@@ -253,6 +253,16 @@ class AuditStoreHealth(BaseModel):
     warning: str | None = None
 
 
+class SecurityHealth(BaseModel):
+    """Non-secret security hardening status."""
+
+    redaction_enabled: bool = True
+    sandbox_private_default: bool = True
+    secret_persistence_allowed: bool = False
+    token_encryption_configured: bool = False
+    encrypted_handoff_enabled: bool = False
+
+
 class UsageEntry(BaseModel):
     usage_id: str
     session_id: str
@@ -414,6 +424,7 @@ class HealthResponse(BaseModel):
     background_runs: BackgroundRunsHealth | None = None
     usage_store: UsageStoreHealth | None = None
     audit_store: AuditStoreHealth | None = None
+    security: SecurityHealth = Field(default_factory=SecurityHealth)
     cloud_run_revision: str | None = None
 
 

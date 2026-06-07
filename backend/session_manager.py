@@ -14,6 +14,7 @@ from agent.config import load_config
 from agent.core.agent_loop import process_submission
 from agent.core.audit import build_audit_event
 from agent.core.background_runs import RUN_TERMINAL_STATUSES, background_runs_in_process
+from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event, OpType, Session
 from agent.core.session_persistence import get_session_store
 from agent.core.tools import ToolRouter
@@ -406,7 +407,7 @@ class SessionManager:
     @staticmethod
     def _serialize_run(run: dict[str, Any]) -> dict[str, Any]:
         provider_metadata = dict(run.get("provider_metadata") or {})
-        return {
+        payload = {
             "run_id": str(run.get("run_id") or run.get("_id") or ""),
             "session_id": str(run.get("session_id") or ""),
             "status": str(run.get("status") or "queued"),
@@ -450,6 +451,7 @@ class SessionManager:
             "audit_error_count": int(run.get("audit_error_count") or 0),
             "latest_audit_event": run.get("latest_audit_event"),
         }
+        return sanitize_for_frontend(payload)
 
     @staticmethod
     def _usage_totals_for_run(
@@ -517,7 +519,7 @@ class SessionManager:
 
     @staticmethod
     def _serialize_run_event(event: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": str(event.get("run_id") or ""),
             "session_id": str(event.get("session_id") or ""),
             "seq": int(event.get("seq") or 0),
@@ -528,6 +530,7 @@ class SessionManager:
             "payload": event.get("payload") or event.get("data") or {},
             "safe_summary": event.get("safe_summary"),
         }
+        return sanitize_for_frontend(payload)
 
     async def create_run(
         self,

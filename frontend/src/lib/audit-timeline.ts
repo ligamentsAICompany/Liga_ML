@@ -1,6 +1,5 @@
 import type { AuditEvent, AuditFilters } from '../types/audit.js';
-
-const SECRET_RE = /(hf_[A-Za-z0-9]{8,}|sk-[A-Za-z0-9_-]{8,}|token\s*[=:]|secret\s*[=:]|api[_-]?key\s*[=:]|password\s*[=:])/i;
+import { containsSecretLikeValue, redactJsonLike, redactText } from './redaction.js';
 
 export function chronologicalAuditEvents(events: AuditEvent[]): AuditEvent[] {
   return [...events].sort((a, b) => {
@@ -11,12 +10,12 @@ export function chronologicalAuditEvents(events: AuditEvent[]): AuditEvent[] {
 }
 
 export function filterAuditEvents(events: AuditEvent[], filters: AuditFilters): AuditEvent[] {
-  return chronologicalAuditEvents(events).filter((event) => {
+  return chronologicalAuditEvents(events).map(redactAuditEvent).filter((event) => {
     if (filters.provider && event.provider !== filters.provider) return false;
     if (filters.category && event.category !== filters.category) return false;
     if (filters.severity && event.severity !== filters.severity) return false;
     if (filters.status && event.status !== filters.status) return false;
-    return !eventContainsSecret(event);
+    return true;
   });
 }
 
@@ -44,7 +43,7 @@ export function severityColor(severity: string): 'default' | 'info' | 'warning' 
 }
 
 export function auditEventTitle(event: AuditEvent): string {
-  return event.title?.trim() || event.event_type.replace(/_/g, ' ');
+  return redactText(event.title?.trim() || event.event_type.replace(/_/g, ' '));
 }
 
 export function safeAuditLinks(event: AuditEvent): Array<{ label: string; href: string }> {
@@ -69,7 +68,11 @@ export function eventContainsSecret(event: AuditEvent): boolean {
     artifact_url: event.artifact_url,
     safe_metadata: event.safe_metadata,
   };
-  return SECRET_RE.test(JSON.stringify(visible));
+  return containsSecretLikeValue(visible);
+}
+
+export function redactAuditEvent(event: AuditEvent): AuditEvent {
+  return redactJsonLike(event);
 }
 
 export function formatAuditTimestamp(value: string | null | undefined): string {

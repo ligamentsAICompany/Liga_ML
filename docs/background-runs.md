@@ -70,6 +70,11 @@ caches, frontend build output, or generated artifacts.
 - `audit_store.enabled`
 - `audit_store.durable`
 - `audit_store.type`
+- `security.redaction_enabled`
+- `security.sandbox_private_default`
+- `security.secret_persistence_allowed`
+- `security.token_encryption_configured`
+- `security.encrypted_handoff_enabled`
 - `session_store.type`
 - `session_store.durable`
 
@@ -79,6 +84,9 @@ block runs beyond the existing approval policy.
 
 See `docs/audit-timeline.md` for timeline categories, retention settings,
 redaction behavior, and frontend usage.
+
+See `docs/security-hardening.md` for Phase 4 redaction, sandbox privacy, and
+token handoff rules.
 
 ## Limitations
 

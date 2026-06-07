@@ -153,8 +153,7 @@ def test_row_payload_scrubs_messages_events_and_tools(tmp_path):
     assert HF_SECRET not in payload
     assert ANTHROPIC_SECRET not in payload
     assert GITHUB_SECRET not in payload
-    assert "[REDACTED_HF_TOKEN]" in payload
-    assert "[REDACTED_ANTHROPIC_KEY]" in payload
+    assert "[REDACTED]" in payload
     assert "GITHUB_TOKEN=[REDACTED]" in payload
 
 
@@ -199,6 +198,5 @@ def test_claude_code_payload_scrubs_messages_before_conversion(tmp_path):
     assert HF_SECRET not in payload
     assert ANTHROPIC_SECRET not in payload
     assert GITHUB_SECRET not in payload
-    assert "[REDACTED_HF_TOKEN]" in payload
-    assert "[REDACTED_ANTHROPIC_KEY]" in payload
+    assert "[REDACTED]" in payload
     assert "GITHUB_TOKEN=[REDACTED]" in payload
