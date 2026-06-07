@@ -250,6 +250,15 @@ class SessionManager:
         return sanitize_for_frontend(discovery) if isinstance(discovery, dict) else None
 
     @staticmethod
+    def _serialize_training_recommendation(session: Session) -> dict[str, Any] | None:
+        recommendation = getattr(session, "latest_training_recommendation", None)
+        return (
+            sanitize_for_frontend(recommendation)
+            if isinstance(recommendation, dict)
+            else None
+        )
+
+    @staticmethod
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
@@ -445,6 +454,9 @@ class SessionManager:
                 "output_policy": provider_metadata.get("provider_output_policy")
                 or run.get("provider_output_policy"),
                 "last_checked_at": provider_metadata.get("last_checked_at"),
+                "training_recommendation": provider_metadata.get(
+                    "training_recommendation"
+                ),
             },
             "evaluation_id": run.get("evaluation_id"),
             "evaluation_status": run.get("evaluation_status"),
@@ -459,6 +471,7 @@ class SessionManager:
             "audit_error_count": int(run.get("audit_error_count") or 0),
             "latest_audit_event": run.get("latest_audit_event"),
             "dataset_discovery": run.get("dataset_discovery"),
+            "training_recommendation": run.get("training_recommendation"),
         }
         return sanitize_for_frontend(payload)
 
@@ -596,6 +609,35 @@ class SessionManager:
             discovery = run.get("dataset_discovery")
             if isinstance(discovery, dict):
                 return sanitize_for_frontend(discovery)
+        return None
+
+    async def get_run_training_recommendation(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        run = await self.get_run(session_id, run_id)
+        recommendation = (
+            run.get("training_recommendation") if isinstance(run, dict) else None
+        )
+        return (
+            sanitize_for_frontend(recommendation)
+            if isinstance(recommendation, dict)
+            else None
+        )
+
+    async def get_latest_training_recommendation(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            recommendation = self._serialize_training_recommendation(
+                agent_session.session
+            )
+            if recommendation:
+                return recommendation
+        for run in await self.list_runs(session_id):
+            recommendation = run.get("training_recommendation")
+            if isinstance(recommendation, dict):
+                return sanitize_for_frontend(recommendation)
         return None
 
     async def list_usage_entries(self, **filters: Any) -> list[dict[str, Any]]:
@@ -883,6 +925,9 @@ class SessionManager:
                 latest_dataset_discovery=self._serialize_dataset_discovery(
                     agent_session.session
                 ),
+                latest_training_recommendation=(
+                    self._serialize_training_recommendation(agent_session.session)
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -1003,6 +1048,10 @@ class SessionManager:
         ]
         if isinstance(meta.get("latest_dataset_discovery"), dict):
             session.latest_dataset_discovery = dict(meta["latest_dataset_discovery"])
+        if isinstance(meta.get("latest_training_recommendation"), dict):
+            session.latest_training_recommendation = dict(
+                meta["latest_training_recommendation"]
+            )
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):
@@ -1827,6 +1876,9 @@ class SessionManager:
             "latest_dataset_discovery": self._serialize_dataset_discovery(
                 agent_session.session
             ),
+            "latest_training_recommendation": (
+                self._serialize_training_recommendation(agent_session.session)
+            ),
         }
 
     def set_notification_destinations(
@@ -1923,6 +1975,9 @@ class SessionManager:
                         },
                         "uploaded_datasets": row.get("uploaded_datasets") or [],
                         "latest_dataset_discovery": row.get("latest_dataset_discovery"),
+                        "latest_training_recommendation": row.get(
+                            "latest_training_recommendation"
+                        ),
                     }
                 )
             return results

@@ -188,6 +188,7 @@ class SessionInfo(BaseModel):
     )
     uploaded_datasets: list[UploadedDatasetInfo] = Field(default_factory=list)
     latest_dataset_discovery: DatasetDiscoveryResponse | None = None
+    latest_training_recommendation: dict[str, Any] | None = None
     runs: list["RunSummary"] = Field(default_factory=list)
 
 
@@ -437,6 +438,7 @@ class RunProviderMetadata(BaseModel):
     output_policy: str | None = None
     last_checked_at: str | None = None
     dataset_discovery: DatasetDiscoveryResponse | None = None
+    training_recommendation: dict[str, Any] | None = None
 
 
 class RunSummary(BaseModel):
@@ -468,6 +470,7 @@ class RunSummary(BaseModel):
     audit_error_count: int = 0
     latest_audit_event: AuditEvent | None = None
     dataset_discovery: DatasetDiscoveryResponse | None = None
+    training_recommendation: dict[str, Any] | None = None
 
 
 class RunEventInfo(BaseModel):

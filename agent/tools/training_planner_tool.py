@@ -19,6 +19,31 @@ def format_training_plan(plan: Any) -> str:
     training_args = _json_block(plan.training_args)
     privacy_warnings = plan.privacy_warnings or ["None."]
     risks = plan.risks or ["None."]
+    recommendation = result.get("recommendation") if isinstance(result, dict) else {}
+    selected_model = (
+        recommendation.get("selected_model") if isinstance(recommendation, dict) else {}
+    )
+    selected_provider = (
+        recommendation.get("selected_provider")
+        if isinstance(recommendation, dict)
+        else {}
+    )
+    selected_hardware = (
+        recommendation.get("selected_hardware")
+        if isinstance(recommendation, dict)
+        else {}
+    )
+    warnings = (
+        recommendation.get("warnings") if isinstance(recommendation, dict) else []
+    ) or []
+    fallbacks = (
+        recommendation.get("fallbacks") if isinstance(recommendation, dict) else []
+    ) or []
+    production_alternative = (
+        recommendation.get("production_alternative")
+        if isinstance(recommendation, dict)
+        else None
+    )
     discovery = plan.dataset_discovery or {}
     discovery_lines: list[str] = []
     if isinstance(discovery, dict) and discovery:
@@ -44,6 +69,19 @@ def format_training_plan(plan: Any) -> str:
         f"**Production model:** {plan.production_model}",
         f"**Output policy:** {plan.output_policy}",
         "",
+        "### Primary Recommendation",
+        "",
+        f"- Model: {selected_model.get('model_id') or plan.recommended_model}",
+        f"- Model family: {selected_model.get('family') or 'unknown'}",
+        f"- Model size: {selected_model.get('parameter_count_b') or 'unknown'}B",
+        f"- License/access: {selected_model.get('license') or 'unknown'} / {selected_model.get('access') or 'unknown'}",
+        f"- Provider: {selected_provider.get('display_name') or plan.provider}",
+        f"- Hardware: {selected_hardware.get('display_name') or plan.recommended_hardware}",
+        f"- Estimated cost: {recommendation.get('estimated_cost_usd') if isinstance(recommendation, dict) else None}",
+        f"- Budget cap: {recommendation.get('budget_cap_usd') if isinstance(recommendation, dict) else None}",
+        f"- Confidence: {recommendation.get('confidence') if isinstance(recommendation, dict) else None}",
+        f"- Evaluation profile: {recommendation.get('recommended_evaluation_profile') if isinstance(recommendation, dict) else 'standard_static_review'}",
+        "",
         "### Recommended Hardware",
         f"**Recommended hardware:** {plan.recommended_hardware}",
         "",
@@ -64,6 +102,28 @@ def format_training_plan(plan: Any) -> str:
         "### Risks",
         "",
         *[f"- {risk}" for risk in risks],
+        "",
+        "### Fallbacks And Alternatives",
+        "",
+        *[
+            f"- Fallback: {item.get('blocked_option')} -> {item.get('fallback_option')} ({item.get('reason')})"
+            for item in fallbacks
+            if isinstance(item, dict)
+        ],
+        *(
+            [
+                "- Production alternative: "
+                f"{production_alternative.get('model_id')} on "
+                f"{production_alternative.get('hardware_id')}"
+            ]
+            if isinstance(production_alternative, dict)
+            else []
+        ),
+        *[
+            f"- Warning: {item.get('message')}"
+            for item in warnings
+            if isinstance(item, dict) and item.get("message")
+        ],
         "",
         "### Reasoning",
         "",
@@ -113,17 +173,28 @@ class TrainingPlannerTool:
             privacy_level=str(params.get("privacy_level") or "unknown"),
             budget_preference=str(params.get("budget_preference") or "balanced"),
             user_model_preference=params.get("user_model_preference"),
+            requested_output_policy=params.get("requested_output_policy")
+            or params.get("output_policy"),
             intent_hint=params.get("intent_hint"),
             full_dataset_approved=params.get("full_dataset_approved") is True,
             dataset_discovery=params.get("dataset_discovery")
             if isinstance(params.get("dataset_discovery"), dict)
             else None,
+            budget_cap_usd=params.get("budget_cap_usd")
+            if isinstance(params.get("budget_cap_usd"), (int, float))
+            and not isinstance(params.get("budget_cap_usd"), bool)
+            else None,
+            provider_readiness=params.get("provider_readiness")
+            if isinstance(params.get("provider_readiness"), dict)
+            else None,
+            explicit_provider=params.get("explicit_provider") is not False,
         )
         return {
             "formatted": format_training_plan(plan),
             "totalResults": 1,
             "resultsShared": 1,
             "isError": False,
+            "structured": plan.to_dict(),
         }
 
 
@@ -191,6 +262,23 @@ TRAINING_PLANNER_TOOL_SPEC = {
                 "type": "string",
                 "description": "Optional model id requested by the user; the planner respects it and adds risk notes when needed.",
             },
+            "output_policy": {
+                "type": "string",
+                "enum": ["cloud-private", "hf-hub", "cloud-and-hf-hub"],
+                "description": "Optional requested output policy. Sensitive/private domains may be corrected to cloud-private with warnings.",
+            },
+            "budget_cap_usd": {
+                "type": "number",
+                "description": "Optional user budget cap in USD for planner cost warnings.",
+            },
+            "provider_readiness": {
+                "type": "object",
+                "description": "Optional non-secret readiness/quota snapshot from health checks. No live API calls are made.",
+            },
+            "explicit_provider": {
+                "type": "boolean",
+                "description": "Whether the requested provider should be treated as explicit. If false and readiness is blocked, planner may recommend a fallback provider.",
+            },
             "intent_hint": {
                 "type": "string",
                 "description": "Optional short user-intent text to help agent-decide choose smoke-test or production.",
@@ -209,7 +297,20 @@ TRAINING_PLANNER_TOOL_SPEC = {
 }
 
 
-async def training_planner_handler(arguments: dict[str, Any]) -> tuple[str, bool]:
+async def training_planner_handler(
+    arguments: dict[str, Any],
+    session: Any = None,
+    tool_call_id: str | None = None,
+) -> tuple[str, bool]:
     tool = TrainingPlannerTool()
     result = await tool.execute(arguments)
+    structured = result.get("structured")
+    if session is not None and isinstance(structured, dict):
+        outputs = getattr(session, "_structured_tool_outputs", None)
+        if not isinstance(outputs, dict):
+            outputs = {}
+            setattr(session, "_structured_tool_outputs", outputs)
+        if tool_call_id:
+            outputs[tool_call_id] = structured
+        setattr(session, "latest_training_recommendation", structured)
     return result["formatted"], not result.get("isError", False)

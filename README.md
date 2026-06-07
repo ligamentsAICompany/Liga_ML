@@ -85,6 +85,11 @@ ranks safe public candidates, explains license/privacy/schema risks, persists
 the latest result in session/run state, and keeps Kaggle excluded as future work.
 See [`docs/dataset-discovery.md`](docs/dataset-discovery.md).
 
+The training planner uses a static model/provider/hardware catalog to recommend
+safe defaults, cost-aware hardware, output policies, warnings, and fallbacks
+before any approval-gated cloud job. See
+[`docs/model-provider-selection.md`](docs/model-provider-selection.md).
+
 Production/client deployments use a shared redaction policy for backend
 persistence and frontend rendering, private-by-default sandboxes, and safe
 security health diagnostics. See

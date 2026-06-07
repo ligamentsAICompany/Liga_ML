@@ -79,6 +79,11 @@ from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.model_provider_selection import (
+    hardware_catalog,
+    model_catalog,
+    provider_catalog,
+)
 from agent.core.post_training_evaluation import build_post_training_evaluation
 from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
@@ -664,6 +669,41 @@ async def provider_health() -> dict[str, Any]:
     }
 
 
+@router.get("/model-catalog")
+async def get_model_catalog(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Return the static planner model catalog."""
+    _ = user
+    return {
+        "models": [model.to_dict() for model in model_catalog()],
+        "live_access_probed": False,
+    }
+
+
+@router.get("/provider-catalog")
+async def get_provider_catalog(
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return the static planner provider catalog."""
+    _ = user
+    return {
+        "providers": [provider.to_dict() for provider in provider_catalog()],
+        "readiness": await provider_health(),
+        "live_quota_api_used": False,
+    }
+
+
+@router.get("/hardware-catalog")
+async def get_hardware_catalog(
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return the static planner hardware catalog."""
+    _ = user
+    return {
+        "hardware": [hardware.to_dict() for hardware in hardware_catalog()],
+        "live_availability_probed": False,
+    }
+
+
 @router.get("/usage", response_model=list[UsageEntry])
 async def list_usage(
     provider: str | None = None,
@@ -925,6 +965,20 @@ async def get_session_dataset_discovery(
     return DatasetDiscoveryResponse(**discovery)
 
 
+@router.get("/session/{session_id}/recommendations")
+async def get_session_recommendations(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    recommendation = await session_manager.get_latest_training_recommendation(
+        session_id
+    )
+    if not recommendation:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return recommendation
+
+
 @router.get(
     "/session/{session_id}/runs/{run_id}/dataset-discovery",
     response_model=DatasetDiscoveryResponse,
@@ -939,6 +993,21 @@ async def get_run_dataset_discovery(
     if not discovery:
         raise HTTPException(status_code=404, detail="Dataset discovery not found")
     return DatasetDiscoveryResponse(**discovery)
+
+
+@router.get("/session/{session_id}/runs/{run_id}/recommendations")
+async def get_run_recommendations(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    recommendation = await session_manager.get_run_training_recommendation(
+        session_id, run_id
+    )
+    if not recommendation:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return recommendation
 
 
 @router.post(

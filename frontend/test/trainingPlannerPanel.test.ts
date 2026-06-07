@@ -49,6 +49,76 @@ test('training planner panel renders privacy warnings and risks', () => {
   assert.match(panel.markdown, /User approval is required before any billable cloud job\./);
 });
 
+test('training planner panel renders phase 7 recommendation sections', () => {
+  const panel = createTrainingPlannerPanel({
+    provider: 'aws-sagemaker',
+    trainingGoal: 'production',
+    recommendedModel: 'Qwen/Qwen2.5-1.5B-Instruct',
+    recommendedHardware: {
+      instance_type: 'ml.g4dn.xlarge',
+      estimated_hourly_cost_usd: 0.9,
+    },
+    outputPolicy: 'cloud-private',
+    recommendation: {
+      selected_model: {
+        model_id: 'Qwen/Qwen2.5-1.5B-Instruct',
+        family: 'Qwen',
+        parameter_count_b: 1.5,
+        license: 'apache-2.0',
+        gated: false,
+      },
+      selected_provider: {
+        provider_id: 'aws-sagemaker',
+        display_name: 'AWS SageMaker AI',
+      },
+      selected_hardware: {
+        hardware_id: 'aws-sagemaker:ml.g4dn.xlarge',
+        display_name: 'ml.g4dn.xlarge',
+        gpu_memory_gb: 16,
+      },
+      estimated_cost_usd: 1.8,
+      budget_cap_usd: 10,
+      confidence: 0.78,
+      warnings: [{ message: 'ml.g5.xlarge quota is 0; using ml.g4dn.xlarge fallback.' }],
+      fallbacks: [
+        {
+          blocked_option: 'aws-sagemaker:ml.g5.xlarge',
+          fallback_option: 'aws-sagemaker:ml.g4dn.xlarge',
+          reason: 'quota unavailable',
+        },
+      ],
+      production_alternative: {
+        model_id: 'Qwen/Qwen2.5-3B-Instruct',
+        hardware_id: 'aws-sagemaker:ml.g5.2xlarge',
+      },
+      recommended_evaluation_profile: 'safety_privacy_review',
+    },
+  });
+
+  assert.match(panel.markdown, /### Primary recommendation/);
+  assert.match(panel.markdown, /Model: Qwen\/Qwen2\.5-1\.5B-Instruct/);
+  assert.match(panel.markdown, /License: apache-2\.0/);
+  assert.match(panel.markdown, /Provider: AWS SageMaker AI/);
+  assert.match(panel.markdown, /Hardware: ml\.g4dn\.xlarge/);
+  assert.match(panel.markdown, /Estimated cost: \$1\.80/);
+  assert.match(panel.markdown, /Budget cap: \$10\.00/);
+  assert.match(panel.markdown, /quota is 0/);
+  assert.match(panel.markdown, /Fallback: aws-sagemaker:ml\.g5\.xlarge -> aws-sagemaker:ml\.g4dn\.xlarge/);
+  assert.match(panel.markdown, /Production alternative: Qwen\/Qwen2\.5-3B-Instruct on aws-sagemaker:ml\.g5\.2xlarge/);
+});
+
+test('training planner panel redacts secret-looking recommendation values', () => {
+  const panel = createTrainingPlannerPanel({
+    provider: 'hf-jobs',
+    recommendation: {
+      warnings: [{ message: 'Do not show sk-secret123456 in UI.' }],
+    },
+  });
+
+  assert.doesNotMatch(panel.markdown, /sk-secret123456/);
+  assert.match(panel.markdown, /\[REDACTED\]/);
+});
+
 test('training planner panel handles missing optional fields gracefully', () => {
   const panel = createTrainingPlannerPanel({});
 

@@ -31,6 +31,7 @@ from agent.core.post_training_evaluation import (
 )
 from agent.core.usage import (
     summarize_usage,
+    usage_from_training_recommendation,
     usage_from_approval_tool,
     usage_from_run_terminal,
     usage_from_tool_state,
@@ -99,6 +100,17 @@ def _dataset_discovery_from_event(
     event_type: str, payload: dict[str, Any]
 ) -> dict[str, Any] | None:
     if event_type != "tool_output" or payload.get("tool") != "dataset_discovery":
+        return None
+    structured = payload.get("structured")
+    if isinstance(structured, dict):
+        return sanitize_for_persistence(structured)
+    return None
+
+
+def _training_recommendation_from_event(
+    event_type: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    if event_type != "tool_output" or payload.get("tool") != "training_planner":
         return None
     structured = payload.get("structured")
     if isinstance(structured, dict):
@@ -577,6 +589,10 @@ class NoopSessionStore:
             update["dataset_discovery"] = discovery
             provider_metadata["dataset_discovery"] = discovery
             update["provider_metadata"] = provider_metadata
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            update["training_recommendation"] = recommendation
+            provider_metadata["training_recommendation"] = recommendation
+            update["provider_metadata"] = provider_metadata
         if provider_fields:
             if provider := provider_fields.pop("provider", None):
                 update["provider"] = provider
@@ -654,6 +670,16 @@ class NoopSessionStore:
                             event_payload=payload,
                         )
                         await self.upsert_usage_entry(usage_id, entry)
+            return
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            usage_update = usage_from_training_recommendation(
+                session_id=session_id,
+                run_id=run_id,
+                recommendation=recommendation,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
             return
         existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
         if event_type == "tool_state_change":
@@ -797,6 +823,7 @@ class MongoSessionStore(NoopSessionStore):
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
         latest_dataset_discovery: dict[str, Any] | None = None,
+        latest_training_recommendation: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -839,6 +866,9 @@ class MongoSessionStore(NoopSessionStore):
                     "latest_dataset_discovery": sanitize_for_persistence(
                         latest_dataset_discovery or {}
                     ),
+                    "latest_training_recommendation": sanitize_for_persistence(
+                        latest_training_recommendation or {}
+                    ),
                 },
             },
             upsert=True,
@@ -867,6 +897,7 @@ class MongoSessionStore(NoopSessionStore):
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
         latest_dataset_discovery: dict[str, Any] | None = None,
+        latest_training_recommendation: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -892,6 +923,7 @@ class MongoSessionStore(NoopSessionStore):
             output_policy=output_policy,
             uploaded_datasets=uploaded_datasets,
             latest_dataset_discovery=latest_dataset_discovery,
+            latest_training_recommendation=latest_training_recommendation,
         )
         ops: list[Any] = []
         for idx, raw in enumerate(messages):
@@ -1395,6 +1427,10 @@ class MongoSessionStore(NoopSessionStore):
             update["dataset_discovery"] = discovery
             provider_metadata["dataset_discovery"] = discovery
             update["provider_metadata"] = provider_metadata
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            update["training_recommendation"] = recommendation
+            provider_metadata["training_recommendation"] = recommendation
+            update["provider_metadata"] = provider_metadata
         if provider_fields:
             if provider := provider_fields.pop("provider", None):
                 update["provider"] = provider
@@ -1473,6 +1509,16 @@ class MongoSessionStore(NoopSessionStore):
                             event_payload=payload,
                         )
                         await self.upsert_usage_entry(usage_id, entry)
+            return
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            usage_update = usage_from_training_recommendation(
+                session_id=session_id,
+                run_id=run_id,
+                recommendation=recommendation,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
             return
         existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
         if event_type == "tool_state_change":

@@ -289,6 +289,8 @@ def event_from_run_event(
         return _tool_state_events(session_id, run_id, payload)
     if event_type == "tool_output" and payload.get("tool") == "dataset_discovery":
         return _dataset_discovery_events(session_id, run_id, payload)
+    if event_type == "tool_output" and payload.get("tool") == "training_planner":
+        return _training_recommendation_events(session_id, run_id, payload)
     if event_type == "turn_complete":
         return [
             build_audit_event(
@@ -442,6 +444,131 @@ def _dataset_discovery_events(
                 entity_id=candidate.get("dataset_id"),
                 dataset_name=candidate.get("title") or candidate.get("dataset_id"),
                 safe_metadata=candidate,
+            )
+        )
+    return events
+
+
+def _training_recommendation_events(
+    session_id: str, run_id: str, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    structured = payload.get("structured")
+    if not isinstance(structured, dict) or payload.get("success") is False:
+        return []
+    recommendation = structured.get("recommendation")
+    recommendation = recommendation if isinstance(recommendation, dict) else {}
+    selected_model = recommendation.get("selected_model")
+    selected_model = selected_model if isinstance(selected_model, dict) else {}
+    selected_provider = recommendation.get("selected_provider")
+    selected_provider = selected_provider if isinstance(selected_provider, dict) else {}
+    selected_hardware = recommendation.get("selected_hardware")
+    selected_hardware = selected_hardware if isinstance(selected_hardware, dict) else {}
+    events = [
+        build_audit_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type="model_recommendation_created",
+            category="planner",
+            status="recommended",
+            actor="assistant",
+            title="Model recommendation created",
+            message=str(
+                selected_model.get("model_id")
+                or structured.get("recommended_model")
+                or "Model recommended"
+            ),
+            provider=structured.get("provider"),
+            tool_name="training_planner",
+            entity_type="model",
+            entity_id=selected_model.get("model_id")
+            or structured.get("recommended_model"),
+            model_name=selected_model.get("model_id")
+            or structured.get("recommended_model"),
+            output_policy=structured.get("output_policy"),
+            estimated_cost_usd=recommendation.get("estimated_cost_usd"),
+            safe_metadata=recommendation,
+        ),
+        build_audit_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type="provider_recommendation_created",
+            category="planner",
+            status="recommended",
+            actor="assistant",
+            title="Provider recommendation created",
+            message=str(
+                selected_provider.get("display_name")
+                or structured.get("provider")
+                or "Provider recommended"
+            ),
+            provider=structured.get("provider"),
+            tool_name="training_planner",
+            entity_type="provider",
+            entity_id=selected_provider.get("provider_id")
+            or structured.get("provider"),
+            output_policy=structured.get("output_policy"),
+            estimated_cost_usd=recommendation.get("estimated_cost_usd"),
+        ),
+        build_audit_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type="hardware_recommendation_created",
+            category="planner",
+            status="recommended",
+            actor="assistant",
+            title="Hardware recommendation created",
+            message=str(
+                selected_hardware.get("display_name") or "Hardware recommended"
+            ),
+            provider=structured.get("provider"),
+            tool_name="training_planner",
+            entity_type="hardware",
+            entity_id=selected_hardware.get("hardware_id"),
+            estimated_cost_usd=recommendation.get("estimated_cost_usd"),
+            safe_metadata=selected_hardware,
+        ),
+    ]
+    for fallback in recommendation.get("fallbacks") or []:
+        if not isinstance(fallback, dict):
+            continue
+        events.append(
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="fallback_recommended",
+                category="planner",
+                severity="warning",
+                status="recommended",
+                actor="assistant",
+                title="Fallback recommended",
+                message=str(fallback.get("reason") or "Fallback recommended"),
+                provider=structured.get("provider"),
+                tool_name="training_planner",
+                entity_type="fallback",
+                entity_id=fallback.get("blocked_option"),
+                safe_metadata=fallback,
+            )
+        )
+    for warning in recommendation.get("warnings") or []:
+        if not isinstance(warning, dict):
+            continue
+        if str(warning.get("category") or "").lower() != "quota":
+            continue
+        events.append(
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="quota_warning_recorded",
+                category="planner",
+                severity="warning",
+                status="warning",
+                actor="assistant",
+                title="Quota warning recorded",
+                message=str(warning.get("message") or "Quota warning recorded"),
+                provider=structured.get("provider"),
+                tool_name="training_planner",
+                entity_type="quota",
+                safe_metadata=warning,
             )
         )
     return events

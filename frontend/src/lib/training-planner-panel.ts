@@ -27,7 +27,10 @@ const FIELD_NAMES = {
   provider: ['provider'],
   domain: ['domain'],
   datasetSummary: ['datasetSummary', 'dataset_summary'],
+  recommendation: ['recommendation'],
 } as const;
+
+const SECRETISH_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|[A-Za-z0-9_-]*secret[A-Za-z0-9_-]*)\b/gi;
 
 function isRecord(value: unknown): value is PlannerRecord {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -42,7 +45,7 @@ function humanizeKey(key: string): string {
 
 function valueLabel(value: unknown): string | null {
   if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return value.replace(SECRETISH_RE, '[REDACTED]');
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return null;
 }
@@ -126,6 +129,86 @@ function appendSection(lines: string[], title: string, items: string[]): void {
   lines.push('', `### ${title}`, ...items.map((item) => `- ${item}`));
 }
 
+function money(value: unknown): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return `$${value.toFixed(2)}`;
+}
+
+function recommendationRecord(record: PlannerRecord): PlannerRecord {
+  const value = getValue(record, FIELD_NAMES.recommendation);
+  return isRecord(value) ? value : {};
+}
+
+function sectionItem(label: string, value: unknown): string | null {
+  const text = valueLabel(value);
+  return text ? `${label}: ${text}` : null;
+}
+
+function phase7Sections(record: PlannerRecord): string[] {
+  const recommendation = recommendationRecord(record);
+  if (!Object.keys(recommendation).length) return [];
+
+  const selectedModel = isRecord(recommendation.selected_model) ? recommendation.selected_model : {};
+  const selectedProvider = isRecord(recommendation.selected_provider) ? recommendation.selected_provider : {};
+  const selectedHardware = isRecord(recommendation.selected_hardware) ? recommendation.selected_hardware : {};
+  const warnings = Array.isArray(recommendation.warnings) ? recommendation.warnings : [];
+  const fallbacks = Array.isArray(recommendation.fallbacks) ? recommendation.fallbacks : [];
+  const productionAlternative = isRecord(recommendation.production_alternative)
+    ? recommendation.production_alternative
+    : null;
+
+  const primary = [
+    sectionItem('Model', selectedModel.model_id ?? getString(record, FIELD_NAMES.recommendedModel)),
+    sectionItem('Family', selectedModel.family),
+    sectionItem('Size', selectedModel.parameter_count_b ? `${selectedModel.parameter_count_b}B` : null),
+    sectionItem('License', selectedModel.license),
+    sectionItem('Access', selectedModel.gated ? 'gated or access-limited' : selectedModel.access),
+    sectionItem('Provider', selectedProvider.display_name ?? selectedProvider.provider_id),
+    sectionItem('Hardware', selectedHardware.display_name ?? selectedHardware.hardware_id),
+    sectionItem('GPU memory', selectedHardware.gpu_memory_gb ? `${selectedHardware.gpu_memory_gb} GB` : null),
+    sectionItem('Estimated cost', money(recommendation.estimated_cost_usd)),
+    sectionItem('Budget cap', money(recommendation.budget_cap_usd)),
+    sectionItem('Confidence', typeof recommendation.confidence === 'number' ? `${Math.round(recommendation.confidence * 100)}%` : null),
+    sectionItem('Evaluation profile', recommendation.recommended_evaluation_profile),
+  ].filter((item): item is string => !!item);
+
+  const warningLines = warnings
+    .map((warning) => (isRecord(warning) ? valueLabel(warning.message) : valueLabel(warning)))
+    .filter((item): item is string => !!item);
+  const fallbackLines = fallbacks
+    .map((fallback) => {
+      if (!isRecord(fallback)) return null;
+      const blocked = valueLabel(fallback.blocked_option);
+      const target = valueLabel(fallback.fallback_option);
+      const reason = valueLabel(fallback.reason);
+      if (!blocked || !target) return null;
+      return `Fallback: ${blocked} -> ${target}${reason ? ` (${reason})` : ''}`;
+    })
+    .filter((item): item is string => !!item);
+  if (productionAlternative) {
+    const modelId = valueLabel(productionAlternative.model_id);
+    const hardwareId = valueLabel(productionAlternative.hardware_id);
+    if (modelId || hardwareId) {
+      fallbackLines.push(`Production alternative: ${modelId ?? 'larger model'} on ${hardwareId ?? 'larger hardware'}`);
+    }
+  }
+
+  const lines: string[] = [];
+  appendSection(lines, 'Primary recommendation', primary);
+  appendSection(lines, 'Provider/hardware', [
+    sectionItem('Provider', selectedProvider.provider_id),
+    sectionItem('Hardware id', selectedHardware.hardware_id),
+    sectionItem('Quota risk', selectedHardware.quota_risk),
+  ].filter((item): item is string => !!item));
+  appendSection(lines, 'Cost/budget', [
+    sectionItem('Estimated cost', money(recommendation.estimated_cost_usd)),
+    sectionItem('Budget cap', money(recommendation.budget_cap_usd)),
+  ].filter((item): item is string => !!item));
+  appendSection(lines, 'Safety/privacy', warningLines);
+  appendSection(lines, 'Fallbacks/alternatives', fallbackLines);
+  return lines;
+}
+
 export function createTrainingPlannerPanel(input: unknown): TrainingPlannerPanel {
   const { record, fallbackMarkdown } = extractPlannerRecord(input);
   const provider = getString(record, FIELD_NAMES.provider) ?? 'hf-jobs';
@@ -181,6 +264,7 @@ export function createTrainingPlannerPanel(input: unknown): TrainingPlannerPanel
     '',
     ...summaryLines.map((line) => `- ${line}`),
   ];
+  lines.push(...phase7Sections(record));
   appendSection(lines, 'Privacy Warnings', warningLines);
   appendSection(lines, 'Risks', riskLines);
   appendSection(lines, 'Reasoning', reasoning);

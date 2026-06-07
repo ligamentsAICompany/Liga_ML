@@ -80,6 +80,12 @@ Uploaded datasets remain the preferred path when a normalized session upload is
 available. The no-upload discovery tool tells the agent to use the uploaded
 dataset first unless the user explicitly asks for alternatives.
 
+Phase 7 consumes discovery metadata as planner context. Recommended candidates,
+row-count hints, domain/sensitivity, schema risks, and license warnings can
+influence model size, provider fallback, output policy, sample caps, and safety
+warnings. Discovery remains advisory and does not download data or bypass launch
+approval.
+
 ## Persistence And APIs
 
 Structured discovery results are persisted in session/run state when emitted by

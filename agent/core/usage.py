@@ -427,6 +427,63 @@ def usage_from_tool_state(
     return usage_id, updates
 
 
+def usage_from_training_recommendation(
+    *,
+    session_id: str,
+    run_id: str,
+    recommendation: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    structured = recommendation if isinstance(recommendation, dict) else {}
+    details = structured.get("recommendation")
+    if not isinstance(details, dict):
+        return None
+    provider = normalize_provider(structured.get("provider"))
+    usage_id = f"{run_id}:planner:training_recommendation"
+    selected_hardware = details.get("selected_hardware")
+    selected_hardware = selected_hardware if isinstance(selected_hardware, dict) else {}
+    hardware_args = selected_hardware.get("hardware_args")
+    hardware_args = hardware_args if isinstance(hardware_args, dict) else {}
+    selected_model = details.get("selected_model")
+    selected_model = selected_model if isinstance(selected_model, dict) else {}
+    entry = base_usage_entry(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        tool_name="training_planner",
+        operation="recommend",
+        usage_id=usage_id,
+    )
+    entry.update(
+        {
+            "status": "estimated",
+            "estimated_cost_usd": _float_or_none(details.get("estimated_cost_usd")),
+            "cost_source": "static_estimate",
+            "cost_confidence": "estimated",
+            "instance_type": selected_hardware.get("display_name")
+            or _instance_type(provider, hardware_args),
+            "instance_count": _instance_count(hardware_args),
+            "max_runtime_seconds": _runtime_cap_seconds(provider, hardware_args),
+            "model_name": selected_model.get("model_id")
+            or structured.get("recommended_model"),
+            "output_policy": structured.get("output_policy"),
+            "budget_cap_usd": _float_or_none(details.get("budget_cap_usd")),
+            "quota_status": "warning"
+            if details.get("quota_warning_recorded")
+            else "unknown",
+            "warning": next(
+                (
+                    str(warning.get("message"))
+                    for warning in details.get("warnings") or []
+                    if isinstance(warning, dict) and warning.get("message")
+                ),
+                None,
+            ),
+            "metadata": sanitize_metadata(structured),
+        }
+    )
+    return usage_id, entry
+
+
 def usage_from_run_terminal(
     *,
     run_id: str,

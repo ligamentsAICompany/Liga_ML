@@ -28,6 +28,44 @@ async def test_noop_store_keeps_local_cli_and_tests_db_free():
     assert await store.try_increment_quota("u1", "2099-01-01", 1) is None
 
 
+@pytest.mark.asyncio
+async def test_noop_store_persists_training_recommendation_from_tool_output():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s1", provider="hf-jobs", request_id="r1")
+
+    await store.append_run_event(
+        run_id=run["run_id"],
+        session_id="s1",
+        event_type="tool_output",
+        payload={
+            "tool": "training_planner",
+            "success": True,
+            "structured": {
+                "recommended_model": "Qwen/Qwen2.5-0.5B-Instruct",
+                "provider": "hf-jobs",
+                "recommended_hardware": {"hardware_flavor": "t4-small"},
+                "recommendation": {
+                    "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+                    "estimated_cost_usd": 0.6,
+                    "recommended_evaluation_profile": "standard_static_review",
+                },
+            },
+        },
+    )
+
+    saved = await store.get_run(run["run_id"])
+    assert (
+        saved["training_recommendation"]["recommended_model"]
+        == "Qwen/Qwen2.5-0.5B-Instruct"
+    )
+    assert (
+        saved["provider_metadata"]["training_recommendation"]["recommendation"][
+            "estimated_cost_usd"
+        ]
+        == 0.6
+    )
+
+
 def test_unsafe_message_payload_is_replaced_with_marker():
     marker = _safe_message_doc({"role": "assistant", "content": object()})
 

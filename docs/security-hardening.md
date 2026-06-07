@@ -73,6 +73,14 @@ paths, metric summaries, generated prompts, findings, recommendations, and
 limitations. They must not include tokens, bearer headers, signed URL
 credentials, raw private datasets, or credential files.
 
+## Planner Recommendations
+
+Phase 7 planner recommendations are also sanitized before persistence and
+frontend rendering. They may include model ids, provider ids, hardware shapes,
+cost estimates, budget caps, warnings, and fallback reasons. They must not expose
+tokens, credentials, private dataset contents, signed URLs, or local credential
+paths.
+
 ## Health Status
 
 `GET /api/health` includes:

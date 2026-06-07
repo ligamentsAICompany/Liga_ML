@@ -15,6 +15,8 @@ launching paid judge models.
 - Can carry Phase 6 dataset discovery metadata from run/provider state as
   planning context, including recommended dataset, warnings, and selection
   requirements.
+- Can carry Phase 7 planner recommendation metadata, including selected model,
+  provider, hardware, output policy, and safety warnings.
 - Generates static test prompts, safety checks, privacy checks, heuristic scores,
   limitations, a recommendation, and a markdown report.
 - Persists evaluations in the session store only. Phase 5 does not upload
