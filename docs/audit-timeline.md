@@ -12,7 +12,11 @@ state, approval required/approved/rejected, provider job start/running/success/
 failure, artifacts, usage estimates, budget/quota warnings, final results, and
 stream/provider errors. Phase 5 also records post-training evaluation lifecycle
 events: `evaluation_planned`, `evaluation_started`, `evaluation_completed`,
-`evaluation_skipped`, `evaluation_unavailable`, and `evaluation_failed`.
+`evaluation_skipped`, `evaluation_unavailable`, and `evaluation_failed`. Phase 6
+records dataset discovery lifecycle and ranking events:
+`dataset_discovery_started`, `dataset_candidates_found`,
+`dataset_candidate_recommended`, `dataset_candidate_excluded`, and
+`dataset_discovery_failed`.
 
 Noisy events are skipped: `assistant_chunk`, `heartbeat`, and low-level logs do
 not create timeline entries. Repeated provider monitoring is idempotent by
@@ -60,6 +64,10 @@ Supported query params are `session_id`, `run_id`, `provider`, `category`,
 Summary responses include counts by category/severity/provider, latest warnings
 or errors, provider job timeline, approval timeline, dataset timeline,
 usage/cost timeline, and grouping by session/run.
+
+Dataset discovery audit metadata stores sanitized query text, warning summaries,
+candidate counts, recommended candidate metadata, and excluded-candidate reasons.
+It does not store raw local dataset contents, credentials, or private data.
 
 ## Frontend
 

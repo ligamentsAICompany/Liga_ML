@@ -54,6 +54,7 @@ export interface ToolOutputEventData {
   tool: string;
   output: string;
   success: boolean;
+  structured?: Record<string, unknown> | null;
 }
 
 export interface ToolLogEventData {

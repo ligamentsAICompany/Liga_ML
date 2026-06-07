@@ -33,6 +33,78 @@ async def test_dataset_discovery_plan_returns_no_upload_guidance():
 
 
 @pytest.mark.asyncio
+async def test_dataset_discovery_plan_includes_intent_scores_and_load_dataset_snippet():
+    output, ok = await dataset_discovery_handler(
+        {
+            "operation": "plan",
+            "query": "Find a safe hardware troubleshooting dataset for AWS SageMaker fine-tuning.",
+            "provider": "aws-sagemaker",
+            "candidates": [
+                {
+                    "dataset_id": "public/hardware-support",
+                    "source": "huggingface",
+                    "repo_id": "public/hardware-support",
+                    "title": "Hardware Support QA",
+                    "description": "Instruction response data for PC troubleshooting",
+                    "license": "mit",
+                    "columns": ["instruction", "output", "category"],
+                    "row_count": 5_000,
+                }
+            ],
+        }
+    )
+
+    assert ok is True
+    assert "Extracted Intent" in output
+    assert "hardware_support" in output
+    assert "Recommended" in output
+    assert "Overall score" in output
+    assert "License: mit (clear)" in output
+    assert "Privacy: low" in output
+    assert "Schema: compatible" in output
+    assert "from datasets import load_dataset" in output
+    assert "User selection required before training" in output
+
+
+@pytest.mark.asyncio
+async def test_dataset_discovery_tool_preserves_extracted_intent_without_overrides():
+    output, ok = await dataset_discovery_handler(
+        {
+            "operation": "plan",
+            "query": "I need house price prediction data for a small model.",
+            "provider": "hf-jobs",
+        }
+    )
+
+    assert ok is True
+    assert "Domain: real_estate" in output
+    assert "Task type: regression" in output
+
+
+@pytest.mark.asyncio
+async def test_dataset_discovery_excludes_kaggle_as_future_work():
+    output, ok = await dataset_discovery_handler(
+        {
+            "operation": "plan",
+            "query": "Find IPL cricket data",
+            "candidates": [
+                {
+                    "dataset_id": "kaggle/ipl-matches",
+                    "source": "kaggle",
+                    "title": "IPL Matches",
+                    "license": "unknown",
+                    "columns": ["team", "runs"],
+                }
+            ],
+        }
+    )
+
+    assert ok is True
+    assert "Kaggle (future work only; not connected)" in output
+    assert "Excluded: Kaggle is future work only." in output
+
+
+@pytest.mark.asyncio
 async def test_dataset_discovery_unknown_operation_returns_error():
     output, ok = await dataset_discovery_handler({"operation": "crawl"})
 

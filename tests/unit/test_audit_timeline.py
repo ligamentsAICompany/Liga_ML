@@ -260,6 +260,80 @@ def test_event_from_run_event_maps_failures_and_artifacts():
     assert artifact[1]["event_type"] == "artifact_available"
 
 
+def test_event_from_run_event_maps_dataset_discovery_lifecycle():
+    events = event_from_run_event(
+        session_id="s1",
+        run_id="r1",
+        event_type="tool_output",
+        payload={
+            "tool": "dataset_discovery",
+            "success": True,
+            "structured": {
+                "query": "Find hardware support data",
+                "recommended_candidate": {
+                    "dataset_id": "public/hardware-support",
+                    "title": "Hardware Support QA",
+                    "overall_score": 0.91,
+                },
+                "candidates": [
+                    {
+                        "dataset_id": "public/hardware-support",
+                        "title": "Hardware Support QA",
+                        "excluded": False,
+                    },
+                    {
+                        "dataset_id": "kaggle/ipl",
+                        "title": "IPL Kaggle",
+                        "excluded": True,
+                        "exclusion_reason": "Kaggle is future work only.",
+                    },
+                ],
+                "warnings": ["User selection required before training."],
+            },
+        },
+    )
+
+    assert [event["event_type"] for event in events] == [
+        "dataset_candidates_found",
+        "dataset_candidate_recommended",
+        "dataset_candidate_excluded",
+    ]
+    assert events[0]["category"] == "dataset"
+    assert events[1]["dataset_name"] == "Hardware Support QA"
+    assert events[2]["severity"] == "warning"
+
+
+@pytest.mark.asyncio
+async def test_run_event_persists_dataset_discovery_metadata():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s1", provider="hf-jobs")
+    run_id = run["run_id"]
+    discovery = {
+        "query": "Find hardware support data",
+        "recommended_candidate": {"dataset_id": "public/hardware-support"},
+        "candidates": [{"dataset_id": "public/hardware-support"}],
+        "warnings": ["User selection required before training."],
+    }
+
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s1",
+        event_type="tool_output",
+        payload={
+            "tool": "dataset_discovery",
+            "success": True,
+            "structured": discovery,
+        },
+    )
+
+    updated = await store.get_run(run_id)
+
+    assert updated["dataset_discovery"]["query"] == "Find hardware support data"
+    assert updated["provider_metadata"]["dataset_discovery"]["query"] == (
+        "Find hardware support data"
+    )
+
+
 def test_sanitize_audit_metadata_redacts_secret_like_values():
     sanitized = sanitize_audit_metadata(
         {

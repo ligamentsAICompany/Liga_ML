@@ -245,6 +245,11 @@ class SessionManager:
         return [dict(upload) for upload in uploads if isinstance(upload, dict)]
 
     @staticmethod
+    def _serialize_dataset_discovery(session: Session) -> dict[str, Any] | None:
+        discovery = getattr(session, "latest_dataset_discovery", None)
+        return sanitize_for_frontend(discovery) if isinstance(discovery, dict) else None
+
+    @staticmethod
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
@@ -453,6 +458,7 @@ class SessionManager:
             "audit_warning_count": int(run.get("audit_warning_count") or 0),
             "audit_error_count": int(run.get("audit_error_count") or 0),
             "latest_audit_event": run.get("latest_audit_event"),
+            "dataset_discovery": run.get("dataset_discovery"),
         }
         return sanitize_for_frontend(payload)
 
@@ -570,6 +576,27 @@ class SessionManager:
         if not run or str(run.get("session_id")) != session_id:
             return None
         return await self._serialize_run_with_usage(run)
+
+    async def get_run_dataset_discovery(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        run = await self.get_run(session_id, run_id)
+        discovery = run.get("dataset_discovery") if isinstance(run, dict) else None
+        return sanitize_for_frontend(discovery) if isinstance(discovery, dict) else None
+
+    async def get_latest_dataset_discovery(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            discovery = self._serialize_dataset_discovery(agent_session.session)
+            if discovery:
+                return discovery
+        for run in await self.list_runs(session_id):
+            discovery = run.get("dataset_discovery")
+            if isinstance(discovery, dict):
+                return sanitize_for_frontend(discovery)
+        return None
 
     async def list_usage_entries(self, **filters: Any) -> list[dict[str, Any]]:
         return await self._store().list_usage_entries(**filters)
@@ -853,6 +880,9 @@ class SessionManager:
                 uploaded_datasets=self._serialize_uploaded_datasets(
                     agent_session.session
                 ),
+                latest_dataset_discovery=self._serialize_dataset_discovery(
+                    agent_session.session
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -971,6 +1001,8 @@ class SessionManager:
             for upload in meta.get("uploaded_datasets") or []
             if isinstance(upload, dict)
         ]
+        if isinstance(meta.get("latest_dataset_discovery"), dict):
+            session.latest_dataset_discovery = dict(meta["latest_dataset_discovery"])
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):
@@ -1412,6 +1444,8 @@ class SessionManager:
     ) -> bool:
         """Submit user input to a session."""
         agent_session = self.sessions.get(session_id)
+        if agent_session and not hasattr(agent_session.session, "current_run_id"):
+            agent_session.session.current_run_id = None
         if (
             cloud_provider in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
             and agent_session
@@ -1430,10 +1464,12 @@ class SessionManager:
         ):
             agent_session.output_policy = output_policy
             agent_session.session.output_policy = output_policy
-        if agent_session and background_runs_in_process():
+        if agent_session:
             if run_id:
                 agent_session.session.current_run_id = run_id
-            else:
+            elif background_runs_in_process() or not getattr(
+                agent_session.session, "current_run_id", None
+            ):
                 run = await self.create_run(
                     session_id,
                     provider=cloud_provider
@@ -1450,6 +1486,8 @@ class SessionManager:
         }
         if run_id:
             data["run_id"] = run_id
+        elif agent_session:
+            data["run_id"] = getattr(agent_session.session, "current_run_id", None)
         if agent_session:
             await self.record_audit_event(
                 build_audit_event(
@@ -1786,6 +1824,9 @@ class SessionManager:
             "uploaded_datasets": self._serialize_uploaded_datasets(
                 agent_session.session
             ),
+            "latest_dataset_discovery": self._serialize_dataset_discovery(
+                agent_session.session
+            ),
         }
 
     def set_notification_destinations(
@@ -1881,6 +1922,7 @@ class SessionManager:
                             ),
                         },
                         "uploaded_datasets": row.get("uploaded_datasets") or [],
+                        "latest_dataset_discovery": row.get("latest_dataset_discovery"),
                     }
                 )
             return results

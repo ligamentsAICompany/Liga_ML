@@ -154,6 +154,19 @@ class UploadedDatasetInfo(BaseModel):
     load_dataset_snippet: str
 
 
+class DatasetDiscoveryResponse(BaseModel):
+    query: str | None = None
+    intent: dict[str, Any] = Field(default_factory=dict)
+    allowed_sources: list[str] = Field(default_factory=list)
+    excluded_sources: list[str] = Field(default_factory=list)
+    candidates: list[dict[str, Any]] = Field(default_factory=list)
+    recommended_candidate: dict[str, Any] | None = None
+    warnings: list[str] = Field(default_factory=list)
+    selected_candidate: dict[str, Any] | None = None
+    timestamp: str | None = None
+    requires_user_selection: bool = True
+
+
 class SessionInfo(BaseModel):
     """Session metadata."""
 
@@ -174,6 +187,7 @@ class SessionInfo(BaseModel):
         default_factory=SessionAutoApprovalInfo
     )
     uploaded_datasets: list[UploadedDatasetInfo] = Field(default_factory=list)
+    latest_dataset_discovery: DatasetDiscoveryResponse | None = None
     runs: list["RunSummary"] = Field(default_factory=list)
 
 
@@ -422,6 +436,7 @@ class RunProviderMetadata(BaseModel):
     artifact_path: str | None = None
     output_policy: str | None = None
     last_checked_at: str | None = None
+    dataset_discovery: DatasetDiscoveryResponse | None = None
 
 
 class RunSummary(BaseModel):
@@ -452,6 +467,7 @@ class RunSummary(BaseModel):
     audit_warning_count: int = 0
     audit_error_count: int = 0
     latest_audit_event: AuditEvent | None = None
+    dataset_discovery: DatasetDiscoveryResponse | None = None
 
 
 class RunEventInfo(BaseModel):

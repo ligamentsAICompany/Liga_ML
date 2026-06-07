@@ -12,6 +12,9 @@ launching paid judge models.
 - Reads existing final result metadata: `LIGA_TRAINING_STATUS`, provider/job ids,
   Hub/GCS/S3 artifact refs, dataset refs, row counts, and
   `LIGA_EVAL_RESULT_JSON`.
+- Can carry Phase 6 dataset discovery metadata from run/provider state as
+  planning context, including recommended dataset, warnings, and selection
+  requirements.
 - Generates static test prompts, safety checks, privacy checks, heuristic scores,
   limitations, a recommendation, and a markdown report.
 - Persists evaluations in the session store only. Phase 5 does not upload
@@ -99,3 +102,7 @@ generated prompts, safety/privacy findings, artifacts, and the report markdown.
 Future phases can add opt-in live inference evaluation, paid judge models,
 benchmark datasets, before/after comparisons, provider artifact downloads, and a
 formal human review workflow.
+
+Dataset discovery remains pre-training planning metadata. Static post-training
+evaluation does not re-download or profile discovered datasets and does not
+convert a recommendation into proof that a dataset was selected or used.

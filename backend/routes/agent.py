@@ -41,6 +41,7 @@ from models import (
     AuditTimelineResponse,
     ApprovalRequest,
     DatasetUploadResponse,
+    DatasetDiscoveryResponse,
     HealthResponse,
     LLMHealthResponse,
     EvaluationSummary,
@@ -909,6 +910,37 @@ async def get_run_evaluation_report(
     }
 
 
+@router.get(
+    "/session/{session_id}/dataset-discovery",
+    response_model=DatasetDiscoveryResponse,
+)
+async def get_session_dataset_discovery(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> DatasetDiscoveryResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    discovery = await session_manager.get_latest_dataset_discovery(session_id)
+    if not discovery:
+        raise HTTPException(status_code=404, detail="Dataset discovery not found")
+    return DatasetDiscoveryResponse(**discovery)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/dataset-discovery",
+    response_model=DatasetDiscoveryResponse,
+)
+async def get_run_dataset_discovery(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> DatasetDiscoveryResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    discovery = await session_manager.get_run_dataset_discovery(session_id, run_id)
+    if not discovery:
+        raise HTTPException(status_code=404, detail="Dataset discovery not found")
+    return DatasetDiscoveryResponse(**discovery)
+
+
 @router.post(
     "/session/{session_id}/runs/{run_id}/evaluation",
     response_model=PostTrainingEvaluation,
@@ -950,6 +982,7 @@ async def trigger_run_evaluation(
                 "manual_trigger": True,
                 "mode": "static",
                 "provider_metadata": provider_metadata,
+                "dataset_discovery": run.get("dataset_discovery"),
             },
         }
     )

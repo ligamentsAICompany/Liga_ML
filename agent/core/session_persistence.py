@@ -95,6 +95,17 @@ def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dataset_discovery_from_event(
+    event_type: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    if event_type != "tool_output" or payload.get("tool") != "dataset_discovery":
+        return None
+    structured = payload.get("structured")
+    if isinstance(structured, dict):
+        return sanitize_for_persistence(structured)
+    return None
+
+
 class NoopSessionStore:
     """Async no-op store used when Mongo is not configured."""
 
@@ -562,6 +573,10 @@ class NoopSessionStore:
                 update["completed_at"] = now
         provider_fields = provider_metadata_from_event(event_type, payload)
         provider_metadata = dict(run.get("provider_metadata") or {})
+        if discovery := _dataset_discovery_from_event(event_type, payload):
+            update["dataset_discovery"] = discovery
+            provider_metadata["dataset_discovery"] = discovery
+            update["provider_metadata"] = provider_metadata
         if provider_fields:
             if provider := provider_fields.pop("provider", None):
                 update["provider"] = provider
@@ -781,6 +796,7 @@ class MongoSessionStore(NoopSessionStore):
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
+        latest_dataset_discovery: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -820,6 +836,9 @@ class MongoSessionStore(NoopSessionStore):
                     "uploaded_datasets": sanitize_for_persistence(
                         uploaded_datasets or []
                     ),
+                    "latest_dataset_discovery": sanitize_for_persistence(
+                        latest_dataset_discovery or {}
+                    ),
                 },
             },
             upsert=True,
@@ -847,6 +866,7 @@ class MongoSessionStore(NoopSessionStore):
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
+        latest_dataset_discovery: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -871,6 +891,7 @@ class MongoSessionStore(NoopSessionStore):
             training_goal=training_goal,
             output_policy=output_policy,
             uploaded_datasets=uploaded_datasets,
+            latest_dataset_discovery=latest_dataset_discovery,
         )
         ops: list[Any] = []
         for idx, raw in enumerate(messages):
@@ -1370,6 +1391,10 @@ class MongoSessionStore(NoopSessionStore):
                 update["completed_at"] = now
         provider_fields = provider_metadata_from_event(event_type, payload)
         provider_metadata = dict((run or {}).get("provider_metadata") or {})
+        if discovery := _dataset_discovery_from_event(event_type, payload):
+            update["dataset_discovery"] = discovery
+            provider_metadata["dataset_discovery"] = discovery
+            update["provider_metadata"] = provider_metadata
         if provider_fields:
             if provider := provider_fields.pop("provider", None):
                 update["provider"] = provider

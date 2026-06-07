@@ -266,8 +266,29 @@ def event_from_run_event(
         return _approval_required_events(session_id, run_id, payload)
     if event_type == "approval_resolved":
         return _approval_resolved_events(session_id, run_id, payload)
+    if event_type == "tool_call" and payload.get("tool") == "dataset_discovery":
+        return [
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="dataset_discovery_started",
+                category="dataset",
+                status="started",
+                actor="assistant",
+                title="Dataset discovery started",
+                message="The agent started no-upload dataset discovery.",
+                tool_name="dataset_discovery",
+                entity_type="dataset_discovery",
+                entity_id=payload.get("tool_call_id"),
+                safe_metadata=payload.get("arguments")
+                if isinstance(payload.get("arguments"), dict)
+                else {},
+            )
+        ]
     if event_type == "tool_state_change":
         return _tool_state_events(session_id, run_id, payload)
+    if event_type == "tool_output" and payload.get("tool") == "dataset_discovery":
+        return _dataset_discovery_events(session_id, run_id, payload)
     if event_type == "turn_complete":
         return [
             build_audit_event(
@@ -326,6 +347,104 @@ def event_from_run_event(
             )
         ]
     return []
+
+
+def _dataset_discovery_events(
+    session_id: str, run_id: str, payload: dict[str, Any]
+) -> list[dict[str, Any]]:
+    structured = payload.get("structured")
+    if not isinstance(structured, dict) or payload.get("success") is False:
+        return [
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="dataset_discovery_failed",
+                category="dataset",
+                severity="warning",
+                status="failed",
+                actor="assistant",
+                title="Dataset discovery failed",
+                message="Dataset discovery did not return structured candidates.",
+                tool_name="dataset_discovery",
+                entity_type="dataset_discovery",
+                entity_id=payload.get("tool_call_id"),
+                safe_metadata=payload,
+            )
+        ]
+
+    candidates = structured.get("candidates") if isinstance(structured, dict) else []
+    candidates = candidates if isinstance(candidates, list) else []
+    recommended = structured.get("recommended_candidate")
+    recommended = recommended if isinstance(recommended, dict) else None
+    events = [
+        build_audit_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type="dataset_candidates_found",
+            category="dataset",
+            status="completed",
+            actor="assistant",
+            title="Dataset candidates found",
+            message=f"Dataset discovery found {len(candidates)} candidate(s).",
+            tool_name="dataset_discovery",
+            entity_type="dataset_discovery",
+            entity_id=payload.get("tool_call_id"),
+            safe_metadata={
+                "query": structured.get("query"),
+                "warnings": structured.get("warnings"),
+                "candidate_count": len(candidates),
+            },
+        )
+    ]
+    if recommended:
+        events.append(
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="dataset_candidate_recommended",
+                category="dataset",
+                status="recommended",
+                actor="assistant",
+                title="Dataset candidate recommended",
+                message=str(
+                    recommended.get("title")
+                    or recommended.get("dataset_id")
+                    or "Dataset candidate recommended"
+                ),
+                tool_name="dataset_discovery",
+                entity_type="dataset_candidate",
+                entity_id=recommended.get("dataset_id"),
+                dataset_name=recommended.get("title") or recommended.get("dataset_id"),
+                safe_metadata=recommended,
+            )
+        )
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("excluded"):
+            continue
+        events.append(
+            build_audit_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type="dataset_candidate_excluded",
+                category="dataset",
+                severity="warning",
+                status="excluded",
+                actor="assistant",
+                title="Dataset candidate excluded",
+                message=str(
+                    candidate.get("exclusion_reason")
+                    or candidate.get("title")
+                    or candidate.get("dataset_id")
+                    or "Dataset candidate excluded"
+                ),
+                tool_name="dataset_discovery",
+                entity_type="dataset_candidate",
+                entity_id=candidate.get("dataset_id"),
+                dataset_name=candidate.get("title") or candidate.get("dataset_id"),
+                safe_metadata=candidate,
+            )
+        )
+    return events
 
 
 def _approval_required_events(

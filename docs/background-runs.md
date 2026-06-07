@@ -26,6 +26,10 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
   final result markers. MongoDB stores them in `evaluations`; the local fallback
   is in-memory and run summaries include `evaluation_status`,
   `evaluation_score`, and `evaluation_id`.
+- Phase 6 persists structured no-upload dataset discovery results from
+  `dataset_discovery` tool output into run/session state. Run summaries can
+  include `dataset_discovery`, and provider metadata carries the same sanitized
+  recommendation payload for replay.
 
 ## APIs
 
@@ -44,6 +48,8 @@ It does not introduce a separate paid worker or launch provider jobs on its own.
 - `GET /api/session/{session_id}/evaluations`
 - `GET /api/session/{session_id}/runs/{run_id}/evaluation`
 - `POST /api/session/{session_id}/runs/{run_id}/evaluation`
+- `GET /api/session/{session_id}/dataset-discovery`
+- `GET /api/session/{session_id}/runs/{run_id}/dataset-discovery`
 
 `POST /api/chat/{session_id}` remains backward compatible. It creates a run for
 new user messages when Phase 1 is enabled and attaches approval continuations to
@@ -97,6 +103,9 @@ token handoff rules.
 
 See `docs/post-training-evaluation.md` for Phase 5 static evaluation, scoring,
 audit events, and limitations.
+
+See `docs/dataset-discovery.md` for Phase 6 no-upload discovery ranking,
+Kaggle exclusion, persistence, and API response shape.
 
 ## Limitations
 

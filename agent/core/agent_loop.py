@@ -117,6 +117,16 @@ def _format_plan_items_for_guard(items: list[dict[str, str]], limit: int = 4) ->
     return "; ".join(formatted)
 
 
+def _structured_tool_output(
+    session: "Session", tool_call_id: str | None
+) -> dict | None:
+    outputs = getattr(session, "_structured_tool_outputs", None)
+    if not isinstance(outputs, dict) or not tool_call_id:
+        return None
+    value = outputs.pop(tool_call_id, None)
+    return value if isinstance(value, dict) else None
+
+
 def _no_tool_incomplete_plan_prompt(items: list[dict[str, str]]) -> str:
     summary = _format_plan_items_for_guard(items)
     return (
@@ -2440,6 +2450,9 @@ class Handlers:
                                     "tool_call_id": tc.id,
                                     "output": output,
                                     "success": success,
+                                    "structured": _structured_tool_output(
+                                        session, tc.id
+                                    ),
                                 },
                             )
                         )
@@ -2863,6 +2876,7 @@ class Handlers:
                             "tool_call_id": tc.id,
                             "output": output,
                             "success": success,
+                            "structured": _structured_tool_output(session, tc.id),
                         },
                     )
                 )

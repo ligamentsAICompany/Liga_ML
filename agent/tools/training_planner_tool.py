@@ -19,6 +19,18 @@ def format_training_plan(plan: Any) -> str:
     training_args = _json_block(plan.training_args)
     privacy_warnings = plan.privacy_warnings or ["None."]
     risks = plan.risks or ["None."]
+    discovery = plan.dataset_discovery or {}
+    discovery_lines: list[str] = []
+    if isinstance(discovery, dict) and discovery:
+        recommended = discovery.get("recommended_candidate")
+        if isinstance(recommended, dict):
+            discovery_lines.append(
+                f"- Recommended candidate: {recommended.get('title') or recommended.get('dataset_id')}"
+            )
+        discovery_lines.extend(
+            f"- Warning: {warning}" for warning in discovery.get("warnings") or []
+        )
+        discovery_lines.append("- User selection required before training.")
 
     lines = [
         "## Training Planner Recommendation",
@@ -56,6 +68,10 @@ def format_training_plan(plan: Any) -> str:
         "### Reasoning",
         "",
         *[f"- {reason}" for reason in plan.reasoning],
+        "",
+        "### Dataset Discovery",
+        "",
+        *(discovery_lines or ["- No enhanced discovery result supplied."]),
         "",
         "### Structured Result",
         "",
@@ -99,6 +115,9 @@ class TrainingPlannerTool:
             user_model_preference=params.get("user_model_preference"),
             intent_hint=params.get("intent_hint"),
             full_dataset_approved=params.get("full_dataset_approved") is True,
+            dataset_discovery=params.get("dataset_discovery")
+            if isinstance(params.get("dataset_discovery"), dict)
+            else None,
         )
         return {
             "formatted": format_training_plan(plan),
@@ -179,6 +198,10 @@ TRAINING_PLANNER_TOOL_SPEC = {
             "full_dataset_approved": {
                 "type": "boolean",
                 "description": "Set true only after explicit approval to plan full-dataset cloud training. Otherwise GCloud production plans use capped pilot samples.",
+            },
+            "dataset_discovery": {
+                "type": "object",
+                "description": "Optional enhanced dataset discovery result. Planner treats it as recommendation context and still requires user confirmation before launch.",
             },
         },
         "required": ["operation"],

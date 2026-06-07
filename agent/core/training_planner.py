@@ -89,6 +89,7 @@ class TrainingPlan:
     privacy_warnings: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
     reasoning: list[str] = field(default_factory=list)
+    dataset_discovery: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -296,6 +297,7 @@ def recommend_training_plan(
     user_model_preference: str | None = None,
     intent_hint: str | None = None,
     full_dataset_approved: bool = False,
+    dataset_discovery: dict[str, Any] | None = None,
 ) -> TrainingPlan:
     normalized_provider = normalize_provider(provider)
     normalized_domain = normalize_domain(domain)
@@ -329,6 +331,23 @@ def recommend_training_plan(
         reasoning.append(
             "Run dataset_discovery first, then search allowed public sources, inspect schema/license/privacy, and do not launch a cloud job until the user selects a dataset."
         )
+        if isinstance(dataset_discovery, dict):
+            recommended = dataset_discovery.get("recommended_candidate")
+            if isinstance(recommended, dict):
+                candidate_name = (
+                    recommended.get("title")
+                    or recommended.get("dataset_id")
+                    or "the recommended dataset candidate"
+                )
+                reasoning.append(
+                    f"Dataset discovery recommends {candidate_name}; user confirmation is still required before launch."
+                )
+            warnings = dataset_discovery.get("warnings")
+            if isinstance(warnings, list):
+                risks.extend(str(warning) for warning in warnings if warning)
+            risks.append(
+                "Discovered datasets are recommendations only; do not treat them as already selected or available."
+            )
 
     if normalized_provider not in SUPPORTED_PROVIDERS:
         risks.append(
@@ -377,4 +396,7 @@ def recommend_training_plan(
         privacy_warnings=privacy_warnings,
         risks=risks,
         reasoning=reasoning,
+        dataset_discovery=dataset_discovery
+        if isinstance(dataset_discovery, dict)
+        else None,
     )

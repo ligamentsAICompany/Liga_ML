@@ -79,6 +79,12 @@ approval, provider job, result, usage, and error history. It uses the same
 durable run/usage records, redacts secret-like metadata, and does not export to
 external observability vendors. See [`docs/audit-timeline.md`](docs/audit-timeline.md).
 
+When no uploaded dataset is attached, Liga ML can produce a no-upload Dataset
+Discovery recommendation before training approval. It extracts dataset intent,
+ranks safe public candidates, explains license/privacy/schema risks, persists
+the latest result in session/run state, and keeps Kaggle excluded as future work.
+See [`docs/dataset-discovery.md`](docs/dataset-discovery.md).
+
 Production/client deployments use a shared redaction policy for backend
 persistence and frontend rendering, private-by-default sandboxes, and safe
 security health diagnostics. See

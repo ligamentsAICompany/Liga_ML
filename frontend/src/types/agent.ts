@@ -41,6 +41,19 @@ export interface UploadedDatasetInfo {
   load_dataset_snippet?: string;
 }
 
+export interface DatasetDiscoveryInfo {
+  query?: string | null;
+  intent?: Record<string, unknown>;
+  allowed_sources?: string[];
+  excluded_sources?: string[];
+  candidates?: Array<Record<string, unknown>>;
+  recommended_candidate?: Record<string, unknown> | null;
+  warnings?: string[];
+  selected_candidate?: Record<string, unknown> | null;
+  timestamp?: string | null;
+  requires_user_selection?: boolean;
+}
+
 export interface BackgroundRunProviderMetadata {
   provider: 'hf-jobs' | 'gcp-vertex' | 'aws-sagemaker' | 'none' | string;
   status?: string | null;
@@ -50,6 +63,7 @@ export interface BackgroundRunProviderMetadata {
   artifact_path?: string | null;
   output_policy?: string | null;
   last_checked_at?: string | null;
+  dataset_discovery?: DatasetDiscoveryInfo | null;
 }
 
 export interface BackgroundRunSummary {
@@ -75,6 +89,7 @@ export interface BackgroundRunSummary {
   audit_warning_count?: number;
   audit_error_count?: number;
   latest_audit_event?: AuditEvent | null;
+  dataset_discovery?: DatasetDiscoveryInfo | null;
 }
 
 export interface UnavailableModelInfo {
@@ -114,6 +129,7 @@ export interface SessionMeta {
   autoApprovalEstimatedSpendUsd?: number;
   autoApprovalRemainingUsd?: number | null;
   uploadedDatasets?: UploadedDatasetInfo[];
+  latestDatasetDiscovery?: DatasetDiscoveryInfo | null;
   runs?: BackgroundRunSummary[];
   unavailableModels?: Record<string, UnavailableModelInfo>;
 }
