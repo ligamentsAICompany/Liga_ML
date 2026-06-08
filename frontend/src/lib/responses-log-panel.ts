@@ -4,9 +4,12 @@ export interface ResponsesSummary {
   batch_number: number;
   has_rows: boolean;
   button_enabled: boolean;
+  durable?: boolean;
+  store_type?: string;
 }
 
 export interface ResponseLogRow {
+  id?: string;
   display_session_number: number;
   actual_sequence_number: number;
   batch_number: number;
@@ -22,6 +25,29 @@ export interface ResponseLogRow {
   final_artifact_or_result: string;
   created_at?: string | null;
   completed_at?: string | null;
+  provider_metadata?: Record<string, unknown> | null;
+  error?: string | null;
+}
+
+export interface ResponsesPagePayload {
+  rows: ResponseLogRow[];
+  page: number;
+  page_size: number;
+  total_rows: number;
+  total_pages: number;
+  has_next: boolean;
+  has_previous: boolean;
+}
+
+export interface ResponsesQueryState {
+  page: number;
+  pageSize: number;
+  platform?: string;
+  progress?: string;
+  model?: string;
+  sessionId?: string;
+  jobId?: string;
+  q?: string;
 }
 
 export interface ResponseColumn {
@@ -92,6 +118,48 @@ export function createResponsesButtonState({
     visible: true,
     disabled: summary?.button_enabled === false ? false : false,
     label: summary?.has_rows ? `Responses (${summary.visible_count})` : 'Responses',
+  };
+}
+
+export function createResponsesQueryParams({
+  page,
+  pageSize,
+  platform,
+  progress,
+  model,
+  sessionId,
+  jobId,
+  q,
+}: ResponsesQueryState): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set('page', String(Math.max(1, page || 1)));
+  params.set('page_size', String(Math.max(1, pageSize || 50)));
+  for (const [key, value] of [
+    ['platform', platform],
+    ['progress', progress],
+    ['model', model],
+    ['session_id', sessionId],
+    ['job_id', jobId],
+    ['q', q],
+  ] as const) {
+    const cleanValue = String(value || '').trim();
+    if (cleanValue) {
+      params.set(key, cleanValue);
+    }
+  }
+  return params;
+}
+
+export function createResponsesPaginationModel(payload: ResponsesPagePayload | null) {
+  const page = payload?.page || 1;
+  const totalPages = payload?.total_pages || 0;
+  const totalRows = payload?.total_rows || 0;
+  return {
+    label: totalPages > 0 ? `Page ${page} of ${totalPages} • ${totalRows} responses` : 'No response pages',
+    canGoPrevious: Boolean(payload?.has_previous),
+    canGoNext: Boolean(payload?.has_next),
+    previousPage: Math.max(1, page - 1),
+    nextPage: page + 1,
   };
 }
 

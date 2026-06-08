@@ -46,7 +46,12 @@ from models import (
     SubmitRequest,
     TruncateRequest,
 )
-from responses_log import build_responses_log, build_responses_summary
+from responses_log import (
+    build_responses_log,
+    build_responses_summary,
+    filter_response_rows,
+    paginate_response_rows,
+)
 from session_manager import (
     MAX_SESSIONS,
     AgentSession,
@@ -425,13 +430,127 @@ async def provider_health() -> dict[str, Any]:
     }
 
 
-@router.get("/responses")
-async def get_responses(user: dict = Depends(get_current_user)) -> dict[str, Any]:
-    """Return the current visible batch of fine-tuning/job response rows."""
-    sessions = await session_manager.list_sessions(user_id=user["user_id"])
-    return await build_responses_log(
+def _active_response_sessions(user_id: str) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    active_sessions = getattr(session_manager, "sessions", {})
+    for agent_session in active_sessions.values():
+        if user_id != "dev" and agent_session.user_id not in {user_id, "dev"}:
+            continue
+        sessions.append(
+            {
+                "session_id": agent_session.session_id,
+                "title": agent_session.title,
+                "model": agent_session.session.config.model_name,
+                "user_id": agent_session.user_id,
+                "cloud_provider": agent_session.cloud_provider,
+                "training_goal": agent_session.training_goal,
+                "output_policy": agent_session.output_policy,
+                "created_at": agent_session.created_at,
+            }
+        )
+    return sessions
+
+
+async def _sync_response_rows(
+    user_id: str, *, include_persisted_sessions: bool = False
+) -> list[dict[str, Any]]:
+    if include_persisted_sessions:
+        sessions = await session_manager.list_sessions(user_id=user_id)
+    else:
+        sessions = _active_response_sessions(user_id)
+    response_log = await build_responses_log(
         sessions,
         load_events=session_manager.load_response_events,
+    )
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
+        await store.upsert_response_rows(response_log["rows"], user_id=user_id)
+    return response_log["rows"]
+
+
+def _stale_hf_response_session_ids(rows: list[dict[str, Any]]) -> set[str]:
+    terminal = {"completed", "failed", "error", "cancelled", "interrupted", "blocked"}
+    return {
+        str(row.get("session_id"))
+        for row in rows
+        if row.get("platform") == "hf-jobs"
+        and str(row.get("progress") or "").lower() not in terminal
+        and row.get("session_id")
+        and row.get("job_id")
+    }
+
+
+async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
+    if not session_ids:
+        return
+    sessions = await session_manager.list_sessions(user_id=user_id)
+    selected = [
+        session
+        for session in sessions
+        if str(session.get("session_id") or "") in session_ids
+    ]
+    if not selected:
+        return
+    response_log = await build_responses_log(
+        selected,
+        load_events=session_manager.load_response_events,
+    )
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
+        await store.upsert_response_rows(response_log["rows"], user_id=user_id)
+
+
+@router.get("/responses")
+async def get_responses(
+    page: int = 1,
+    page_size: int = 50,
+    platform: str | None = None,
+    progress: str | None = None,
+    model: str | None = None,
+    session_id: str | None = None,
+    job_id: str | None = None,
+    q: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return paginated fine-tuning/job response rows."""
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "list_response_rows"):
+        summary = await store.get_response_summary(user_id=user["user_id"])
+        await _sync_response_rows(
+            user["user_id"],
+            include_persisted_sessions=not bool(summary.get("has_rows")),
+        )
+    else:
+        rows = await _sync_response_rows(
+            user["user_id"], include_persisted_sessions=True
+        )
+    filters = {
+        "platform": platform,
+        "progress": progress,
+        "model": model,
+        "session_id": session_id,
+        "job_id": job_id,
+        "q": q,
+        "page": page,
+        "page_size": page_size,
+    }
+    if getattr(store, "enabled", False) and hasattr(store, "list_response_rows"):
+        response_page = await store.list_response_rows(
+            user_id=user["user_id"], **filters
+        )
+        stale_session_ids = _stale_hf_response_session_ids(
+            response_page.get("rows", [])
+        )
+        if stale_session_ids:
+            await _sync_response_sessions(user["user_id"], stale_session_ids)
+            response_page = await store.list_response_rows(
+                user_id=user["user_id"], **filters
+            )
+        return response_page
+    return paginate_response_rows(
+        filter_response_rows(rows, **filters),
+        page=page,
+        page_size=page_size,
     )
 
 
@@ -440,19 +559,20 @@ async def get_responses_summary(
     user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Return summary metadata for the Responses button."""
-    sessions = await session_manager.list_sessions(user_id=user["user_id"])
-    response_log = await build_responses_log(
-        sessions,
-        load_events=session_manager.load_response_events,
-    )
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "get_response_summary"):
+        return await store.get_response_summary(user_id=user["user_id"])
+    rows = await _sync_response_rows(user["user_id"])
     total_responses = 0
-    for row in response_log["rows"]:
+    for row in rows:
         total_responses = max(
             total_responses, int(row.get("actual_sequence_number") or 0)
         )
     return build_responses_summary(
-        response_log["rows"],
+        rows,
         total_responses=total_responses,
+        durable=False,
+        store_type="memory",
     )
 
 

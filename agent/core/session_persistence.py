@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import os
+import math
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -104,6 +106,31 @@ class NoopSessionStore:
     async def mark_pro_seen(self, *_: Any, **__: Any) -> dict[str, Any] | None:
         return None
 
+    async def upsert_response_rows(self, *_: Any, **__: Any) -> None:
+        return None
+
+    async def list_response_rows(self, *_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "rows": [],
+            "page": 1,
+            "page_size": 50,
+            "total_rows": 0,
+            "total_pages": 0,
+            "has_next": False,
+            "has_previous": False,
+        }
+
+    async def get_response_summary(self, *_: Any, **__: Any) -> dict[str, Any]:
+        return {
+            "total_responses": 0,
+            "visible_count": 0,
+            "batch_number": 1,
+            "has_rows": False,
+            "button_enabled": True,
+            "durable": False,
+            "store_type": "memory",
+        }
+
 
 class MongoSessionStore(NoopSessionStore):
     """MongoDB-backed session store."""
@@ -159,6 +186,12 @@ class MongoSessionStore(NoopSessionStore):
         )
         await self.db.session_trace_messages.create_index([("created_at", -1)])
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
+        await self.db.response_rows.create_index(
+            [("user_id", 1), ("actual_sequence_number", -1)]
+        )
+        await self.db.response_rows.create_index([("platform", 1), ("progress", 1)])
+        await self.db.response_rows.create_index([("session_id", 1)])
+        await self.db.response_rows.create_index([("job_id", 1)])
 
     def _ready(self) -> bool:
         return bool(self.enabled and self.db is not None)
@@ -506,6 +539,191 @@ class MongoSessionStore(NoopSessionStore):
         return {
             "converted": True,
             "first_seen_at": (doc.get("first_seen_at") or now).isoformat(),
+        }
+
+    def _response_query(
+        self,
+        *,
+        user_id: str,
+        platform: str | None = None,
+        progress: str | None = None,
+        model: str | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {}
+        if user_id != "dev":
+            query["user_id"] = user_id
+
+        def contains(field: str, value: str | None) -> None:
+            if value:
+                query[field] = {"$regex": re.escape(value), "$options": "i"}
+
+        contains("platform", platform)
+        contains("progress", progress)
+        contains("model_name", model)
+        contains("session_id", session_id)
+        contains("job_id", job_id)
+        if q:
+            regex = {"$regex": re.escape(q), "$options": "i"}
+            query["$or"] = [
+                {"id": regex},
+                {"session_id": regex},
+                {"short_session_id": regex},
+                {"session_title": regex},
+                {"model_name": regex},
+                {"platform": regex},
+                {"run_type": regex},
+                {"result_storage": regex},
+                {"progress": regex},
+                {"job_id": regex},
+                {"final_artifact_or_result": regex},
+                {"error": regex},
+            ]
+        return query
+
+    def _mongo_safe_value(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            safe: dict[str, Any] = {}
+            for key, item in value.items():
+                text_key = str(key).replace(".", "_")
+                if text_key.startswith("$"):
+                    text_key = f"_{text_key[1:]}"
+                safe[text_key] = self._mongo_safe_value(item)
+            return safe
+        if isinstance(value, list):
+            return [self._mongo_safe_value(item) for item in value]
+        return value
+
+    def _normalize_response_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(row)
+        progress = str(normalized.get("progress") or "").lower()
+        state = str(
+            (normalized.get("provider_metadata") or {}).get("state") or ""
+        ).lower()
+        status = state if progress in {"", "unknown"} else progress
+        if status in {"succeeded", "success", "complete"}:
+            normalized["progress"] = "completed"
+        elif status == "failure":
+            normalized["progress"] = "failed"
+        elif status == "canceled":
+            normalized["progress"] = "cancelled"
+        elif status in {"scheduling", "scheduled", "pending"}:
+            normalized["progress"] = "queued"
+        elif status in {"billing_required", "missing_token", "approval_required"}:
+            normalized["progress"] = "blocked"
+        return normalized
+
+    async def upsert_response_rows(
+        self, rows: list[dict[str, Any]], *, user_id: str = "dev"
+    ) -> None:
+        if not self._ready() or not rows:
+            return
+        now = _now()
+        ops: list[Any] = []
+        for raw in rows:
+            row = self._mongo_safe_value(dict(raw))
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
+            row_user_id = str(row.get("user_id") or user_id)
+            row["user_id"] = row_user_id
+            row["updated_at"] = now
+            ops.append(
+                UpdateOne(
+                    {"_id": row_id},
+                    {
+                        "$set": row,
+                        "$setOnInsert": {
+                            "_id": row_id,
+                            "inserted_at": now,
+                            "schema_version": SCHEMA_VERSION,
+                        },
+                    },
+                    upsert=True,
+                )
+            )
+        if not ops:
+            return
+        try:
+            await self.db.response_rows.bulk_write(ops, ordered=False)
+        except PyMongoError as e:
+            logger.debug("Failed to upsert response rows: %s", e)
+
+    async def list_response_rows(
+        self,
+        *,
+        user_id: str,
+        page: int = 1,
+        page_size: int = 50,
+        platform: str | None = None,
+        progress: str | None = None,
+        model: str | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
+        q: str | None = None,
+    ) -> dict[str, Any]:
+        safe_page = max(1, int(page or 1))
+        safe_page_size = min(200, max(1, int(page_size or 50)))
+        if not self._ready():
+            return {
+                "rows": [],
+                "page": safe_page,
+                "page_size": safe_page_size,
+                "total_rows": 0,
+                "total_pages": 0,
+                "has_next": False,
+                "has_previous": False,
+            }
+        query = self._response_query(
+            user_id=user_id,
+            platform=platform,
+            progress=progress,
+            model=model,
+            session_id=session_id,
+            job_id=job_id,
+            q=q,
+        )
+        total_rows = await self.db.response_rows.count_documents(query)
+        total_pages = math.ceil(total_rows / safe_page_size) if total_rows else 0
+        cursor = (
+            self.db.response_rows.find(query, {"_id": 0})
+            .sort([("actual_sequence_number", -1), ("created_at", -1)])
+            .skip((safe_page - 1) * safe_page_size)
+            .limit(safe_page_size)
+        )
+        rows = [self._normalize_response_row(row) async for row in cursor]
+        return {
+            "rows": rows,
+            "page": safe_page,
+            "page_size": safe_page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+            "has_next": bool(total_pages and safe_page < total_pages),
+            "has_previous": safe_page > 1 and total_pages > 0,
+        }
+
+    async def get_response_summary(self, *, user_id: str) -> dict[str, Any]:
+        if not self._ready():
+            return await super().get_response_summary(user_id=user_id)
+        query: dict[str, Any] = {}
+        if user_id != "dev":
+            query["user_id"] = user_id
+        total = await self.db.response_rows.count_documents(query)
+        latest = await self.db.response_rows.find_one(
+            query,
+            sort=[("actual_sequence_number", -1), ("created_at", -1)],
+        )
+        batch = int((latest or {}).get("batch_number") or 1)
+        return {
+            "total_responses": total,
+            "visible_count": min(total, 50),
+            "batch_number": batch,
+            "has_rows": bool(total),
+            "button_enabled": True,
+            "durable": True,
+            "store_type": "mongodb",
         }
 
 

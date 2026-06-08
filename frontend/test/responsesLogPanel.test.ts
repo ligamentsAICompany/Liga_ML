@@ -4,6 +4,8 @@ import { test } from 'node:test';
 
 import {
   REQUIRED_RESPONSE_COLUMNS,
+  createResponsesQueryParams,
+  createResponsesPaginationModel,
   createResponsesButtonState,
   createResponsesPanelModel,
   redactResponseText,
@@ -55,7 +57,7 @@ test('responses panel renders row labels with redacted artifacts', () => {
         platform: 'hf-jobs',
         run_type: 'smoke-test',
         result_storage: 'cloud-and-hf-hub',
-        progress: 'succeeded',
+        progress: 'completed',
         job_id: 'https://huggingface.co/jobs/acme/123',
         final_artifact_or_result: 'https://huggingface.co/acme/model?token=hf_secret_token_123',
         created_at: '2026-01-01T00:00:00+00:00',
@@ -67,7 +69,7 @@ test('responses panel renders row labels with redacted artifacts', () => {
   assert.equal(panel.rows[0].cells.session, '1 (actual 16, batch 2)');
   assert.equal(panel.rows[0].cells.model, 'Qwen/Qwen2.5-0.5B-Instruct');
   assert.equal(panel.rows[0].cells.platform, 'hf-jobs');
-  assert.equal(panel.rows[0].cells.progress, 'succeeded');
+  assert.equal(panel.rows[0].cells.progress, 'completed');
   assert.doesNotMatch(panel.rows[0].cells.result, /hf_secret/);
   assert.match(panel.rows[0].cells.result, /\[REDACTED\]/);
 });
@@ -86,4 +88,46 @@ test('response redaction handles bearer and hf tokens', () => {
 
 test('app layout includes the responses button component', () => {
   assert.match(appLayoutSource, /ResponsesLogButton/);
+});
+
+test('responses query params include pagination and omit empty filters', () => {
+  const params = createResponsesQueryParams({
+    page: 2,
+    pageSize: 25,
+    platform: 'hf-jobs',
+    progress: 'completed',
+    model: '',
+    jobId: 'job-123',
+    q: 'housing',
+  });
+
+  assert.equal(
+    params.toString(),
+    'page=2&page_size=25&platform=hf-jobs&progress=completed&job_id=job-123&q=housing',
+  );
+});
+
+test('responses pagination model exposes previous and next controls', () => {
+  const pagination = createResponsesPaginationModel({
+    rows: [],
+    page: 2,
+    page_size: 50,
+    total_rows: 101,
+    total_pages: 3,
+    has_next: true,
+    has_previous: true,
+  });
+
+  assert.equal(pagination.label, 'Page 2 of 3 • 101 responses');
+  assert.equal(pagination.canGoPrevious, true);
+  assert.equal(pagination.canGoNext, true);
+  assert.equal(pagination.previousPage, 1);
+  assert.equal(pagination.nextPage, 3);
+});
+
+test('responses dialog source does not clear fetched rows on close', () => {
+  const buttonSource = readFileSync('src/components/ResponsesLogButton.tsx', 'utf8');
+
+  assert.match(buttonSource, /setOpen\(false\)/);
+  assert.doesNotMatch(buttonSource, /setRows\(\[\]\)/);
 });
