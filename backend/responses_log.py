@@ -48,6 +48,9 @@ LIGA_MARKER_RE = re.compile(r"^(LIGA_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
 HF_JOB_URL_RE = re.compile(r"https://huggingface\.co/jobs/[^\s`\"')\]]+")
 HF_JOB_ID_RE = re.compile(r"\*\*Job ID:\*\*\s*([^\s`]+)", re.IGNORECASE)
 FINAL_STATUS_RE = re.compile(r"\*\*Final Status:\*\*\s*([A-Za-z_]+)", re.IGNORECASE)
+GCP_JOB_RE = re.compile(r"\*\*Job:\*\*\s*`?([^`\n]+)`?", re.IGNORECASE)
+GCP_STATE_RE = re.compile(r"\*\*State:\*\*\s*([A-Z_]+)", re.IGNORECASE)
+GCP_OUTPUT_DIR_RE = re.compile(r"\*\*Output dir:\*\*\s*([^\s`]+)", re.IGNORECASE)
 JSON_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 JSON_STAGE_RE = re.compile(r'"stage"\s*:\s*"([^"]+)"')
 JSON_MESSAGE_RE = re.compile(r'"message"\s*:\s*("([^"]*)"|null)')
@@ -118,6 +121,8 @@ def _event_created_at(event: dict[str, Any], session: dict[str, Any]) -> str | N
 
 def _normalize_progress(state: Any) -> str:
     text = (_as_str(state) or "unknown").lower()
+    if text.startswith("job_state_"):
+        text = text.removeprefix("job_state_")
     if text in {"succeeded", "success", "complete", "done", "finished"}:
         return "completed"
     if text in {"failure"}:
@@ -268,6 +273,38 @@ def _extract_hf_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None:
     return extracted
 
 
+def _extract_gcp_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None:
+    output = _as_str(data.get("output") or data.get("formatted") or data.get("result"))
+    if not output:
+        return None
+
+    job_match = GCP_JOB_RE.search(output)
+    state_match = GCP_STATE_RE.search(output)
+    output_dir_match = GCP_OUTPUT_DIR_RE.search(output)
+    job_name = _as_str(job_match.group(1)) if job_match else None
+    state = _as_str(state_match.group(1)) if state_match else None
+    output_dir = _as_str(output_dir_match.group(1)) if output_dir_match else None
+
+    if not state and data.get("success") is False and job_name:
+        state = "failed"
+    if not state and not job_name:
+        return None
+
+    extracted = {
+        "tool_call_id": data.get("tool_call_id"),
+        "tool": "gcp_vertex_jobs",
+        "state": state or "unknown",
+        "output": output,
+    }
+    if job_name and not _is_fake_job_id(job_name):
+        extracted["jobName"] = job_name
+    if output_dir:
+        extracted["outputDir"] = output_dir
+    if data.get("success") is not None:
+        extracted["success"] = data.get("success")
+    return extracted
+
+
 def _response_event_data(event: dict[str, Any]) -> dict[str, Any] | None:
     data = event.get("data") or {}
     if not isinstance(data, dict):
@@ -277,6 +314,8 @@ def _response_event_data(event: dict[str, Any]) -> dict[str, Any] | None:
         return data
     if event_type == "tool_output" and data.get("tool") == "hf_jobs":
         return _extract_hf_tool_output_data(data)
+    if event_type == "tool_output" and data.get("tool") == "gcp_vertex_jobs":
+        return _extract_gcp_tool_output_data(data)
     return None
 
 

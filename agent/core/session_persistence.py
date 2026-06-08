@@ -622,11 +622,35 @@ class MongoSessionStore(NoopSessionStore):
             return
         now = _now()
         ops: list[Any] = []
-        for raw in rows:
+        raw_rows = [dict(raw) for raw in rows]
+        row_ids = [str(row.get("id") or "") for row in raw_rows if row.get("id")]
+        existing_by_id: dict[str, dict[str, Any]] = {}
+        if row_ids:
+            cursor = self.db.response_rows.find(
+                {"_id": {"$in": row_ids}},
+                {
+                    "_id": 1,
+                    "actual_sequence_number": 1,
+                    "display_session_number": 1,
+                    "batch_number": 1,
+                    "created_at": 1,
+                },
+            )
+            existing_by_id = {str(doc["_id"]): doc async for doc in cursor}
+        for raw in raw_rows:
             row = self._mongo_safe_value(dict(raw))
             row_id = str(row.get("id") or "")
             if not row_id:
                 continue
+            existing = existing_by_id.get(row_id) or {}
+            for key in (
+                "actual_sequence_number",
+                "display_session_number",
+                "batch_number",
+                "created_at",
+            ):
+                if existing.get(key) is not None:
+                    row[key] = existing[key]
             row_user_id = str(row.get("user_id") or user_id)
             row["user_id"] = row_user_id
             row["updated_at"] = now

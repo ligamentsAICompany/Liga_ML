@@ -468,12 +468,12 @@ async def _sync_response_rows(
     return response_log["rows"]
 
 
-def _stale_hf_response_session_ids(rows: list[dict[str, Any]]) -> set[str]:
+def _stale_response_session_ids(rows: list[dict[str, Any]]) -> set[str]:
     terminal = {"completed", "failed", "error", "cancelled", "interrupted", "blocked"}
     return {
         str(row.get("session_id"))
         for row in rows
-        if row.get("platform") == "hf-jobs"
+        if row.get("platform") in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
         and str(row.get("progress") or "").lower() not in terminal
         and row.get("session_id")
         and row.get("job_id")
@@ -538,9 +538,7 @@ async def get_responses(
         response_page = await store.list_response_rows(
             user_id=user["user_id"], **filters
         )
-        stale_session_ids = _stale_hf_response_session_ids(
-            response_page.get("rows", [])
-        )
+        stale_session_ids = _stale_response_session_ids(response_page.get("rows", []))
         if stale_session_ids:
             await _sync_response_sessions(user["user_id"], stale_session_ids)
             response_page = await store.list_response_rows(

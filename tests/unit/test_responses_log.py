@@ -320,6 +320,51 @@ async def test_gcp_and_aws_terminal_rows_extract_provider_artifacts():
 
 
 @pytest.mark.asyncio
+async def test_gcp_running_row_updates_from_succeeded_tool_output():
+    events = [
+        _event(
+            "gcp_vertex_jobs",
+            "running",
+            jobName="projects/p/locations/us/customJobs/456",
+            outputDir="gs://liga-output/job-456",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+        _tool_output(
+            "gcp_vertex_jobs",
+            """
+**Vertex AI job details:**
+
+**Job:** `projects/p/locations/us/customJobs/456`
+**Display name:** manufacturing-smoke-test
+**State:** JOB_STATE_SUCCEEDED
+**Update time:** 2026-01-01 00:01:00+00:00
+**View in Vertex AI:** https://console.cloud.google.com/vertex-ai/jobs/456
+""",
+            created_at=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        ),
+    ]
+
+    result = await build_responses_log(
+        [
+            _session(
+                "gcp",
+                provider="gcp-vertex",
+                output_policy="cloud-private",
+                events=events,
+            )
+        ],
+        load_events=lambda _sid: events,
+    )
+
+    assert len(result["rows"]) == 1
+    row = result["rows"][0]
+    assert row["progress"] == "completed"
+    assert row["job_id"] == "projects/p/locations/us/customJobs/456"
+    assert row["final_artifact_or_result"] == "gs://liga-output/job-456"
+    assert row["completed_at"] == "2026-01-01T00:01:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_failed_row_extracts_failure_reason_and_redacts_secrets():
     sample_token_value = "hf_fake_token_123456789"
     events = [
@@ -675,6 +720,69 @@ async def test_responses_routes_refresh_stale_hf_rows_from_persisted_events(
 
     rows = await agent.get_responses(
         job_id="persisted",
+        user={"user_id": "dev"},
+    )
+
+    assert rows["rows"][0]["progress"] == "completed"
+    assert rows["rows"][0]["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_responses_routes_refresh_stale_gcp_rows_from_persisted_events(
+    monkeypatch,
+):
+    manager = _StoreBackedManager()
+    job_name = "projects/p/locations/us/customJobs/456"
+    await manager.persistence_store.upsert_response_rows(
+        [
+            {
+                "id": f"persisted:gcp-vertex:{job_name}",
+                "display_session_number": 1,
+                "actual_sequence_number": 1,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "short_session_id": "persiste",
+                "session_title": "Persisted Vertex run",
+                "model_name": "moonshotai/Kimi-K2.6",
+                "platform": "gcp-vertex",
+                "run_type": "smoke-test",
+                "result_storage": "cloud-private",
+                "progress": "running",
+                "job_id": job_name,
+                "final_artifact_or_result": "gs://liga-output/job-456",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {},
+            }
+        ]
+    )
+    manager.sessions = {}
+
+    async def completed_events(session_id):
+        assert session_id == "persisted"
+        return [
+            _event(
+                "gcp_vertex_jobs",
+                "running",
+                jobName=job_name,
+                outputDir="gs://liga-output/job-456",
+            ),
+            _tool_output(
+                "gcp_vertex_jobs",
+                f"""
+**Vertex AI job details:**
+
+**Job:** `{job_name}`
+**State:** JOB_STATE_SUCCEEDED
+""",
+            ),
+        ]
+
+    manager.load_response_events = completed_events
+    monkeypatch.setattr(agent, "session_manager", manager)
+
+    rows = await agent.get_responses(
+        job_id="customJobs/456",
         user={"user_id": "dev"},
     )
 
