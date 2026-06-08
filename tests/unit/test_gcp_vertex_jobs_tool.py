@@ -243,7 +243,111 @@ async def test_run_sft_template_generates_vertex_training_script(monkeypatch):
     assert env["TRACKIO_MODE"] == "disabled"
     assert env["TRACKIO_PROJECT"] == "medical-sft"
     assert env["TRACKIO_SPACE_ID"] == "ligaments-dev/ml-intern-trackio"
+    assert env["HF_TOKEN"] == "hf-session-token"
+    assert env["HUGGINGFACE_HUB_TOKEN"] == "hf-session-token"
+    assert "hf-session-token" not in result["formatted"]
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_cloud_private_does_not_require_or_inject_hf_token(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeCustomJob.instances = []
+
+    session = FakeSession()
+    session.hf_token = None
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "command": ["python", "train.py"],
+            "display_name": "private-run",
+            "output_policy": "cloud-private",
+        }
+    )
+
+    assert not result.get("isError")
+    worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
+    env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
     assert "HF_TOKEN" not in env
+    assert "HUGGINGFACE_HUB_TOKEN" not in env
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_preserves_secret_resource_for_cloud_private(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    monkeypatch.setenv(
+        "HF_TOKEN_SECRET_RESOURCE",
+        "projects/test-project/secrets/hf-token/versions/latest",
+    )
+    FakeCustomJob.instances = []
+
+    session = FakeSession()
+    session.hf_token = None
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "command": ["python", "train.py"],
+            "display_name": "private-run-with-secret",
+            "output_policy": "cloud-private",
+        }
+    )
+
+    assert not result.get("isError")
+    worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
+    env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
+    assert env["HF_TOKEN_SECRET_RESOURCE"] == (
+        "projects/test-project/secrets/hf-token/versions/latest"
+    )
+    assert "HF_TOKEN" not in env
+    assert "HUGGINGFACE_HUB_TOKEN" not in env
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_hf_hub_policy_requires_hf_token_before_submit(
+    monkeypatch,
+):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("HF_TOKEN_SECRET_RESOURCE", raising=False)
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool._resolve_vertex_hf_token",
+        lambda session=None: None,
+    )
+    FakeCustomJob.instances = []
+
+    session = FakeSession()
+    session.hf_token = None
+    tool = GcpVertexJobsTool(session=session, custom_job_cls=FakeCustomJob)
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "dataset_name": "trl-lib/Capybara",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "hub_model_id": "ligaments-dev/needs-token",
+            "output_policy": "cloud-and-hf-hub",
+        }
+    )
+
+    assert result["isError"] is True
+    assert "Hugging Face token" in result["formatted"]
+    assert "hf_" not in result["formatted"]
+    assert FakeCustomJob.instances == []
 
 
 @pytest.mark.asyncio
@@ -519,14 +623,10 @@ async def test_run_sft_template_defaults_to_cloud_private_and_caps_large_dataset
 
 
 @pytest.mark.asyncio
-async def test_run_sft_template_uses_secret_manager_resource_for_hf_token(monkeypatch):
+async def test_run_sft_template_uses_session_token_for_hf_hub_policy(monkeypatch):
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
     monkeypatch.setenv("GCS_BUCKET", "liga-training")
-    monkeypatch.setenv(
-        "HF_TOKEN_SECRET_RESOURCE",
-        "projects/test-project/secrets/hf-token/versions/latest",
-    )
     FakeCustomJob.instances = []
 
     session = FakeSession()
@@ -538,17 +638,16 @@ async def test_run_sft_template_uses_secret_manager_resource_for_hf_token(monkey
             "template": "sft",
             "dataset_name": "ligaments-dev/private-dataset",
             "model_name": "meta-llama/Llama-3.2-3B-Instruct",
-            "output_policy": "cloud-private",
+            "hub_model_id": "ligaments-dev/private-dataset-model",
+            "output_policy": "hf-hub",
         }
     )
 
     assert not result.get("isError")
     worker_pool = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0]
     env = {item["name"]: item["value"] for item in worker_pool["container_spec"]["env"]}
-    assert env["HF_TOKEN_SECRET_RESOURCE"] == (
-        "projects/test-project/secrets/hf-token/versions/latest"
-    )
-    assert "HF_TOKEN" not in env
+    assert env["HF_TOKEN"] == "hf-session-token"
+    assert env["HUGGINGFACE_HUB_TOKEN"] == "hf-session-token"
     assert "hf-session-token" not in result["formatted"]
 
 

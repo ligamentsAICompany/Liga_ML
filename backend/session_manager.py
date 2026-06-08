@@ -779,6 +779,7 @@ class SessionManager:
                 hf_username=hf_username,
             )
             return started
+        await self.persist_session_snapshot(agent_session, runtime_state="idle")
         if preload_sandbox:
             self._start_cpu_sandbox_preload(agent_session)
         logger.info("Restored session %s for user %s", session_id, owner or user_id)

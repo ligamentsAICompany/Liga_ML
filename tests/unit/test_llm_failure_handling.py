@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,44 @@ class EmptyToolRouter:
         raise AssertionError(f"unexpected tool call: {name}")
 
 
+class VertexTerminalToolRouter:
+    def __init__(self):
+        self.calls = []
+
+    def get_tool_specs_for_llm(self):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "gcp_vertex_jobs",
+                    "description": "Inspect Vertex jobs",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+
+    async def call_tool(self, name, arguments, session=None, tool_call_id=None):
+        self.calls.append((name, arguments, tool_call_id))
+        await session.send_event(
+            agent_loop.Event(
+                event_type="tool_state_change",
+                data={
+                    "tool": "gcp_vertex_jobs",
+                    "tool_call_id": tool_call_id,
+                    "state": "failed",
+                    "jobName": "projects/test/locations/us/customJobs/123",
+                },
+            )
+        )
+        return (
+            "**Vertex AI job details:**\n\n"
+            "**Job:** `projects/test/locations/us/customJobs/123`\n"
+            "**State:** JOB_STATE_FAILED\n"
+            "**Failure reason:** missing runtime token",
+            True,
+        )
+
+
 def _session() -> Session:
     return Session(
         asyncio.Queue(),
@@ -27,11 +66,96 @@ def _session() -> Session:
     )
 
 
+def _session_with_router(router, model_name: str = "openai/test") -> Session:
+    return Session(
+        asyncio.Queue(),
+        Config.model_validate({"model_name": model_name, "save_sessions": False}),
+        tool_router=router,
+        stream=False,
+    )
+
+
 async def _drain_events(session: Session):
     events = []
     while not session.event_queue.empty():
         events.append(await session.event_queue.get())
     return events
+
+
+def test_kimi_text_only_messages_drop_stale_image_placeholders():
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {
+            "role": "user",
+            "content": "Run an HF Jobs smoke test <image>.",
+            "images": [],
+        },
+        {"role": "assistant", "content": "Prior answer with <|image_1|> marker."},
+    ]
+
+    sanitized = agent_loop._sanitize_messages_for_model(
+        messages, "openai/moonshotai/Kimi-K2.6"
+    )
+
+    dumped = [
+        message.model_dump(mode="json") if hasattr(message, "model_dump") else message
+        for message in sanitized
+    ]
+    payload_text = json.dumps(dumped)
+    assert "<image>" not in payload_text
+    assert "<|image_1|>" not in payload_text
+    assert "images" not in dumped[1]
+    assert dumped[1]["content"] == "Run an HF Jobs smoke test ."
+
+
+def test_kimi_sanitizer_preserves_actual_image_parts():
+    messages = [
+        {
+            "role": "user",
+            "content": "Describe this image.",
+            "images": [{"url": "data:image/png;base64,abc123"}],
+        }
+    ]
+
+    sanitized = agent_loop._sanitize_messages_for_model(
+        messages, "openai/moonshotai/Kimi-K2.6"
+    )
+
+    assert sanitized == messages
+
+
+def test_kimi_sanitizer_omits_empty_image_content_parts():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Run HF Jobs <|image_1|> smoke test."},
+                {"type": "image_url", "image_url": {}},
+                {"type": "input_image", "image_url": ""},
+            ],
+        }
+    ]
+
+    sanitized = agent_loop._sanitize_messages_for_model(
+        messages, "openai/moonshotai/Kimi-K2.6"
+    )
+
+    assert sanitized == [{"role": "user", "content": "Run HF Jobs  smoke test."}]
+    assert "image" not in json.dumps(sanitized).lower()
+
+
+def test_kimi_sanitizer_leaves_non_kimi_models_unchanged():
+    messages = [
+        {
+            "role": "user",
+            "content": "Keep provider-specific placeholders <image> unchanged.",
+            "images": [],
+        }
+    ]
+
+    sanitized = agent_loop._sanitize_messages_for_model(messages, "openai/gpt-5.5")
+
+    assert sanitized is messages
 
 
 @pytest.mark.asyncio
@@ -187,6 +311,67 @@ async def test_provider_spending_limit_failure_is_quota(monkeypatch):
         event.event_type == "error" and (event.data or {}).get("error_type") == "quota"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_vertex_terminal_failure_ends_turn_without_extra_llm_retry(monkeypatch):
+    router = VertexTerminalToolRouter()
+    session = _session_with_router(router)
+    session.cloud_provider = "gcp-vertex"
+    calls = 0
+
+    async def fake_call_llm_non_streaming(session, messages, tools, llm_params):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("terminal provider failure should end the turn")
+        return LLMResult(
+            content=None,
+            tool_calls_acc={
+                0: {
+                    "id": "call_vertex",
+                    "function": {
+                        "name": "gcp_vertex_jobs",
+                        "arguments": json.dumps(
+                            {
+                                "operation": "inspect",
+                                "job_name": "projects/test/locations/us/customJobs/123",
+                            }
+                        ),
+                    },
+                }
+            },
+            token_count=10,
+            finish_reason="tool_calls",
+        )
+
+    monkeypatch.setattr(
+        agent_loop, "_resolve_llm_params", lambda *_, **__: {"model": "openai/test"}
+    )
+    monkeypatch.setattr(
+        agent_loop, "_call_llm_non_streaming", fake_call_llm_non_streaming
+    )
+
+    await Handlers.run_agent(session, "check the Vertex job")
+
+    events = await _drain_events(session)
+    assert calls == 1
+    assert router.calls == [
+        (
+            "gcp_vertex_jobs",
+            {
+                "operation": "inspect",
+                "job_name": "projects/test/locations/us/customJobs/123",
+            },
+            "call_vertex",
+        )
+    ]
+    assert any(
+        event.event_type == "tool_state_change"
+        and (event.data or {}).get("state") == "failed"
+        for event in events
+    )
+    assert any(event.event_type == "turn_complete" for event in events)
 
 
 @pytest.mark.asyncio

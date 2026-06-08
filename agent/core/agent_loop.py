@@ -5,6 +5,7 @@ Main agent implementation with integrated tool system and MCP support
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -91,6 +92,114 @@ _AWS_SECOND_RUN_BLOCK_MESSAGE = (
     + " AWS job failed. No automatic retry was launched. Ask the user explicitly "
     "before preparing another paid AWS SageMaker run."
 )
+_IMAGE_TOKEN_RE = re.compile(r"<\|?image(?:[_-]\d+)?\|?>", re.IGNORECASE)
+
+
+def _is_kimi_text_model(model_name: str | None) -> bool:
+    normalized = str(model_name or "").lower()
+    return "kimi" in normalized or "moonshot" in normalized
+
+
+def _strip_image_tokens(text: str) -> str:
+    return _IMAGE_TOKEN_RE.sub("", text)
+
+
+def _content_part_has_actual_image(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    part_type = str(part.get("type") or "").lower()
+    if part_type not in {"image", "image_url", "input_image"}:
+        return False
+    image_url = part.get("image_url")
+    if isinstance(image_url, dict) and image_url.get("url"):
+        return True
+    if isinstance(image_url, str) and image_url:
+        return True
+    return bool(part.get("url") or part.get("data") or part.get("source"))
+
+
+def _message_has_actual_image(message: Any) -> bool:
+    images = (
+        message.get("images")
+        if isinstance(message, dict)
+        else getattr(message, "images", None)
+    )
+    if images:
+        return True
+    content = (
+        message.get("content")
+        if isinstance(message, dict)
+        else getattr(message, "content", None)
+    )
+    return isinstance(content, list) and any(
+        _content_part_has_actual_image(part) for part in content
+    )
+
+
+def _sanitize_text_only_message_for_kimi(message: Any) -> Any:
+    if _message_has_actual_image(message):
+        return message
+
+    is_dict = isinstance(message, dict)
+    content = message.get("content") if is_dict else getattr(message, "content", None)
+    images = message.get("images") if is_dict else getattr(message, "images", None)
+    updates: dict[str, Any] = {}
+
+    if isinstance(content, str):
+        cleaned_content = _strip_image_tokens(content)
+        if cleaned_content != content:
+            updates["content"] = cleaned_content
+    elif isinstance(content, list):
+        text_parts = [
+            str(part.get("text") or "")
+            for part in content
+            if isinstance(part, dict)
+            and str(part.get("type") or "").lower() == "text"
+            and part.get("text")
+        ]
+        updates["content"] = _strip_image_tokens("\n".join(text_parts))
+
+    if images is not None:
+        updates["images"] = None
+
+    if not updates:
+        return message
+    if is_dict:
+        cleaned = dict(message)
+        if "content" in updates:
+            cleaned["content"] = updates["content"]
+        if "images" in updates:
+            cleaned.pop("images", None)
+        return cleaned
+    return message.model_copy(update=updates)
+
+
+def _sanitize_messages_for_model(
+    messages: list[Any], model_name: str | None
+) -> list[Any]:
+    """Keep text-only Kimi/Moonshot requests free of stale image markers."""
+    if not _is_kimi_text_model(model_name):
+        return messages
+    return [_sanitize_text_only_message_for_kimi(message) for message in messages]
+
+
+def _is_terminal_provider_tool_output(
+    tool_name: str, output: str, success: bool
+) -> bool:
+    if tool_name != "gcp_vertex_jobs":
+        return False
+    text = str(output or "").lower()
+    if any(
+        state in text
+        for state in (
+            "job_state_failed",
+            "job_state_cancelled",
+            "job_state_expired",
+            "job_state_succeeded",
+        )
+    ):
+        return True
+    return not success and "vertex" in text
 
 
 def _unfinished_plan_items(session: Session) -> list[dict[str, str]]:
@@ -1994,6 +2103,9 @@ class Handlers:
                         session.config.model_name
                     ),
                 )
+                messages = _sanitize_messages_for_model(
+                    messages, llm_params.get("model") or session.config.model_name
+                )
                 if session.stream:
                     llm_result = await _call_llm_streaming(
                         session, messages, tools, llm_params
@@ -2423,6 +2535,7 @@ class Handlers:
                     results = gather_task.result()
 
                     # 4. Record results and send outputs (order preserved)
+                    terminal_provider_output: str | None = None
                     for tc, tool_name, tool_args, output, success in results:
                         tool_msg = Message(
                             role="tool",
@@ -2443,6 +2556,14 @@ class Handlers:
                                 },
                             )
                         )
+                        if _is_terminal_provider_tool_output(
+                            tool_name, output, success
+                        ):
+                            terminal_provider_output = output
+
+                    if terminal_provider_output is not None:
+                        final_response = terminal_provider_output
+                        break
 
                 # If there are tools requiring approval, ask for batch approval
                 if approval_required_tools:
