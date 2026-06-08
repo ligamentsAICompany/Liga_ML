@@ -81,6 +81,95 @@ test('responses panel exposes API error state', () => {
   assert.equal(panel.emptyStateTitle, 'No responses yet');
 });
 
+test('responses panel renders API rows when total rows are present', () => {
+  const panel = createResponsesPanelModel({
+    rows: [
+      {
+        display_session_number: 13,
+        actual_sequence_number: 13,
+        batch_number: 1,
+        session_id: 'vertex-session',
+        model_name: 'Kimi K2.6',
+        platform: 'gcp-vertex',
+        run_type: 'smoke-test',
+        result_storage: 'cloud-private',
+        progress: 'completed',
+        job_id: 'projects/p/locations/us/customJobs/123',
+        final_artifact_or_result: 'gs://liga-output/job-123',
+      },
+    ],
+  });
+
+  assert.equal(panel.rows.length, 1);
+  assert.equal(panel.rows[0].cells.platform, 'gcp-vertex');
+  assert.equal(panel.rows[0].cells.progress, 'completed');
+  assert.equal(panel.rows[0].cells.jobId, 'projects/p/locations/us/customJobs/123');
+});
+
+test('responses pagination renders rows safely when total_pages is zero', () => {
+  const pagination = createResponsesPaginationModel({
+    rows: [
+      {
+        display_session_number: 13,
+        actual_sequence_number: 13,
+        batch_number: 1,
+        session_id: 'vertex-session',
+        model_name: 'Kimi K2.6',
+        platform: 'gcp-vertex',
+        run_type: 'smoke-test',
+        result_storage: 'cloud-private',
+        progress: 'completed',
+        job_id: 'projects/p/locations/us/customJobs/123',
+        final_artifact_or_result: 'gs://liga-output/job-123',
+      },
+    ],
+    page: 1,
+    page_size: 50,
+    total_rows: 1,
+    total_pages: 0,
+    has_next: false,
+    has_previous: false,
+  });
+
+  assert.equal(pagination.label, 'Page 1 of 1 • 1 responses');
+});
+
+test('responses pagination renders rows safely when total_pages is missing', () => {
+  const pagination = createResponsesPaginationModel({
+    rows: [
+      {
+        display_session_number: 13,
+        actual_sequence_number: 13,
+        batch_number: 1,
+        session_id: 'vertex-session',
+        model_name: 'Kimi K2.6',
+        platform: 'gcp-vertex',
+        run_type: 'smoke-test',
+        result_storage: 'cloud-private',
+        progress: 'completed',
+        job_id: 'projects/p/locations/us/customJobs/123',
+        final_artifact_or_result: 'gs://liga-output/job-123',
+      },
+    ],
+    page: 1,
+    page_size: 50,
+    total_rows: 1,
+    total_pages: undefined as unknown as number,
+    has_next: false,
+    has_previous: false,
+  });
+
+  assert.equal(pagination.label, 'Page 1 of 1 • 1 responses');
+});
+
+test('responses panel distinguishes filtered empty state from global no-data state', () => {
+  const empty = createResponsesPanelModel({ rows: [] });
+  const filtered = createResponsesPanelModel({ rows: [], filtersActive: true });
+
+  assert.equal(empty.emptyStateTitle, 'No responses yet');
+  assert.equal(filtered.emptyStateTitle, 'No responses match your filters');
+});
+
 test('response redaction handles bearer and hf tokens', () => {
   assert.equal(redactResponseText('Authorization: Bearer hf_secret_token_123'), 'Authorization: Bearer [REDACTED]');
   assert.equal(redactResponseText('model?token=hf_secret_token_123'), 'model?token=[REDACTED]');

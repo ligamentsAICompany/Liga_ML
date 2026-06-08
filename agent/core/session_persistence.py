@@ -624,12 +624,26 @@ class MongoSessionStore(NoopSessionStore):
         ops: list[Any] = []
         raw_rows = [dict(raw) for raw in rows]
         row_ids = [str(row.get("id") or "") for row in raw_rows if row.get("id")]
+        identity_filters = []
+        for row in raw_rows:
+            row_user_id = str(row.get("user_id") or user_id)
+            platform = str(row.get("platform") or "")
+            job_id = str(row.get("job_id") or "")
+            if platform and job_id:
+                identity_filters.append(
+                    {"user_id": row_user_id, "platform": platform, "job_id": job_id}
+                )
         existing_by_id: dict[str, dict[str, Any]] = {}
+        existing_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
         if row_ids:
             cursor = self.db.response_rows.find(
                 {"_id": {"$in": row_ids}},
                 {
                     "_id": 1,
+                    "id": 1,
+                    "user_id": 1,
+                    "platform": 1,
+                    "job_id": 1,
                     "actual_sequence_number": 1,
                     "display_session_number": 1,
                     "batch_number": 1,
@@ -637,12 +651,42 @@ class MongoSessionStore(NoopSessionStore):
                 },
             )
             existing_by_id = {str(doc["_id"]): doc async for doc in cursor}
+        if identity_filters:
+            cursor = self.db.response_rows.find(
+                {"$or": identity_filters},
+                {
+                    "_id": 1,
+                    "id": 1,
+                    "user_id": 1,
+                    "platform": 1,
+                    "job_id": 1,
+                    "actual_sequence_number": 1,
+                    "display_session_number": 1,
+                    "batch_number": 1,
+                    "created_at": 1,
+                },
+            )
+            async for doc in cursor:
+                identity = (
+                    str(doc.get("user_id") or user_id),
+                    str(doc.get("platform") or ""),
+                    str(doc.get("job_id") or ""),
+                )
+                existing_by_identity[identity] = doc
         for raw in raw_rows:
             row = self._mongo_safe_value(dict(raw))
             row_id = str(row.get("id") or "")
             if not row_id:
                 continue
-            existing = existing_by_id.get(row_id) or {}
+            row_user_id = str(row.get("user_id") or user_id)
+            identity = (
+                row_user_id,
+                str(row.get("platform") or ""),
+                str(row.get("job_id") or ""),
+            )
+            existing = (
+                existing_by_id.get(row_id) or existing_by_identity.get(identity) or {}
+            )
             for key in (
                 "actual_sequence_number",
                 "display_session_number",
@@ -651,7 +695,9 @@ class MongoSessionStore(NoopSessionStore):
             ):
                 if existing.get(key) is not None:
                     row[key] = existing[key]
-            row_user_id = str(row.get("user_id") or user_id)
+            if existing.get("_id"):
+                row_id = str(existing["_id"])
+                row["id"] = str(existing.get("id") or existing["_id"])
             row["user_id"] = row_user_id
             row["updated_at"] = now
             ops.append(

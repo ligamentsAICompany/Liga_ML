@@ -51,6 +51,9 @@ FINAL_STATUS_RE = re.compile(r"\*\*Final Status:\*\*\s*([A-Za-z_]+)", re.IGNOREC
 GCP_JOB_RE = re.compile(r"\*\*Job:\*\*\s*`?([^`\n]+)`?", re.IGNORECASE)
 GCP_STATE_RE = re.compile(r"\*\*State:\*\*\s*([A-Z_]+)", re.IGNORECASE)
 GCP_OUTPUT_DIR_RE = re.compile(r"\*\*Output dir:\*\*\s*([^\s`]+)", re.IGNORECASE)
+GCP_VIEW_URL_RE = re.compile(
+    r"\*\*View in Vertex AI:\*\*\s*(https://[^\s`]+)", re.IGNORECASE
+)
 JSON_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 JSON_STAGE_RE = re.compile(r'"stage"\s*:\s*"([^"]+)"')
 JSON_MESSAGE_RE = re.compile(r'"message"\s*:\s*("([^"]*)"|null)')
@@ -123,13 +126,20 @@ def _normalize_progress(state: Any) -> str:
     text = (_as_str(state) or "unknown").lower()
     if text.startswith("job_state_"):
         text = text.removeprefix("job_state_")
-    if text in {"succeeded", "success", "complete", "done", "finished"}:
+    if text in {
+        "succeeded",
+        "success",
+        "complete",
+        "done",
+        "finished",
+        "partially_succeeded",
+    }:
         return "completed"
-    if text in {"failure"}:
+    if text in {"failure", "expired"}:
         return "failed"
     if text in {"errored"}:
         return "error"
-    if text in {"canceled"}:
+    if text in {"canceled", "cancelling"}:
         return "cancelled"
     if text in {"billing_required", "missing_token", "approval_required"}:
         return "blocked"
@@ -281,9 +291,11 @@ def _extract_gcp_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None
     job_match = GCP_JOB_RE.search(output)
     state_match = GCP_STATE_RE.search(output)
     output_dir_match = GCP_OUTPUT_DIR_RE.search(output)
+    view_url_match = GCP_VIEW_URL_RE.search(output)
     job_name = _as_str(job_match.group(1)) if job_match else None
     state = _as_str(state_match.group(1)) if state_match else None
     output_dir = _as_str(output_dir_match.group(1)) if output_dir_match else None
+    job_url = _as_str(view_url_match.group(1)) if view_url_match else None
 
     if not state and data.get("success") is False and job_name:
         state = "failed"
@@ -300,6 +312,12 @@ def _extract_gcp_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None
         extracted["jobName"] = job_name
     if output_dir:
         extracted["outputDir"] = output_dir
+    if job_url:
+        extracted["jobUrl"] = job_url
+    if data.get("failureReason") or data.get("failure_reason") or data.get("error"):
+        extracted["failureReason"] = (
+            data.get("failureReason") or data.get("failure_reason") or data.get("error")
+        )
     if data.get("success") is not None:
         extracted["success"] = data.get("success")
     return extracted
@@ -465,6 +483,8 @@ async def build_responses_log(
             key_id = real_job_id or _as_str(data.get("tool_call_id")) or ""
             if not key_id:
                 continue
+            if platform == "gcp-vertex" and real_job_id is None:
+                continue
             if event.get("event_type") == "tool_output" and real_job_id is None:
                 continue
             if real_job_id is None and progress not in TERMINAL_STATES:
@@ -488,6 +508,13 @@ async def build_responses_log(
                 prior
                 and final_artifact in {"unknown", raw_state, progress}
                 and prior.get("final_artifact_or_result")
+            ):
+                final_artifact = prior["final_artifact_or_result"]
+            if (
+                prior
+                and platform == "gcp-vertex"
+                and str(final_artifact).startswith("https://console.cloud.google.com")
+                and str(prior.get("final_artifact_or_result") or "").startswith("gs://")
             ):
                 final_artifact = prior["final_artifact_or_result"]
             row = {

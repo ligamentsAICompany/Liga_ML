@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["agent"])
 _background_teardown_tasks: set[asyncio.Task] = set()
+_response_sync_tasks: set[asyncio.Task] = set()
 
 DEFAULT_CLAUDE_MODEL_ID = "bedrock/us.anthropic.claude-opus-4-6-v1"
 DEFAULT_FREE_MODEL_ID = "moonshotai/Kimi-K2.6"
@@ -500,6 +501,12 @@ async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
         await store.upsert_response_rows(response_log["rows"], user_id=user_id)
 
 
+def _schedule_response_sync(user_id: str) -> None:
+    task = asyncio.create_task(_sync_response_rows(user_id))
+    _response_sync_tasks.add(task)
+    task.add_done_callback(_response_sync_tasks.discard)
+
+
 @router.get("/responses")
 async def get_responses(
     page: int = 1,
@@ -516,10 +523,13 @@ async def get_responses(
     store = session_manager.persistence_store
     if getattr(store, "enabled", False) and hasattr(store, "list_response_rows"):
         summary = await store.get_response_summary(user_id=user["user_id"])
-        await _sync_response_rows(
-            user["user_id"],
-            include_persisted_sessions=not bool(summary.get("has_rows")),
-        )
+        if summary.get("has_rows"):
+            _schedule_response_sync(user["user_id"])
+        else:
+            await _sync_response_rows(
+                user["user_id"],
+                include_persisted_sessions=True,
+            )
     else:
         rows = await _sync_response_rows(
             user["user_id"], include_persisted_sessions=True
@@ -540,10 +550,17 @@ async def get_responses(
         )
         stale_session_ids = _stale_response_session_ids(response_page.get("rows", []))
         if stale_session_ids:
-            await _sync_response_sessions(user["user_id"], stale_session_ids)
-            response_page = await store.list_response_rows(
-                user_id=user["user_id"], **filters
-            )
+            if platform or progress or session_id or job_id or q:
+                await _sync_response_sessions(user["user_id"], stale_session_ids)
+                response_page = await store.list_response_rows(
+                    user_id=user["user_id"], **filters
+                )
+            else:
+                task = asyncio.create_task(
+                    _sync_response_sessions(user["user_id"], stale_session_ids)
+                )
+                _response_sync_tasks.add(task)
+                task.add_done_callback(_response_sync_tasks.discard)
         return response_page
     return paginate_response_rows(
         filter_response_rows(rows, **filters),

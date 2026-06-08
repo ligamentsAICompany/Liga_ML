@@ -152,10 +152,17 @@ export function createResponsesQueryParams({
 
 export function createResponsesPaginationModel(payload: ResponsesPagePayload | null) {
   const page = payload?.page || 1;
-  const totalPages = payload?.total_pages || 0;
-  const totalRows = payload?.total_rows || 0;
+  const rowCount = payload?.rows?.length || 0;
+  const totalRows = payload?.total_rows || rowCount;
+  const pageSize = payload?.page_size || Math.max(rowCount, 1);
+  const totalPages =
+    payload?.total_pages && payload.total_pages > 0
+      ? payload.total_pages
+      : totalRows > 0
+        ? Math.max(1, Math.ceil(totalRows / pageSize))
+        : 0;
   return {
-    label: totalPages > 0 ? `Page ${page} of ${totalPages} • ${totalRows} responses` : 'No response pages',
+    label: totalPages > 0 ? `Page ${page} of ${totalPages} • ${totalRows} responses` : '0 responses',
     canGoPrevious: Boolean(payload?.has_previous),
     canGoNext: Boolean(payload?.has_next),
     previousPage: Math.max(1, page - 1),
@@ -166,15 +173,18 @@ export function createResponsesPaginationModel(payload: ResponsesPagePayload | n
 export function createResponsesPanelModel({
   rows,
   error = null,
+  filtersActive = false,
 }: {
   rows: ResponseLogRow[];
   error?: string | null;
+  filtersActive?: boolean;
 }) {
   return {
     columns: [...REQUIRED_RESPONSE_COLUMNS, ...OPTIONAL_RESPONSE_COLUMNS],
-    emptyStateTitle: 'No responses yet',
-    emptyStateDescription:
-      'Fine-tuning and cloud job outcomes will appear here after a run starts or finishes.',
+    emptyStateTitle: filtersActive ? 'No responses match your filters' : 'No responses yet',
+    emptyStateDescription: filtersActive
+      ? 'Clear the filters or search text to see all persisted Responses rows.'
+      : 'Fine-tuning and cloud job outcomes will appear here after a run starts or finishes.',
     errorMessage: error,
     rows: rows.map((row) => ({
       raw: row,

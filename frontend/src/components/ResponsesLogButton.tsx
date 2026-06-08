@@ -51,9 +51,10 @@ export default function ResponsesLogButton() {
   const [q, setQ] = useState('');
 
   const buttonState = createResponsesButtonState({ isProcessing, summary });
+  const filtersActive = Boolean(platform || progress || model.trim() || jobId.trim() || q.trim());
   const panel = useMemo(
-    () => createResponsesPanelModel({ rows, error }),
-    [rows, error],
+    () => createResponsesPanelModel({ rows, error, filtersActive }),
+    [rows, error, filtersActive],
   );
   const pagination = useMemo(
     () => createResponsesPaginationModel(pagePayload),

@@ -365,6 +365,167 @@ async def test_gcp_running_row_updates_from_succeeded_tool_output():
 
 
 @pytest.mark.asyncio
+async def test_gcp_tool_output_only_terminal_status_updates_to_completed():
+    job_name = "projects/p/locations/us/customJobs/123"
+    events = [
+        _tool_output(
+            "gcp_vertex_jobs",
+            f"""
+**Vertex AI job details:**
+
+**Job:** `{job_name}`
+**State:** JOB_STATE_SUCCEEDED
+**View in Vertex AI:** https://console.cloud.google.com/vertex-ai/jobs/123
+""",
+            created_at=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        ),
+    ]
+
+    result = await build_responses_log(
+        [_session("gcp", provider="gcp-vertex", events=events)],
+        load_events=lambda _sid: events,
+    )
+
+    row = result["rows"][0]
+    assert row["progress"] == "completed"
+    assert row["job_id"] == job_name
+    assert row["completed_at"] == "2026-01-01T00:01:00+00:00"
+    assert row["final_artifact_or_result"].startswith(
+        "https://console.cloud.google.com"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gcp_failed_tool_output_normalizes_and_stores_reason():
+    job_name = "projects/p/locations/us/customJobs/failed"
+    events = [
+        _event("gcp_vertex_jobs", "running", jobName=job_name),
+        _tool_output(
+            "gcp_vertex_jobs",
+            f"""
+**Vertex AI job details:**
+
+**Job:** `{job_name}`
+**State:** JOB_STATE_FAILED
+**Failure reason:**
+
+```text
+trainer crashed
+```
+""",
+            failureReason="trainer crashed",
+            created_at=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+        ),
+    ]
+
+    result = await build_responses_log(
+        [_session("gcp", provider="gcp-vertex", events=events)],
+        load_events=lambda _sid: events,
+    )
+
+    row = result["rows"][0]
+    assert row["progress"] == "failed"
+    assert row["job_id"] == job_name
+    assert row["error"] == "trainer crashed"
+    assert row["completed_at"] == "2026-01-01T00:02:00+00:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("JOB_STATE_SUCCEEDED", "completed"),
+        ("SUCCEEDED", "completed"),
+        ("succeeded", "completed"),
+        ("completed", "completed"),
+        ("JOB_STATE_FAILED", "failed"),
+        ("FAILED", "failed"),
+        ("failed", "failed"),
+        ("JOB_STATE_CANCELLED", "cancelled"),
+        ("JOB_STATE_CANCELLING", "cancelled"),
+        ("cancelled", "cancelled"),
+        ("canceled", "cancelled"),
+        ("JOB_STATE_EXPIRED", "failed"),
+        ("JOB_STATE_PARTIALLY_SUCCEEDED", "completed"),
+    ],
+)
+async def test_gcp_terminal_status_variants_normalize(state, expected):
+    events = [
+        _event(
+            "gcp_vertex_jobs",
+            state,
+            jobName="projects/p/locations/us/customJobs/variants",
+        )
+    ]
+
+    result = await build_responses_log(
+        [_session("gcp", provider="gcp-vertex", events=events)],
+        load_events=lambda _sid: events,
+    )
+
+    assert result["rows"][0]["progress"] == expected
+
+
+@pytest.mark.asyncio
+async def test_new_gcp_row_after_twelve_existing_responses_gets_sequence_thirteen():
+    sessions = []
+    event_map = {}
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    for index in range(12):
+        sid = f"hf-{index + 1}"
+        event_map[sid] = [
+            _event(
+                "hf_jobs",
+                "succeeded",
+                jobUrl=f"https://huggingface.co/jobs/acme/{index + 1}",
+                created_at=base + timedelta(minutes=index),
+            )
+        ]
+        sessions.append(_session(sid, events=event_map[sid]))
+
+    event_map["gcp"] = [
+        _event(
+            "gcp_vertex_jobs",
+            "JOB_STATE_SUCCEEDED",
+            jobName="projects/p/locations/us/customJobs/13",
+            outputDir="gs://liga-output/job-13",
+            created_at=base + timedelta(minutes=12),
+        )
+    ]
+    sessions.append(_session("gcp", provider="gcp-vertex", events=event_map["gcp"]))
+
+    result = await build_responses_log(sessions, load_events=lambda sid: event_map[sid])
+
+    row = result["rows"][-1]
+    assert row["platform"] == "gcp-vertex"
+    assert row["actual_sequence_number"] == 13
+    assert row["display_session_number"] == 13
+    assert row["batch_number"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fake_id", ["functions.gcp_vertex_jobs:10", "tool_call_abc", "call_abc"]
+)
+async def test_gcp_fake_internal_ids_do_not_become_job_ids(fake_id):
+    events = [
+        _event(
+            "gcp_vertex_jobs",
+            "JOB_STATE_SUCCEEDED",
+            tool_call_id=fake_id,
+            jobName=fake_id,
+        )
+    ]
+
+    result = await build_responses_log(
+        [_session("gcp", provider="gcp-vertex", events=events)],
+        load_events=lambda _sid: events,
+    )
+
+    assert result == {"rows": []}
+
+
+@pytest.mark.asyncio
 async def test_failed_row_extracts_failure_reason_and_redacts_secrets():
     sample_token_value = "hf_fake_token_123456789"
     events = [
@@ -556,6 +717,84 @@ def test_mongo_response_rows_normalize_persisted_provider_states():
         )["progress"]
         == "completed"
     )
+
+
+class _AsyncListCursor:
+    def __init__(self, docs):
+        self._docs = list(docs)
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for doc in self._docs:
+            yield doc
+
+
+class _FakeResponseRowsCollection:
+    def __init__(self, existing_doc):
+        self.existing_doc = existing_doc
+        self.ops = []
+
+    def find(self, query, *_args, **_kwargs):
+        if "$or" in query:
+            return _AsyncListCursor([self.existing_doc])
+        return _AsyncListCursor([])
+
+    async def bulk_write(self, ops, **_kwargs):
+        self.ops = ops
+
+
+class _FakeMongoDb:
+    def __init__(self, existing_doc):
+        self.response_rows = _FakeResponseRowsCollection(existing_doc)
+
+
+@pytest.mark.asyncio
+async def test_mongo_upsert_preserves_sequence_when_vertex_identity_matches():
+    existing_doc = {
+        "_id": "persisted:gcp-vertex:projects/p/locations/us/customJobs/123",
+        "id": "persisted:gcp-vertex:projects/p/locations/us/customJobs/123",
+        "user_id": "dev",
+        "platform": "gcp-vertex",
+        "job_id": "projects/p/locations/us/customJobs/123",
+        "actual_sequence_number": 13,
+        "display_session_number": 13,
+        "batch_number": 1,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    store = MongoSessionStore("mongodb://example.invalid", "liga_ml")
+    store.enabled = True
+    store.db = _FakeMongoDb(existing_doc)
+
+    await store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:gcp-vertex:different-derived-id",
+                "display_session_number": 1,
+                "actual_sequence_number": 1,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "platform": "gcp-vertex",
+                "progress": "completed",
+                "job_id": "projects/p/locations/us/customJobs/123",
+                "final_artifact_or_result": "gs://liga-output/job-123",
+                "created_at": "2026-01-01T00:01:00+00:00",
+                "completed_at": "2026-01-01T00:02:00+00:00",
+            }
+        ],
+        user_id="dev",
+    )
+
+    [op] = store.db.response_rows.ops
+    assert op._filter == {"_id": existing_doc["_id"]}
+    update = op._doc["$set"]
+    assert update["id"] == existing_doc["id"]
+    assert update["actual_sequence_number"] == 13
+    assert update["display_session_number"] == 13
+    assert update["batch_number"] == 1
+    assert update["created_at"] == "2026-01-01T00:00:00+00:00"
+    assert update["progress"] == "completed"
 
 
 class _DurableResponseStore:
