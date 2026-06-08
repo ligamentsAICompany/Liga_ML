@@ -176,6 +176,43 @@ async def test_failed_row_extracts_failure_reason_and_redacts_secrets():
 
 
 @pytest.mark.asyncio
+async def test_hf_running_without_provider_job_id_is_not_fake_job_row():
+    events = [
+        _event("hf_jobs", "running", tool_call_id="functions.hf_jobs:10"),
+    ]
+
+    result = await build_responses_log(
+        [_session("s1", events=events)], load_events=lambda _sid: events
+    )
+
+    assert result == {"rows": []}
+
+
+@pytest.mark.asyncio
+async def test_hf_error_without_provider_job_id_records_failure_not_fake_job_id():
+    events = [
+        _event(
+            "hf_jobs",
+            "error",
+            tool_call_id="functions.hf_jobs:10",
+            error="No HF token available to resolve a jobs namespace.",
+        ),
+    ]
+
+    result = await build_responses_log(
+        [_session("s1", events=events)], load_events=lambda _sid: events
+    )
+
+    row = result["rows"][0]
+    assert row["progress"] == "error"
+    assert row["job_id"] == ""
+    assert row["final_artifact_or_result"] == (
+        "No HF token available to resolve a jobs namespace."
+    )
+    assert row["completed_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_rolling_visible_batch_keeps_actual_sequence_continuing():
     sessions = []
     event_map = {}

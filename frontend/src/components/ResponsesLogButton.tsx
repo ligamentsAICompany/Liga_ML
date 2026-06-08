@@ -8,6 +8,7 @@ import {
   Dialog,
   DialogContent,
   DialogTitle,
+  IconButton,
   Table,
   TableBody,
   TableCell,
@@ -17,6 +18,7 @@ import {
   Typography,
 } from '@mui/material';
 import FormatListBulletedIcon from '@mui/icons-material/FormatListBulleted';
+import CloseIcon from '@mui/icons-material/Close';
 
 import {
   createResponsesButtonState,
@@ -90,12 +92,17 @@ export default function ResponsesLogButton() {
 
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="xl" fullWidth>
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-          Responses Log
-          <Chip
-            size="small"
-            label={`Batch ${summary?.batch_number || 1}`}
-            sx={{ bgcolor: 'var(--accent-yellow-weak)', color: 'var(--text)' }}
-          />
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flex: 1 }}>
+            Responses Log
+            <Chip
+              size="small"
+              label={`Batch ${summary?.batch_number || 1}`}
+              sx={{ bgcolor: 'var(--accent-yellow-weak)', color: 'var(--text)' }}
+            />
+          </Box>
+          <IconButton aria-label="Close Responses log" onClick={() => setOpen(false)} size="small">
+            <CloseIcon fontSize="small" />
+          </IconButton>
         </DialogTitle>
         <DialogContent>
           {panel.errorMessage ? (

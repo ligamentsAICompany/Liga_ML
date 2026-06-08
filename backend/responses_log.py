@@ -19,6 +19,7 @@ JOB_TO_PLATFORM = {
 TERMINAL_STATES = {
     "completed",
     "complete",
+    "error",
     "succeeded",
     "success",
     "failed",
@@ -151,6 +152,9 @@ def _final_artifact(platform: str, data: dict[str, Any]) -> str:
                 or data.get("hubModelId")
                 or data.get("hub_model_id")
                 or data.get("jobUrl")
+                or data.get("failureReason")
+                or data.get("failure_reason")
+                or data.get("error")
             )
             or _as_str(data.get("state"))
             or "unknown"
@@ -221,12 +225,15 @@ async def build_responses_log(
             if not platform:
                 continue
             state = _as_str(data.get("state")) or "unknown"
-            job_id = _job_id(platform, data) or _as_str(data.get("tool_call_id")) or ""
-            if not job_id:
+            real_job_id = _job_id(platform, data)
+            key_id = real_job_id or _as_str(data.get("tool_call_id")) or ""
+            if not key_id:
+                continue
+            if real_job_id is None and state.lower() not in TERMINAL_STATES:
                 continue
             discovery_order += 1
             created_at = _event_created_at(event, session)
-            key = (session_id, platform, job_id)
+            key = (session_id, platform, key_id)
             prior = rows_by_key.get(key)
             row = {
                 "display_session_number": 0,
@@ -240,7 +247,7 @@ async def build_responses_log(
                 "run_type": _as_str(session.get("training_goal")) or "agent-decide",
                 "result_storage": _as_str(session.get("output_policy")) or "unknown",
                 "progress": state,
-                "job_id": job_id,
+                "job_id": real_job_id or "",
                 "final_artifact_or_result": _final_artifact(platform, data),
                 "created_at": prior.get("created_at") if prior else created_at,
                 "completed_at": _completed_at(state, event, session),
