@@ -1,0 +1,89 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { test } from 'node:test';
+
+import {
+  REQUIRED_RESPONSE_COLUMNS,
+  createResponsesButtonState,
+  createResponsesPanelModel,
+  redactResponseText,
+} from '../src/lib/responses-log-panel.js';
+
+const appLayoutSource = readFileSync('src/components/Layout/AppLayout.tsx', 'utf8');
+
+test('responses button is modeled as visible and clickable before or during processing', () => {
+  const initial = createResponsesButtonState({ isProcessing: false, summary: null });
+  const processing = createResponsesButtonState({
+    isProcessing: true,
+    summary: { total_responses: 0, visible_count: 0, batch_number: 1, has_rows: false, button_enabled: true },
+  });
+
+  assert.equal(initial.visible, true);
+  assert.equal(initial.disabled, false);
+  assert.equal(processing.visible, true);
+  assert.equal(processing.disabled, false);
+});
+
+test('responses panel exposes clean empty state and required columns', () => {
+  const panel = createResponsesPanelModel({ rows: [] });
+
+  assert.equal(panel.emptyStateTitle, 'No responses yet');
+  assert.match(panel.emptyStateDescription, /Fine-tuning and cloud job outcomes/);
+  assert.deepEqual(REQUIRED_RESPONSE_COLUMNS.map((column) => column.label), [
+    'Session Number',
+    'Model Name',
+    'Platform',
+    'Run Type',
+    'Result Storage',
+    'Progress',
+    'Job ID',
+    'Final Artifact / Result',
+  ]);
+  assert.deepEqual(panel.columns.slice(0, 8), REQUIRED_RESPONSE_COLUMNS);
+});
+
+test('responses panel renders row labels with redacted artifacts', () => {
+  const panel = createResponsesPanelModel({
+    rows: [
+      {
+        display_session_number: 1,
+        actual_sequence_number: 16,
+        batch_number: 2,
+        session_id: 'abcdef123456',
+        session_title: 'Housing fine-tune',
+        model_name: 'Qwen/Qwen2.5-0.5B-Instruct',
+        platform: 'hf-jobs',
+        run_type: 'smoke-test',
+        result_storage: 'cloud-and-hf-hub',
+        progress: 'succeeded',
+        job_id: 'https://huggingface.co/jobs/acme/123',
+        final_artifact_or_result: 'https://huggingface.co/acme/model?token=hf_secret_token_123',
+        created_at: '2026-01-01T00:00:00+00:00',
+        completed_at: '2026-01-01T00:10:00+00:00',
+      },
+    ],
+  });
+
+  assert.equal(panel.rows[0].cells.session, '1 (actual 16, batch 2)');
+  assert.equal(panel.rows[0].cells.model, 'Qwen/Qwen2.5-0.5B-Instruct');
+  assert.equal(panel.rows[0].cells.platform, 'hf-jobs');
+  assert.equal(panel.rows[0].cells.progress, 'succeeded');
+  assert.doesNotMatch(panel.rows[0].cells.result, /hf_secret/);
+  assert.match(panel.rows[0].cells.result, /\[REDACTED\]/);
+});
+
+test('responses panel exposes API error state', () => {
+  const panel = createResponsesPanelModel({ rows: [], error: 'Failed to load responses.' });
+
+  assert.equal(panel.errorMessage, 'Failed to load responses.');
+  assert.equal(panel.emptyStateTitle, 'No responses yet');
+});
+
+test('response redaction handles bearer and hf tokens', () => {
+  assert.equal(redactResponseText('Authorization: Bearer hf_secret_token_123'), 'Authorization: Bearer [REDACTED]');
+  assert.equal(redactResponseText('model?token=hf_secret_token_123'), 'model?token=[REDACTED]');
+});
+
+test('app layout includes the responses button component', () => {
+  assert.match(appLayoutSource, /ResponsesLogButton/);
+});

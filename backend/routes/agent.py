@@ -46,6 +46,7 @@ from models import (
     SubmitRequest,
     TruncateRequest,
 )
+from responses_log import build_responses_log, build_responses_summary
 from session_manager import (
     MAX_SESSIONS,
     AgentSession,
@@ -422,6 +423,37 @@ async def provider_health() -> dict[str, Any]:
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
         "session_store": session_store_status(session_manager.persistence_store),
     }
+
+
+@router.get("/responses")
+async def get_responses(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Return the current visible batch of fine-tuning/job response rows."""
+    sessions = await session_manager.list_sessions(user_id=user["user_id"])
+    return await build_responses_log(
+        sessions,
+        load_events=session_manager.load_response_events,
+    )
+
+
+@router.get("/responses/summary")
+async def get_responses_summary(
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return summary metadata for the Responses button."""
+    sessions = await session_manager.list_sessions(user_id=user["user_id"])
+    response_log = await build_responses_log(
+        sessions,
+        load_events=session_manager.load_response_events,
+    )
+    total_responses = 0
+    for row in response_log["rows"]:
+        total_responses = max(
+            total_responses, int(row.get("actual_sequence_number") or 0)
+        )
+    return build_responses_summary(
+        response_log["rows"],
+        total_responses=total_responses,
+    )
 
 
 @router.get("/config/model")

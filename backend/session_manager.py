@@ -1487,6 +1487,28 @@ class SessionManager:
             results.append(info)
         return results
 
+    async def load_response_events(self, session_id: str) -> list[dict[str, Any]]:
+        """Return response-relevant events from live memory or durable storage."""
+        events: list[dict[str, Any]] = []
+        agent_session = self.sessions.get(session_id)
+        if agent_session is not None:
+            events.extend(
+                dict(event)
+                for event in getattr(agent_session.session, "logged_events", []) or []
+                if isinstance(event, dict)
+            )
+
+        store = self._store()
+        if getattr(store, "enabled", False):
+            try:
+                events.extend(await store.load_events_after(session_id, 0))
+            except Exception as e:
+                logger.debug(
+                    "Failed to load persisted events for %s: %s", session_id, e
+                )
+
+        return events
+
     @property
     def active_session_count(self) -> int:
         """Get count of active sessions."""
