@@ -162,6 +162,14 @@ test('responses pagination renders rows safely when total_pages is missing', () 
   assert.equal(pagination.label, 'Page 1 of 1 • 1 responses');
 });
 
+test('responses pagination avoids transient zero label while loading', () => {
+  const pagination = createResponsesPaginationModel(null, { loading: true });
+
+  assert.equal(pagination.label, 'Loading responses...');
+  assert.equal(pagination.canGoPrevious, false);
+  assert.equal(pagination.canGoNext, false);
+});
+
 test('responses panel distinguishes filtered empty state from global no-data state', () => {
   const empty = createResponsesPanelModel({ rows: [] });
   const filtered = createResponsesPanelModel({ rows: [], filtersActive: true });
@@ -219,4 +227,12 @@ test('responses dialog source does not clear fetched rows on close', () => {
 
   assert.match(buttonSource, /setOpen\(false\)/);
   assert.doesNotMatch(buttonSource, /setRows\(\[\]\)/);
+});
+
+test('chat hydration clears stale processing when backend is terminal', () => {
+  const hookSource = readFileSync('src/hooks/useAgentChat.ts', 'utf8');
+
+  assert.match(hookSource, /backendIsProcessing/);
+  assert.match(hookSource, /updateSession\(sessionId,\s*\{\s*isProcessing:\s*false,\s*activityStatus:\s*\{\s*type:\s*'idle'\s*\}/s);
+  assert.match(hookSource, /fresh\.info && !fresh\.info\.is_processing/);
 });
