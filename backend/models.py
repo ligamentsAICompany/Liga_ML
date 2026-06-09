@@ -273,12 +273,18 @@ class TrainingPreflightResultModel(BaseModel):
 class TrainingPreflightRequest(BaseModel):
     session_id: str
     run_id: str | None = None
-    provider: CloudProviderId | str
-    model_id: str
+    provider: CloudProviderId | str | None = None
+    model_id: str | None = None
     hardware_id: str | None = None
-    output_policy: OutputPolicy = "cloud-and-hf-hub"
+    output_policy: OutputPolicy | None = None
     recommendation: dict[str, Any] | None = None
+    dataset_summary: dict[str, Any] | None = None
+    target_namespace: str | None = None
+    target_repo_id: str | None = None
+    target_bucket: str | None = None
     include_fallbacks: bool = False
+    force_refresh: bool = False
+    timeout_seconds: int | None = Field(default=None, ge=1, le=60)
     allow_unknown_override: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 

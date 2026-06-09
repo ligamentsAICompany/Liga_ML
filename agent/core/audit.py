@@ -218,6 +218,117 @@ def build_audit_event(
     }
 
 
+def training_preflight_audit_events(
+    preflight: dict[str, Any],
+    *,
+    include_started: bool = False,
+) -> list[dict[str, Any]]:
+    """Build sanitized audit events for a training preflight result."""
+
+    session_id = str(preflight.get("session_id") or "")
+    if not session_id:
+        return []
+    run_id = str(preflight.get("run_id") or "") or None
+    preflight_id = str(preflight.get("preflight_id") or "")
+    provider = str(preflight.get("provider") or "unknown")
+    status = str(preflight.get("status") or "unknown")
+    launch_ready = preflight.get("launch_ready") is True
+    blocking = preflight.get("blocking_reasons")
+    unknowns = preflight.get("unknown_reasons")
+    warnings = preflight.get("warning_reasons")
+    safe_metadata = {
+        "preflight_id": preflight_id,
+        "model_id": preflight.get("model_id"),
+        "hardware_id": preflight.get("hardware_id"),
+        "blocking_reasons": blocking if isinstance(blocking, list) else [],
+        "unknown_reasons": unknowns if isinstance(unknowns, list) else [],
+        "warning_reasons": warnings if isinstance(warnings, list) else [],
+        "metadata": preflight.get("metadata")
+        if isinstance(preflight.get("metadata"), dict)
+        else {},
+    }
+    common = {
+        "session_id": session_id,
+        "run_id": run_id,
+        "category": "planner",
+        "actor": "system",
+        "provider": provider,
+        "entity_type": "training_preflight",
+        "entity_id": preflight_id,
+        "model_name": preflight.get("model_id"),
+        "output_policy": preflight.get("output_policy"),
+        "safe_metadata": safe_metadata,
+    }
+    events: list[dict[str, Any]] = []
+    if include_started:
+        events.append(
+            build_audit_event(
+                **common,
+                event_type="training_preflight_started",
+                status="started",
+                severity="info",
+                title="Training preflight started",
+                message="Local training preflight checks started.",
+            )
+        )
+    if status == "failed":
+        events.append(
+            build_audit_event(
+                **common,
+                event_type="training_preflight_failed",
+                status="failed",
+                severity="error",
+                title="Training preflight failed",
+                message=preflight.get("safe_summary")
+                or "Training preflight found blocking failures.",
+                error_summary=preflight.get("safe_summary"),
+            )
+        )
+    elif status == "unknown":
+        events.append(
+            build_audit_event(
+                **common,
+                event_type="training_preflight_unknown",
+                status="unknown",
+                severity="warning",
+                title="Training preflight unknown",
+                message=preflight.get("safe_summary")
+                or "Training preflight requires live checks in a later slice.",
+            )
+        )
+    else:
+        events.append(
+            build_audit_event(
+                **common,
+                event_type="training_preflight_completed",
+                status=status,
+                severity="info" if launch_ready else "warning",
+                title="Training preflight completed",
+                message=preflight.get("safe_summary")
+                or "Training preflight completed.",
+            )
+        )
+    events.append(
+        build_audit_event(
+            **common,
+            event_type="training_preflight_launch_ready"
+            if launch_ready
+            else "training_preflight_launch_blocked",
+            status="ready" if launch_ready else "blocked",
+            severity="info" if launch_ready else "warning",
+            title="Training launch ready"
+            if launch_ready
+            else "Training launch blocked",
+            message=(
+                "Training preflight marked the plan launch-ready."
+                if launch_ready
+                else "Training preflight did not mark the plan launch-ready."
+            ),
+        )
+    )
+    return events
+
+
 def event_from_run_event(
     *,
     session_id: str,

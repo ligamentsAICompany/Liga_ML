@@ -10,6 +10,7 @@ from agent.core.training_preflight import (
     TrainingPreflightCheck,
     build_training_preflight_result,
     derive_launch_ready,
+    run_local_training_preflight,
 )
 
 
@@ -233,3 +234,80 @@ def test_normalize_provider_error_maps_common_errors(message, expected_code):
     assert normalized["error_code"] == expected_code
     assert "traceback" not in normalized
     assert "message" in normalized
+
+
+def _recommendation(
+    *,
+    provider: str = "hf-jobs",
+    model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    hardware_id: str = "hf-jobs:t4-small",
+    output_policy: str = "cloud-and-hf-hub",
+) -> dict:
+    return {
+        "provider": provider,
+        "recommended_model": model_id,
+        "output_policy": output_policy,
+        "recommendation": {
+            "selected_provider": {"provider_id": provider},
+            "selected_model": {"model_id": model_id},
+            "selected_hardware": {"hardware_id": hardware_id},
+            "output_policy": output_policy,
+        },
+    }
+
+
+def test_local_preflight_keeps_launch_blocked_without_live_probes():
+    result = run_local_training_preflight(
+        session_id="session-1",
+        run_id="run-1",
+        recommendation=_recommendation(),
+        dataset_summary={"rows": 25},
+    )
+
+    payload = result.to_dict()
+
+    assert payload["status"] == "unknown"
+    assert payload["launch_ready"] is False
+    assert payload["metadata"]["provider_jobs_launched"] is False
+    assert payload["metadata"]["resources_created"] is False
+    assert any("live" in reason.lower() for reason in payload["unknown_reasons"])
+    assert "not implemented" in payload["safe_summary"].lower()
+
+
+def test_local_preflight_missing_required_static_fields_fails():
+    result = run_local_training_preflight(
+        session_id="session-1",
+        recommendation={"provider": "hf-jobs", "output_policy": "cloud-and-hf-hub"},
+    )
+
+    assert result.status == PreflightStatus.FAILED
+    assert result.launch_ready is False
+    assert any("model" in reason.lower() for reason in result.blocking_reasons)
+    assert any("hardware" in reason.lower() for reason in result.blocking_reasons)
+
+
+def test_local_preflight_unknown_output_or_storage_checks_block_by_default():
+    result = run_local_training_preflight(
+        session_id="session-1",
+        recommendation=_recommendation(output_policy="hf-hub"),
+        dataset_summary={"rows": 25},
+    )
+
+    assert result.status == PreflightStatus.UNKNOWN
+    assert result.launch_ready is False
+    assert any("hub" in reason.lower() for reason in result.unknown_reasons)
+
+
+def test_local_preflight_model_hardware_incompatibility_blocks_launch():
+    result = run_local_training_preflight(
+        session_id="session-1",
+        recommendation=_recommendation(
+            model_id="mistralai/Mistral-7B-Instruct-v0.3",
+            hardware_id="hf-jobs:t4-small",
+        ),
+        dataset_summary={"rows": 25},
+    )
+
+    assert result.status == PreflightStatus.FAILED
+    assert result.launch_ready is False
+    assert any("memory" in reason.lower() for reason in result.blocking_reasons)

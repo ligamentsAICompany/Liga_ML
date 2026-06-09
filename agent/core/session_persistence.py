@@ -23,6 +23,7 @@ from agent.core.audit import (
     build_audit_event,
     event_from_run_event,
     summarize_audit_events,
+    training_preflight_audit_events,
 )
 from agent.core.post_training_evaluation import (
     build_post_training_evaluation,
@@ -129,6 +130,8 @@ class NoopSessionStore:
         self._usage_entries: dict[str, dict[str, Any]] = {}
         self._audit_events: dict[str, dict[str, Any]] = {}
         self._evaluations: dict[str, dict[str, Any]] = {}
+        self._session_preflights: dict[str, dict[str, Any]] = {}
+        self._run_preflights: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -242,6 +245,55 @@ class NoopSessionStore:
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self._runs.get(run_id)
         return dict(run) if run else None
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+        include_started_audit: bool = True,
+    ) -> dict[str, Any]:
+        clean = sanitize_for_persistence(preflight)
+        if not isinstance(clean, dict):
+            clean = {}
+        clean["session_id"] = session_id
+        if run_id:
+            clean["run_id"] = run_id
+        self._session_preflights[session_id] = dict(clean)
+        if run_id:
+            self._run_preflights[run_id] = dict(clean)
+            run = self._runs.get(run_id)
+            if run:
+                provider_metadata = dict(run.get("provider_metadata") or {})
+                provider_metadata["training_preflight"] = dict(clean)
+                run["training_preflight"] = dict(clean)
+                run["provider_metadata"] = provider_metadata
+                run["updated_at"] = _now()
+        for event in training_preflight_audit_events(
+            clean, include_started=include_started_audit
+        ):
+            await self.record_audit_event(event)
+        return dict(clean)
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        preflight = self._session_preflights.get(session_id)
+        return dict(preflight) if preflight else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        preflight = self._run_preflights.get(run_id)
+        if preflight and preflight.get("session_id") == session_id:
+            return dict(preflight)
+        run = self._runs.get(run_id)
+        if run and run.get("session_id") == session_id:
+            value = run.get("training_preflight")
+            if isinstance(value, dict):
+                return dict(value)
+        return None
 
     async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
         now = _now()
@@ -824,6 +876,7 @@ class MongoSessionStore(NoopSessionStore):
         uploaded_datasets: list[dict[str, Any]] | None = None,
         latest_dataset_discovery: dict[str, Any] | None = None,
         latest_training_recommendation: dict[str, Any] | None = None,
+        latest_training_preflight: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -869,6 +922,9 @@ class MongoSessionStore(NoopSessionStore):
                     "latest_training_recommendation": sanitize_for_persistence(
                         latest_training_recommendation or {}
                     ),
+                    "latest_training_preflight": sanitize_for_persistence(
+                        latest_training_preflight or {}
+                    ),
                 },
             },
             upsert=True,
@@ -898,6 +954,7 @@ class MongoSessionStore(NoopSessionStore):
         uploaded_datasets: list[dict[str, Any]] | None = None,
         latest_dataset_discovery: dict[str, Any] | None = None,
         latest_training_recommendation: dict[str, Any] | None = None,
+        latest_training_preflight: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -924,6 +981,7 @@ class MongoSessionStore(NoopSessionStore):
             uploaded_datasets=uploaded_datasets,
             latest_dataset_discovery=latest_dataset_discovery,
             latest_training_recommendation=latest_training_recommendation,
+            latest_training_preflight=latest_training_preflight,
         )
         ops: list[Any] = []
         for idx, raw in enumerate(messages):
@@ -1118,6 +1176,81 @@ class MongoSessionStore(NoopSessionStore):
         if not self._ready():
             return await super().get_run(run_id)
         return await self.db.runs.find_one({"_id": run_id})
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+        include_started_audit: bool = True,
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().record_training_preflight(
+                session_id=session_id,
+                preflight=preflight,
+                run_id=run_id,
+                include_started_audit=include_started_audit,
+            )
+        clean = sanitize_for_persistence(preflight)
+        if not isinstance(clean, dict):
+            clean = {}
+        clean["session_id"] = session_id
+        if run_id:
+            clean["run_id"] = run_id
+        now = _now()
+        await self.db.sessions.update_one(
+            {"_id": session_id},
+            {"$set": {"latest_training_preflight": clean, "updated_at": now}},
+            upsert=False,
+        )
+        if run_id:
+            existing_run = await self.get_run(run_id)
+            provider_metadata = dict(
+                (existing_run or {}).get("provider_metadata") or {}
+            )
+            provider_metadata["training_preflight"] = clean
+            await self.update_run(
+                run_id,
+                training_preflight=clean,
+                provider_metadata=provider_metadata,
+            )
+        for event in training_preflight_audit_events(
+            clean, include_started=include_started_audit
+        ):
+            await self.record_audit_event(event)
+        return dict(clean)
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_latest_training_preflight(session_id)
+        session = await self.db.sessions.find_one({"_id": session_id})
+        preflight = (
+            session.get("latest_training_preflight")
+            if isinstance(session, dict)
+            else None
+        )
+        return dict(preflight) if isinstance(preflight, dict) and preflight else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_run_training_preflight(session_id, run_id)
+        run = await self.get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        preflight = run.get("training_preflight")
+        if isinstance(preflight, dict) and preflight:
+            return dict(preflight)
+        provider_metadata = run.get("provider_metadata")
+        if isinstance(provider_metadata, dict) and isinstance(
+            provider_metadata.get("training_preflight"), dict
+        ):
+            return dict(provider_metadata["training_preflight"])
+        return None
 
     async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
         if not self._ready():

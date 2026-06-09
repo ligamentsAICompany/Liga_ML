@@ -8,6 +8,16 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from agent.core.model_provider_selection import (
+    catalog_hardware,
+    catalog_model,
+    catalog_provider,
+)
+from agent.core.output_policy import (
+    VALID_OUTPUT_POLICIES,
+    output_policy_requires_cloud_storage,
+    output_policy_requires_hub,
+)
 from agent.core.redact import sanitize_for_frontend, sanitize_for_persistence
 
 
@@ -316,6 +326,111 @@ def _safe_summary(
     return str(sanitize_for_frontend(summary))
 
 
+def _recommendation_body(recommendation: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(recommendation, dict):
+        return {}
+    nested = recommendation.get("recommendation")
+    return nested if isinstance(nested, dict) else {}
+
+
+def _nested_mapping(
+    recommendation: dict[str, Any],
+    nested_key: str,
+) -> dict[str, Any]:
+    nested = _recommendation_body(recommendation).get(nested_key)
+    return nested if isinstance(nested, dict) else {}
+
+
+def _extract_provider(recommendation: dict[str, Any] | None) -> str:
+    if not isinstance(recommendation, dict):
+        return "unknown"
+    selected = _nested_mapping(recommendation, "selected_provider")
+    return str(
+        selected.get("provider_id")
+        or recommendation.get("provider")
+        or recommendation.get("cloud_provider")
+        or "unknown"
+    )
+
+
+def _extract_model_id(recommendation: dict[str, Any] | None) -> str:
+    if not isinstance(recommendation, dict):
+        return "unknown"
+    selected = _nested_mapping(recommendation, "selected_model")
+    return str(
+        selected.get("model_id")
+        or recommendation.get("recommended_model")
+        or recommendation.get("model_id")
+        or ""
+    )
+
+
+def _extract_hardware_id(recommendation: dict[str, Any] | None) -> str | None:
+    if not isinstance(recommendation, dict):
+        return None
+    selected = _nested_mapping(recommendation, "selected_hardware")
+    value = selected.get("hardware_id") or recommendation.get("hardware_id")
+    return str(value) if value else None
+
+
+def _extract_output_policy(recommendation: dict[str, Any] | None) -> str:
+    if not isinstance(recommendation, dict):
+        return ""
+    nested = _recommendation_body(recommendation)
+    return str(nested.get("output_policy") or recommendation.get("output_policy") or "")
+
+
+def _has_dataset_context(
+    dataset_summary: dict[str, Any] | None,
+    dataset_discovery: dict[str, Any] | None,
+) -> bool:
+    if isinstance(dataset_summary, dict) and dataset_summary:
+        return True
+    if not isinstance(dataset_discovery, dict) or not dataset_discovery:
+        return False
+    return bool(
+        dataset_discovery.get("selected_candidate")
+        or dataset_discovery.get("recommended_candidate")
+        or dataset_discovery.get("candidates")
+    )
+
+
+def _check(
+    *,
+    check_id: str,
+    provider: str,
+    category: PreflightCheckCategory,
+    label: str,
+    status: PreflightStatus,
+    severity: PreflightSeverity,
+    message: str,
+    required: bool = True,
+    applicable: bool = True,
+    details: dict[str, Any] | None = None,
+    error_code: str | None = None,
+    docs_verification_required: bool = False,
+) -> TrainingPreflightCheck:
+    return TrainingPreflightCheck(
+        check_id=check_id,
+        provider=provider,
+        category=category,
+        label=label,
+        status=status,
+        severity=severity,
+        message=message,
+        details={
+            "required": required,
+            "applicable": applicable,
+            **(details or {}),
+        },
+        started_at=_utc_now(),
+        completed_at=_utc_now(),
+        duration_ms=0,
+        error_code=error_code,
+        docs_verification_required=docs_verification_required,
+    )
+
+
 def build_training_preflight_result(
     *,
     session_id: str,
@@ -389,3 +504,300 @@ def build_training_preflight_result(
         cache=cache or TrainingPreflightCacheInfo(),
         metadata=safe_metadata,
     )
+
+
+def run_local_training_preflight(
+    *,
+    session_id: str,
+    run_id: str | None = None,
+    recommendation: dict[str, Any] | None = None,
+    dataset_summary: dict[str, Any] | None = None,
+    dataset_discovery: dict[str, Any] | None = None,
+    target_namespace: str | None = None,
+    target_repo_id: str | None = None,
+    target_bucket: str | None = None,
+    include_fallbacks: bool = False,
+    force_refresh: bool = False,
+    timeout_seconds: int | None = None,
+    metadata: dict[str, Any] | None = None,
+    allow_unknown_override: bool = False,
+) -> TrainingPreflightResult:
+    """Run Slice 2 local-only checks without provider SDKs or network calls."""
+
+    _ = include_fallbacks, force_refresh, timeout_seconds
+    provider = _extract_provider(recommendation)
+    model_id = _extract_model_id(recommendation)
+    hardware_id = _extract_hardware_id(recommendation)
+    output_policy = _extract_output_policy(recommendation)
+    checks: list[TrainingPreflightCheck] = []
+
+    if not isinstance(recommendation, dict) or not recommendation:
+        checks.append(
+            _check(
+                check_id="static_recommendation",
+                provider=provider,
+                category=PreflightCheckCategory.METADATA,
+                label="Static recommendation",
+                status=PreflightStatus.FAILED,
+                severity=PreflightSeverity.BLOCKING,
+                message="Static training recommendation is required before preflight.",
+                error_code="missing_recommendation",
+            )
+        )
+    else:
+        checks.append(
+            _check(
+                check_id="static_recommendation",
+                provider=provider,
+                category=PreflightCheckCategory.METADATA,
+                label="Static recommendation",
+                status=PreflightStatus.PASSED,
+                severity=PreflightSeverity.INFO,
+                message="Static training recommendation is present.",
+            )
+        )
+
+    provider_candidate = catalog_provider(provider)
+    checks.append(
+        _check(
+            check_id="provider_present",
+            provider=provider,
+            category=PreflightCheckCategory.API,
+            label="Provider",
+            status=PreflightStatus.PASSED
+            if provider_candidate
+            else PreflightStatus.FAILED,
+            severity=PreflightSeverity.INFO
+            if provider_candidate
+            else PreflightSeverity.BLOCKING,
+            message=(
+                f"Provider {provider} is in the static catalog."
+                if provider_candidate
+                else "Provider is missing or not recognized by the static catalog."
+            ),
+            error_code=None if provider_candidate else "unsupported_provider",
+        )
+    )
+
+    model_candidate = catalog_model(model_id) if model_id else None
+    checks.append(
+        _check(
+            check_id="model_id_present",
+            provider=provider,
+            category=PreflightCheckCategory.MODEL_ACCESS,
+            label="Model id",
+            status=PreflightStatus.PASSED if model_id else PreflightStatus.FAILED,
+            severity=PreflightSeverity.INFO if model_id else PreflightSeverity.BLOCKING,
+            message=(
+                f"Model id {model_id} is present."
+                if model_id
+                else "Model id is required before preflight."
+            ),
+            error_code=None if model_id else "missing_model_id",
+        )
+    )
+    if model_id and not model_candidate:
+        checks.append(
+            _check(
+                check_id="model_static_catalog",
+                provider=provider,
+                category=PreflightCheckCategory.METADATA,
+                label="Model static catalog",
+                status=PreflightStatus.WARNING,
+                severity=PreflightSeverity.WARNING,
+                message="Model is outside the static catalog; live metadata verification is still required.",
+                required=False,
+            )
+        )
+
+    hardware_candidate = catalog_hardware(hardware_id) if hardware_id else None
+    checks.append(
+        _check(
+            check_id="hardware_id_present",
+            provider=provider,
+            category=PreflightCheckCategory.HARDWARE,
+            label="Hardware id",
+            status=PreflightStatus.PASSED
+            if hardware_candidate
+            else PreflightStatus.FAILED,
+            severity=PreflightSeverity.INFO
+            if hardware_candidate
+            else PreflightSeverity.BLOCKING,
+            message=(
+                f"Hardware id {hardware_id} is in the static catalog."
+                if hardware_candidate
+                else "Hardware id is required and must be recognized before preflight."
+            ),
+            error_code=None if hardware_candidate else "missing_or_unknown_hardware",
+        )
+    )
+
+    valid_policy = output_policy in VALID_OUTPUT_POLICIES
+    checks.append(
+        _check(
+            check_id="output_policy_present",
+            provider=provider,
+            category=PreflightCheckCategory.OUTPUT_POLICY,
+            label="Output policy",
+            status=PreflightStatus.PASSED if valid_policy else PreflightStatus.FAILED,
+            severity=PreflightSeverity.INFO
+            if valid_policy
+            else PreflightSeverity.BLOCKING,
+            message=(
+                f"Output policy {output_policy} is recognized."
+                if valid_policy
+                else "Recognized output policy is required before preflight."
+            ),
+            error_code=None if valid_policy else "missing_or_unknown_output_policy",
+        )
+    )
+
+    has_dataset = _has_dataset_context(dataset_summary, dataset_discovery)
+    checks.append(
+        _check(
+            check_id="dataset_context",
+            provider=provider,
+            category=PreflightCheckCategory.METADATA,
+            label="Dataset context",
+            status=PreflightStatus.PASSED if has_dataset else PreflightStatus.WARNING,
+            severity=PreflightSeverity.INFO
+            if has_dataset
+            else PreflightSeverity.WARNING,
+            message=(
+                "Dataset summary or discovery context is present."
+                if has_dataset
+                else "Dataset summary or selected discovery context is not available yet."
+            ),
+            required=False,
+        )
+    )
+
+    if provider_candidate and valid_policy:
+        checks.append(
+            _check(
+                check_id="provider_output_policy_compatibility",
+                provider=provider,
+                category=PreflightCheckCategory.COMPATIBILITY,
+                label="Provider/output policy compatibility",
+                status=PreflightStatus.PASSED,
+                severity=PreflightSeverity.INFO,
+                message="Provider and output policy are locally plausible.",
+                details={
+                    "supports_private_output": provider_candidate.supports_private_output,
+                    "supports_hub_output": provider_candidate.supports_hub_output,
+                },
+            )
+        )
+
+    if model_candidate and hardware_candidate:
+        limit = hardware_candidate.suitable_model_size_b
+        fits = limit is None or model_candidate.parameter_count_b <= limit
+        checks.append(
+            _check(
+                check_id="model_hardware_memory_fit",
+                provider=provider,
+                category=PreflightCheckCategory.HARDWARE,
+                label="Model/hardware memory fit",
+                status=PreflightStatus.PASSED if fits else PreflightStatus.FAILED,
+                severity=PreflightSeverity.INFO if fits else PreflightSeverity.BLOCKING,
+                message=(
+                    "Static model size fits the selected hardware memory estimate."
+                    if fits
+                    else "Static model size exceeds the selected hardware memory estimate."
+                ),
+                error_code=None if fits else "hardware_memory_incompatible",
+                details={
+                    "model_parameter_count_b": model_candidate.parameter_count_b,
+                    "hardware_suitable_model_size_b": limit,
+                    "gpu_memory_gb": hardware_candidate.gpu_memory_gb,
+                },
+            )
+        )
+
+    checks.append(
+        _check(
+            check_id="provider_credentials_live",
+            provider=provider,
+            category=PreflightCheckCategory.CREDENTIALS,
+            label="Provider credentials",
+            status=PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.ERROR,
+            message="Live provider credential checks are not implemented in this slice.",
+            error_code="live_probe_not_implemented",
+            docs_verification_required=True,
+        )
+    )
+    if valid_policy and output_policy_requires_hub(output_policy):
+        checks.append(
+            _check(
+                check_id="hub_write_live",
+                provider=provider,
+                category=PreflightCheckCategory.OUTPUT_POLICY,
+                label="Hub write access",
+                status=PreflightStatus.UNKNOWN,
+                severity=PreflightSeverity.ERROR,
+                message="Hugging Face Hub write access requires a later live preflight probe.",
+                details={
+                    "target_namespace": target_namespace,
+                    "target_repo_id": target_repo_id,
+                },
+                error_code="live_probe_not_implemented",
+                docs_verification_required=True,
+            )
+        )
+    if valid_policy and output_policy_requires_cloud_storage(output_policy):
+        checks.append(
+            _check(
+                check_id="cloud_storage_live",
+                provider=provider,
+                category=PreflightCheckCategory.STORAGE,
+                label="Cloud storage writability",
+                status=PreflightStatus.UNKNOWN,
+                severity=PreflightSeverity.ERROR,
+                message="Cloud storage writability requires a later live preflight probe.",
+                details={"target_bucket": target_bucket},
+                error_code="live_probe_not_implemented",
+                docs_verification_required=True,
+            )
+        )
+    checks.append(
+        _check(
+            check_id="provider_job_launch",
+            provider=provider,
+            category=PreflightCheckCategory.SAFETY,
+            label="Provider job launch",
+            status=PreflightStatus.SKIPPED,
+            severity=PreflightSeverity.INFO,
+            message="Provider job launch is intentionally skipped for local preflight.",
+            required=False,
+            applicable=False,
+        )
+    )
+
+    result_metadata = {
+        "mode": "local_non_network",
+        "live_provider_checks": False,
+        "live_preflight_probe_status": "not_implemented",
+        **(metadata or {}),
+    }
+    result = build_training_preflight_result(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        model_id=model_id or "unknown",
+        hardware_id=hardware_id,
+        output_policy=output_policy or "unknown",
+        checks=checks,
+        verified_recommendation=sanitize_for_frontend(recommendation)
+        if isinstance(recommendation, dict)
+        else None,
+        metadata=result_metadata,
+        allow_unknown_override=allow_unknown_override,
+    )
+    if result.status == PreflightStatus.UNKNOWN:
+        summary = (
+            f"{result.safe_summary} Live provider probes are not implemented in this slice, "
+            "so launch_ready remains false until a later live preflight passes."
+        )
+        object.__setattr__(result, "safe_summary", str(sanitize_for_frontend(summary)))
+    return result
