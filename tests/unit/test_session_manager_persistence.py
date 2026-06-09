@@ -109,6 +109,32 @@ class RestoreStore(NoopSessionStore):
         self.messages = messages
 
 
+class TraceStore(RestoreStore):
+    def __init__(self, *, trace_messages: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.trace_messages = trace_messages
+
+    async def load_events_after(self, session_id: str, after_seq: int = 0):
+        return [
+            {
+                "_id": f"{session_id}:1",
+                "session_id": session_id,
+                "seq": 1,
+                "event_type": "tool_state_change",
+                "created_at": datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                "data": {
+                    "tool": "hf_jobs",
+                    "tool_call_id": "functions.hf_jobs:23",
+                    "state": "running",
+                    "jobUrl": "https://huggingface.co/jobs/acme/job-123",
+                },
+            }
+        ]
+
+    async def load_trace_messages(self, session_id: str):
+        return self.trace_messages
+
+
 class CloseableResource:
     def __init__(self) -> None:
         self.closed = False
@@ -194,6 +220,53 @@ async def test_submit_user_input_preserves_hf_training_metadata():
         "cloud_provider": "hf-jobs",
         "training_goal": "production",
         "output_policy": "hf-hub",
+    }
+
+
+@pytest.mark.asyncio
+async def test_load_response_events_includes_persisted_tool_trace_messages():
+    manager = _manager_with_store(
+        TraceStore(
+            trace_messages=[
+                {
+                    "session_id": "persisted-session",
+                    "seq": 2,
+                    "role": "tool",
+                    "created_at": datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+                    "message": {
+                        "role": "tool",
+                        "name": "hf_jobs",
+                        "tool_call_id": "functions.hf_jobs:23",
+                        "content": (
+                            "Python job completed!\n\n"
+                            "**Job ID:** job-123\n"
+                            "**Final Status:** COMPLETED\n"
+                            "**View at:** https://huggingface.co/jobs/acme/job-123\n"
+                        ),
+                    },
+                }
+            ]
+        )
+    )
+
+    events = await manager.load_response_events("persisted-session")
+
+    assert [event["event_type"] for event in events] == [
+        "tool_state_change",
+        "tool_output",
+    ]
+    tool_output = events[1]
+    assert tool_output["created_at"] == datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
+    assert tool_output["data"] == {
+        "tool": "hf_jobs",
+        "tool_call_id": "functions.hf_jobs:23",
+        "output": (
+            "Python job completed!\n\n"
+            "**Job ID:** job-123\n"
+            "**Final Status:** COMPLETED\n"
+            "**View at:** https://huggingface.co/jobs/acme/job-123\n"
+        ),
+        "success": True,
     }
 
 

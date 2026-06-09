@@ -35,6 +35,74 @@ def _doc_id(session_id: str, idx: int) -> str:
     return f"{session_id}:{idx}"
 
 
+def _hf_job_slug(value: Any) -> str:
+    return str(value or "").strip().rstrip("/").split("/")[-1]
+
+
+def _same_hf_job_id(left: Any, right: Any) -> bool:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text or not right_text:
+        return False
+    return left_text == right_text or _hf_job_slug(left_text) == _hf_job_slug(
+        right_text
+    )
+
+
+def _hf_job_slug_regex(value: Any) -> dict[str, str] | None:
+    slug = _hf_job_slug(value)
+    if not slug:
+        return None
+    return {"$regex": rf"(^|/){re.escape(slug)}/?$"}
+
+
+def _find_existing_response_row(
+    candidates: list[dict[str, Any]], row: dict[str, Any], row_user_id: str
+) -> dict[str, Any]:
+    platform = str(row.get("platform") or "")
+    job_id = str(row.get("job_id") or "")
+    session_id = str(row.get("session_id") or "")
+
+    def platform_matches(doc: dict[str, Any]) -> bool:
+        return str(doc.get("platform") or "") == platform
+
+    def exact_job_matches(doc: dict[str, Any]) -> bool:
+        return str(doc.get("job_id") or "") == job_id
+
+    def hf_job_matches(doc: dict[str, Any]) -> bool:
+        return platform == "hf-jobs" and _same_hf_job_id(doc.get("job_id"), job_id)
+
+    matchers = (
+        lambda doc: (
+            str(doc.get("user_id") or "") == row_user_id
+            and platform_matches(doc)
+            and exact_job_matches(doc)
+        ),
+        lambda doc: (
+            str(doc.get("user_id") or "") == row_user_id
+            and platform_matches(doc)
+            and hf_job_matches(doc)
+        ),
+        lambda doc: (
+            session_id
+            and str(doc.get("session_id") or "") == session_id
+            and platform_matches(doc)
+            and exact_job_matches(doc)
+        ),
+        lambda doc: (
+            session_id
+            and str(doc.get("session_id") or "") == session_id
+            and platform_matches(doc)
+            and hf_job_matches(doc)
+        ),
+    )
+    for matcher in matchers:
+        for doc in candidates:
+            if matcher(doc):
+                return doc
+    return {}
+
+
 def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
     """Return a Mongo-safe message document payload.
 
@@ -93,6 +161,9 @@ class NoopSessionStore:
 
     async def append_trace_message(self, *_: Any, **__: Any) -> int | None:
         return None
+
+    async def load_trace_messages(self, *_: Any, **__: Any) -> list[dict[str, Any]]:
+        return []
 
     async def get_quota(self, *_: Any, **__: Any) -> int | None:
         return None
@@ -445,6 +516,14 @@ class MongoSessionStore(NoopSessionStore):
             logger.debug("Failed to append trace message for %s: %s", session_id, e)
             return None
 
+    async def load_trace_messages(self, session_id: str) -> list[dict[str, Any]]:
+        if not self._ready():
+            return []
+        cursor = self.db.session_trace_messages.find({"session_id": session_id}).sort(
+            "seq", 1
+        )
+        return [row async for row in cursor]
+
     async def get_quota(self, user_id: str, day: str) -> int | None:
         if not self._ready():
             return None
@@ -629,12 +708,39 @@ class MongoSessionStore(NoopSessionStore):
             row_user_id = str(row.get("user_id") or user_id)
             platform = str(row.get("platform") or "")
             job_id = str(row.get("job_id") or "")
+            session_id = str(row.get("session_id") or "")
             if platform and job_id:
                 identity_filters.append(
                     {"user_id": row_user_id, "platform": platform, "job_id": job_id}
                 )
+                if session_id:
+                    identity_filters.append(
+                        {
+                            "session_id": session_id,
+                            "platform": platform,
+                            "job_id": job_id,
+                        }
+                    )
+                if platform == "hf-jobs":
+                    slug_regex = _hf_job_slug_regex(job_id)
+                    if slug_regex:
+                        identity_filters.append(
+                            {
+                                "user_id": row_user_id,
+                                "platform": platform,
+                                "job_id": slug_regex,
+                            }
+                        )
+                        if session_id:
+                            identity_filters.append(
+                                {
+                                    "session_id": session_id,
+                                    "platform": platform,
+                                    "job_id": slug_regex,
+                                }
+                            )
         existing_by_id: dict[str, dict[str, Any]] = {}
-        existing_by_identity: dict[tuple[str, str, str], dict[str, Any]] = {}
+        existing_candidates: list[dict[str, Any]] = []
         if row_ids:
             cursor = self.db.response_rows.find(
                 {"_id": {"$in": row_ids}},
@@ -642,6 +748,7 @@ class MongoSessionStore(NoopSessionStore):
                     "_id": 1,
                     "id": 1,
                     "user_id": 1,
+                    "session_id": 1,
                     "platform": 1,
                     "job_id": 1,
                     "actual_sequence_number": 1,
@@ -651,6 +758,7 @@ class MongoSessionStore(NoopSessionStore):
                 },
             )
             existing_by_id = {str(doc["_id"]): doc async for doc in cursor}
+            existing_candidates.extend(existing_by_id.values())
         if identity_filters:
             cursor = self.db.response_rows.find(
                 {"$or": identity_filters},
@@ -658,6 +766,7 @@ class MongoSessionStore(NoopSessionStore):
                     "_id": 1,
                     "id": 1,
                     "user_id": 1,
+                    "session_id": 1,
                     "platform": 1,
                     "job_id": 1,
                     "actual_sequence_number": 1,
@@ -667,26 +776,19 @@ class MongoSessionStore(NoopSessionStore):
                 },
             )
             async for doc in cursor:
-                identity = (
-                    str(doc.get("user_id") or user_id),
-                    str(doc.get("platform") or ""),
-                    str(doc.get("job_id") or ""),
-                )
-                existing_by_identity[identity] = doc
+                existing_candidates.append(doc)
         for raw in raw_rows:
             row = self._mongo_safe_value(dict(raw))
             row_id = str(row.get("id") or "")
             if not row_id:
                 continue
             row_user_id = str(row.get("user_id") or user_id)
-            identity = (
-                row_user_id,
-                str(row.get("platform") or ""),
-                str(row.get("job_id") or ""),
+            existing = existing_by_id.get(row_id) or _find_existing_response_row(
+                existing_candidates, row, row_user_id
             )
-            existing = (
-                existing_by_id.get(row_id) or existing_by_identity.get(identity) or {}
-            )
+            row.pop("_id", None)
+            row.pop("inserted_at", None)
+            row.pop("schema_version", None)
             for key in (
                 "actual_sequence_number",
                 "display_session_number",
@@ -698,6 +800,14 @@ class MongoSessionStore(NoopSessionStore):
             if existing.get("_id"):
                 row_id = str(existing["_id"])
                 row["id"] = str(existing.get("id") or existing["_id"])
+            if (
+                existing.get("job_id")
+                and str(row.get("platform") or "") == "hf-jobs"
+                and _same_hf_job_id(existing.get("job_id"), row.get("job_id"))
+                and str(existing.get("job_id")).startswith("https://")
+                and not str(row.get("job_id") or "").startswith("https://")
+            ):
+                row["job_id"] = existing["job_id"]
             row["user_id"] = row_user_id
             row["updated_at"] = now
             ops.append(
