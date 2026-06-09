@@ -13,6 +13,7 @@ import type {
 import { DEFAULT_OUTPUT_POLICY, DEFAULT_TRAINING_GOAL } from '@/lib/gcloud-preflight';
 import { deleteMessages, moveMessages } from '@/lib/chat-message-store';
 import { moveBackendMessages, deleteBackendMessages } from '@/lib/backend-message-store';
+import { redactText } from '@/lib/redaction';
 
 interface SessionStore {
   sessions: SessionMeta[];
@@ -143,7 +144,7 @@ export const useSessionStore = create<SessionStore>()(
               const auto = server.auto_approval;
               const updated = {
                 ...existing,
-                title: server.title || existing.title,
+                title: redactText(server.title || existing.title),
                 isActive: server.is_active ?? existing.isActive,
                 model: server.model ?? existing.model ?? null,
                 cloudProvider: server.cloud_provider ?? existing.cloudProvider ?? 'hf-jobs',
@@ -171,7 +172,7 @@ export const useSessionStore = create<SessionStore>()(
             }
             const newSession: SessionMeta = {
               id,
-              title: server.title || `Chat ${merged.length + 1}`,
+              title: redactText(server.title || `Chat ${merged.length + 1}`),
               createdAt: server.created_at || new Date().toISOString(),
               isActive: server.is_active ?? true,
               needsAttention: Boolean(server.pending_approval?.length),
@@ -247,7 +248,7 @@ export const useSessionStore = create<SessionStore>()(
       updateSessionTitle: (id: string, title: string) => {
         set((state) => ({
           sessions: state.sessions.map((s) =>
-            s.id === id ? { ...s, title } : s
+            s.id === id ? { ...s, title: redactText(title) } : s
           ),
         }));
       },

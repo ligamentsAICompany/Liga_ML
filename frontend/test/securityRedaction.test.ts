@@ -11,16 +11,23 @@ import type { UsageSummary } from '../src/types/usage.js';
 test('redacts secret-like frontend text and JSON without hiding normal artifact URLs', () => {
   const redacted = redactText([
     `HF_TOKEN=${'hf_' + 'A'.repeat(35)}`,
+    'HF_TOKEN=hf_FAKE_TEST_TOKEN_1234567890',
+    'AWS_SECRET_ACCESS_KEY=FAKEAWSSECRET1234567890',
     `Authorization: Bearer ${'b'.repeat(32)}`,
     'mongodb+srv://user:pass@example.mongodb.net/db',
+    'MONGODB_URI=mongodb+srv://fake_user:fake_password@example.mongodb.net/test',
+    'PRIVATE_KEY=-----BEGIN PRIVATE KEY-----FAKE-----END PRIVATE KEY-----',
     's3://bucket/model.tar.gz',
     'gs://bucket/path',
     'https://huggingface.co/alice/model',
   ].join('\n'));
 
   assert.doesNotMatch(redacted, /hf_[A-Za-z0-9]/);
+  assert.doesNotMatch(redacted, /FAKEAWSSECRET/);
   assert.doesNotMatch(redacted, /Bearer b/);
   assert.doesNotMatch(redacted, /user:pass@/);
+  assert.doesNotMatch(redacted, /fake_password/);
+  assert.doesNotMatch(redacted, /BEGIN PRIVATE KEY/);
   assert.match(redacted, /\[REDACTED\]/);
   assert.match(redacted, /s3:\/\/bucket\/model\.tar\.gz/);
   assert.match(redacted, /gs:\/\/bucket\/path/);

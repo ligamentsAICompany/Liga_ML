@@ -25,7 +25,7 @@ import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunP
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
 import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
-import { redactedJsonString } from '@/lib/redaction';
+import { redactText, redactedJsonString } from '@/lib/redaction';
 import { shouldMarkModelUnavailable, normalizeLlmErrorType } from '@/lib/llm-error-recovery';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import type { ToolStateChangeEventData } from '@/types/events';
@@ -51,15 +51,15 @@ function createPreflightPanelData(toolName: string, output: unknown, args?: Reco
     const panel = createTrainingPlannerPanel(output ?? args ?? {});
     return {
       title: 'Training Planner',
-      output: { content: panel.markdown, language: 'markdown' },
-      ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+      output: { content: redactText(panel.markdown), language: 'markdown' },
+      ...(args ? { input: { content: redactedJsonString(args), language: 'json' } } : {}),
     };
   }
   if (toolName === 'training_preflight') {
     const panel = createTrainingPreflightPanel(output as Parameters<typeof createTrainingPreflightPanel>[0]);
     return {
       title: 'Training Preflight',
-      output: { content: panel.markdown, language: 'markdown' },
+      output: { content: redactText(panel.markdown), language: 'markdown' },
       ...(args ? { input: { content: redactedJsonString(args), language: 'json' } } : {}),
     };
   }
@@ -67,8 +67,8 @@ function createPreflightPanelData(toolName: string, output: unknown, args?: Reco
     const panel = createDatasetDiscoveryPanel(output ?? args ?? {});
     return {
       title: 'Dataset Discovery',
-      output: { content: panel.markdown, language: 'markdown' },
-      ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+      output: { content: redactText(panel.markdown), language: 'markdown' },
+      ...(args ? { input: { content: redactedJsonString(args), language: 'json' } } : {}),
     };
   }
   return null;
@@ -230,7 +230,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         const sessState = useAgentStore.getState().getSessionState(sessionId);
         const existingOutput = sessState.panelData?.output?.content || '';
 
-        const rawNewContent = appendPanelOutput(existingOutput, log);
+        const rawNewContent = appendPanelOutput(existingOutput, redactText(log));
         const newContent = tool === 'gcp_vertex_jobs'
           ? appendTrainingResultSummary(rawNewContent)
           : tool === 'aws_sagemaker_jobs'
@@ -304,8 +304,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           panelUpdate = {
             panelData: {
               title: 'Script',
-              script: { content: args.script, language: 'python' },
-              parameters: firstTool.arguments as Record<string, unknown>,
+              script: { content: redactText(args.script), language: 'python' },
+              parameters: JSON.parse(redactedJsonString(firstTool.arguments)) as Record<string, unknown>,
             },
             panelView: 'script' as const,
             panelEditable: true,
@@ -333,8 +333,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           panelUpdate = {
             panelData: {
               title: filename.split('/').pop() || 'Content',
-              script: { content: args.content, language: filename.endsWith('.py') ? 'python' : 'text' },
-              parameters: firstTool.arguments as Record<string, unknown>,
+              script: { content: redactText(args.content), language: filename.endsWith('.py') ? 'python' : 'text' },
+              parameters: JSON.parse(redactedJsonString(firstTool.arguments)) as Record<string, unknown>,
             },
           };
         } else if (firstTool.tool === 'training_planner' || firstTool.tool === 'dataset_discovery') {
@@ -346,7 +346,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           panelUpdate = {
             panelData: {
               title: firstTool.tool,
-              output: { content: JSON.stringify(firstTool.arguments, null, 2), language: 'json' },
+              output: { content: redactedJsonString(firstTool.arguments), language: 'json' },
             },
             panelView: 'output' as const,
           };
@@ -363,8 +363,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           updateSession(sessionId, {
             panelData: {
               title: 'Script',
-              script: { content: String(args.script), language: 'python' },
-              parameters: args,
+              script: { content: redactText(String(args.script)), language: 'python' },
+              parameters: JSON.parse(redactedJsonString(args)) as Record<string, unknown>,
             },
             panelView: 'script',
           });
@@ -400,8 +400,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           updateSession(sessionId, {
             panelData: {
               title: `File Upload: ${String(args.path || 'unnamed')}`,
-              script: { content: String(args.content), language: String(args.path || '').endsWith('.py') ? 'python' : 'text' },
-              parameters: args,
+              script: { content: redactText(String(args.content)), language: String(args.path || '').endsWith('.py') ? 'python' : 'text' },
+              parameters: JSON.parse(redactedJsonString(args)) as Record<string, unknown>,
             },
           });
           if (isActiveRef.current) {
@@ -421,7 +421,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           updateSession(sessionId, {
             panelData: {
               title: 'Sandbox',
-              script: { content: String(args.command), language: 'bash' },
+              script: { content: redactText(String(args.command)), language: 'bash' },
             },
             panelView: 'output',
           });
@@ -432,12 +432,12 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         if (toolName === 'hf_jobs' && output) {
           updateSession(sessionId, {
             panelData: sessState.panelData
-              ? { ...sessState.panelData, output: { content: output, language: 'markdown' } }
-              : { title: 'Output', output: { content: output, language: 'markdown' } },
+              ? { ...sessState.panelData, output: { content: redactText(output), language: 'markdown' } }
+              : { title: 'Output', output: { content: redactText(output), language: 'markdown' } },
             panelView: !success ? 'output' : sessState.panelView,
           });
         } else if (toolName === 'gcp_vertex_jobs' && output) {
-          const content = appendTrainingResultSummary(output);
+          const content = redactText(appendTrainingResultSummary(output));
           updateSession(sessionId, {
             panelData: sessState.panelData
               ? { ...sessState.panelData, output: { content, language: 'markdown' } }
@@ -458,7 +458,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             useLayoutStore.getState().setRightPanelOpen(true);
           }
         } else if (toolName === 'aws_sagemaker_jobs' && output) {
-          const content = appendAwsTrainingResultSummary(output);
+          const content = redactText(appendAwsTrainingResultSummary(output));
           updateSession(sessionId, {
             panelData: sessState.panelData
               ? { ...sessState.panelData, output: { content, language: 'markdown' } }
@@ -527,8 +527,8 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           ? existingOutput.replace(new RegExp(`${heading}[\\s\\S]*$`, 'm'), stateMarkdown)
           : appendPanelOutput(existingOutput, stateMarkdown);
         const content = state.tool === 'gcp_vertex_jobs'
-          ? appendTrainingResultSummary(rawContent)
-          : appendAwsTrainingResultSummary(rawContent);
+          ? redactText(appendTrainingResultSummary(rawContent))
+          : redactText(appendAwsTrainingResultSummary(rawContent));
 
         updateSession(sessionId, {
           panelData: sessState.panelData

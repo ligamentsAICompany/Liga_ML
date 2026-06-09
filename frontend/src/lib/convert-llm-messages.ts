@@ -2,6 +2,7 @@
  * Convert backend LLM messages (litellm format) to Vercel AI SDK UIMessage format.
  */
 import type { UIMessage } from 'ai';
+import { redactJsonLike, redactText } from './redaction.js';
 
 interface LLMToolCall {
   id: string;
@@ -71,7 +72,7 @@ export function llmMessagesToUIMessages(
       uiMessages.push({
         id: existingId || nextId(),
         role: 'user',
-        parts: [{ type: 'text', text: msg.content || '' }],
+        parts: [{ type: 'text', text: redactText(msg.content || '') }],
       });
       continue;
     }
@@ -80,7 +81,7 @@ export function llmMessagesToUIMessages(
       const parts: UIMessage['parts'] = [];
 
       if (msg.content) {
-        parts.push({ type: 'text', text: msg.content });
+        parts.push({ type: 'text', text: redactText(msg.content) });
       }
 
       if (msg.tool_calls) {
@@ -97,8 +98,8 @@ export function llmMessagesToUIMessages(
               toolCallId: tc.id,
               toolName: tc.function.name,
               state: 'output-available',
-              input,
-              output: result.output,
+              input: redactJsonLike(input),
+              output: redactText(result.output),
             });
           } else if (pendingApprovalIds?.has(tc.id)) {
             parts.push({
@@ -106,7 +107,7 @@ export function llmMessagesToUIMessages(
               toolCallId: tc.id,
               toolName: tc.function.name,
               state: 'approval-requested',
-              input,
+              input: redactJsonLike(input),
               approval: { id: `approval-${tc.id}` },
             });
           } else {
@@ -115,7 +116,7 @@ export function llmMessagesToUIMessages(
               toolCallId: tc.id,
               toolName: tc.function.name,
               state: 'input-available',
-              input,
+              input: redactJsonLike(input),
             });
           }
         }
@@ -186,12 +187,12 @@ export function uiMessagesToLLMMessages(uiMessages: UIMessage[]): LLMMessage[] {
   const out: LLMMessage[] = [];
   for (const msg of uiMessages) {
     if (msg.role === 'user') {
-      const text = joinText(msg.parts);
+      const text = redactText(joinText(msg.parts));
       if (text) out.push({ role: 'user', content: text });
       continue;
     }
     if (msg.role === 'assistant') {
-      const text = joinText(msg.parts);
+      const text = redactText(joinText(msg.parts));
       const toolCalls: LLMToolCall[] = [];
       const pairedResults: Array<{ id: string; content: string }> = [];
       for (const raw of msg.parts as ToolPart[]) {
@@ -207,7 +208,7 @@ export function uiMessagesToLLMMessages(uiMessages: UIMessage[]): LLMMessage[] {
           id: toolCallId,
           function: {
             name: toolName,
-            arguments: JSON.stringify(raw.input ?? {}),
+            arguments: JSON.stringify(redactJsonLike(raw.input ?? {})),
           },
         });
 
@@ -221,7 +222,7 @@ export function uiMessagesToLLMMessages(uiMessages: UIMessage[]): LLMMessage[] {
               ? raw.errorText
               : null;
         if (result != null) {
-          pairedResults.push({ id: toolCallId, content: result });
+          pairedResults.push({ id: toolCallId, content: redactText(result) });
         }
       }
       if (text || toolCalls.length) {

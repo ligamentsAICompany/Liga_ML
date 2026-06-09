@@ -1,6 +1,7 @@
 import UserMessage from './UserMessage';
 import AssistantMessage from './AssistantMessage';
 import type { UIMessage } from 'ai';
+import { redactUIMessage } from '@/lib/chat-redaction';
 
 interface MessageBubbleProps {
   message: UIMessage;
@@ -23,10 +24,12 @@ export default function MessageBubble({
   sessionId,
   approveTools,
 }: MessageBubbleProps) {
+  const safeMessage = redactUIMessage(message);
+
   if (message.role === 'user') {
     return (
       <UserMessage
-        message={message}
+        message={safeMessage}
         isLastTurn={isLastTurn}
         onUndoTurn={onUndoTurn}
         onEditAndRegenerate={onEditAndRegenerate}
@@ -38,7 +41,7 @@ export default function MessageBubble({
   if (message.role === 'assistant') {
     return (
       <AssistantMessage
-        message={message}
+        message={safeMessage}
         isStreaming={isStreaming}
         sessionId={sessionId}
         approveTools={approveTools}

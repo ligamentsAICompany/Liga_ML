@@ -7,6 +7,7 @@
  */
 import type { UIMessage } from 'ai';
 import { logger } from '@/utils/logger';
+import { redactUIMessages, sanitizeMessagesMap } from './chat-redaction';
 
 const STORAGE_KEY = 'hf-agent-messages';
 const MAX_SESSIONS = 50;
@@ -19,9 +20,9 @@ function readAll(): MessagesMap {
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     // Legacy format was { messagesBySession: {...} }
-    if (parsed.messagesBySession) return parsed.messagesBySession;
+    if (parsed.messagesBySession) return sanitizeMessagesMap(parsed.messagesBySession);
     // New flat format
-    if (typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    if (typeof parsed === 'object' && !Array.isArray(parsed)) return sanitizeMessagesMap(parsed);
     return {};
   } catch {
     return {};
@@ -39,12 +40,15 @@ function writeAll(map: MessagesMap): void {
 export function loadMessages(sessionId: string): UIMessage[] {
   const map = readAll();
   const messages = map[sessionId] ?? [];
+  if (messages.length > 0) {
+    writeAll(map);
+  }
   return messages;
 }
 
 export function saveMessages(sessionId: string, messages: UIMessage[]): void {
   const map = readAll();
-  map[sessionId] = messages;
+  map[sessionId] = redactUIMessages(messages);
 
   // Evict oldest sessions if we exceed the cap
   const keys = Object.keys(map);
