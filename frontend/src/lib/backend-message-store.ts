@@ -5,6 +5,7 @@
  * but the LLM needs the backend format to continue the conversation.
  */
 import { logger } from '@/utils/logger';
+import { redactJsonLike } from './redaction.js';
 
 const STORAGE_KEY = 'hf-agent-backend-messages';
 const MAX_SESSIONS = 50;
@@ -17,7 +18,7 @@ function readAll(): MessagesMap {
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-      return parsed as MessagesMap;
+      return redactJsonLike(parsed) as MessagesMap;
     }
     return {};
   } catch {
@@ -36,12 +37,16 @@ function writeAll(map: MessagesMap): void {
 
 export function loadBackendMessages(sessionId: string): unknown[] {
   const map = readAll();
-  return map[sessionId] ?? [];
+  const messages = map[sessionId] ?? [];
+  if (messages.length > 0) {
+    writeAll(map);
+  }
+  return messages;
 }
 
 export function saveBackendMessages(sessionId: string, messages: unknown[]): void {
   const map = readAll();
-  map[sessionId] = messages;
+  map[sessionId] = redactJsonLike(messages);
 
   const keys = Object.keys(map);
   if (keys.length > MAX_SESSIONS) {

@@ -14,6 +14,7 @@ import { useAgentStore } from '@/store/agentStore';
 import { useSessionStore } from '@/store/sessionStore';
 import { buildGcloudChatRequestMetadata } from '@/lib/gcloud-preflight';
 import { consumeExplicitApprovalDecision } from '@/lib/explicit-tool-approvals';
+import { redactOutboundChatText } from './chat-redaction.js';
 
 function emptyFinishStream(): ReadableStream<UIMessageChunk> {
   return new ReadableStream<UIMessageChunk>({
@@ -575,7 +576,7 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
         .getState()
         .sessions.find((candidate) => candidate.id === sessionId);
       body = {
-        text,
+        text: redactOutboundChatText(text),
         request_id: requestId,
         ...buildGcloudChatRequestMetadata({
           cloudProvider,
