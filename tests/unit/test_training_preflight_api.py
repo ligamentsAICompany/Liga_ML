@@ -59,7 +59,7 @@ def allow_access(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_post_training_preflight_returns_and_persists_local_result(
+async def test_post_training_preflight_returns_and_persists_hf_token_failure(
     preflight_store,
     allow_access,
 ):
@@ -77,10 +77,14 @@ async def test_post_training_preflight_returns_and_persists_local_result(
 
     payload = response.model_dump()
 
-    assert payload["status"] == "unknown"
+    assert payload["status"] == "failed"
     assert payload["launch_ready"] is False
     assert payload["metadata"]["provider_jobs_launched"] is False
     assert payload["metadata"]["resources_created"] is False
+    assert any(
+        check["check_id"] == "hf.token.present" and check["status"] == "failed"
+        for check in payload["primary"]["checks"]
+    )
     assert allow_access == [False]
     assert await preflight_store.get_run_training_preflight("s1", run["run_id"])
 

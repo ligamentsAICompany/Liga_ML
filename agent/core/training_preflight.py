@@ -801,3 +801,113 @@ def run_local_training_preflight(
         )
         object.__setattr__(result, "safe_summary", str(sanitize_for_frontend(summary)))
     return result
+
+
+def _needs_hf_live_checks(provider: str, model_id: str, output_policy: str) -> bool:
+    return (
+        provider == "hf-jobs"
+        or output_policy_requires_hub(output_policy)
+        or bool(model_id and "/" in model_id)
+    )
+
+
+def _local_check_superseded_by_hf(
+    check: TrainingPreflightCheck,
+    *,
+    provider: str,
+    output_policy: str,
+) -> bool:
+    if check.check_id == "provider_credentials_live":
+        return True
+    if check.check_id == "hub_write_live" and output_policy_requires_hub(output_policy):
+        return True
+    return check.check_id == "cloud_storage_live" and provider == "hf-jobs"
+
+
+async def run_training_preflight(
+    *,
+    session_id: str,
+    run_id: str | None = None,
+    recommendation: dict[str, Any] | None = None,
+    dataset_summary: dict[str, Any] | None = None,
+    dataset_discovery: dict[str, Any] | None = None,
+    target_namespace: str | None = None,
+    target_repo_id: str | None = None,
+    target_bucket: str | None = None,
+    include_fallbacks: bool = False,
+    force_refresh: bool = False,
+    timeout_seconds: int | None = None,
+    metadata: dict[str, Any] | None = None,
+    allow_unknown_override: bool = False,
+    hf_token: str | None = None,
+    hf_client_factory: Any | None = None,
+    jobs_namespace_resolver: Any | None = None,
+) -> TrainingPreflightResult:
+    """Run training preflight, including HF read-only probes when required."""
+
+    local = run_local_training_preflight(
+        session_id=session_id,
+        run_id=run_id,
+        recommendation=recommendation,
+        dataset_summary=dataset_summary,
+        dataset_discovery=dataset_discovery,
+        target_namespace=target_namespace,
+        target_repo_id=target_repo_id,
+        target_bucket=target_bucket,
+        include_fallbacks=include_fallbacks,
+        force_refresh=force_refresh,
+        timeout_seconds=timeout_seconds,
+        metadata=metadata,
+        allow_unknown_override=allow_unknown_override,
+    )
+    if not _needs_hf_live_checks(local.provider, local.model_id, local.output_policy):
+        return local
+
+    from agent.core.preflight_hf import run_hf_preflight_checks
+
+    hf_result = await run_hf_preflight_checks(
+        provider=local.provider,
+        model_id=local.model_id,
+        hardware_id=local.hardware_id,
+        output_policy=local.output_policy,
+        target_namespace=target_namespace,
+        target_repo_id=target_repo_id,
+        hf_token=hf_token,
+        timeout_seconds=timeout_seconds,
+        hf_client_factory=hf_client_factory,
+        jobs_namespace_resolver=jobs_namespace_resolver,
+    )
+    local_checks = [
+        check
+        for check in local.primary.checks
+        if not _local_check_superseded_by_hf(
+            check,
+            provider=local.provider,
+            output_policy=local.output_policy,
+        )
+    ]
+    combined_metadata = {
+        **local.metadata,
+        "mode": "hf_read_only_live",
+        "live_provider_checks": True,
+        "live_preflight_probe_status": "hf_read_only",
+        "provider_jobs_launched": False,
+        "resources_created": False,
+    }
+    result = build_training_preflight_result(
+        session_id=session_id,
+        run_id=run_id,
+        provider=local.provider,
+        model_id=local.model_id,
+        hardware_id=local.hardware_id,
+        output_policy=local.output_policy,
+        checks=[*local_checks, *hf_result.checks],
+        fallbacks=local.fallbacks,
+        verified_recommendation=local.verified_recommendation,
+        cache=local.cache,
+        metadata=combined_metadata,
+        preflight_id=local.preflight_id,
+        created_at=local.created_at,
+        allow_unknown_override=allow_unknown_override,
+    )
+    return result

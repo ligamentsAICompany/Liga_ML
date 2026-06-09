@@ -90,7 +90,9 @@ from agent.core.post_training_evaluation import build_post_training_evaluation
 from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
-from agent.core.training_preflight import run_local_training_preflight
+from agent.core.training_preflight import (
+    run_training_preflight as execute_training_preflight,
+)
 from agent.core.usage import usage_dashboard_enabled
 
 logger = logging.getLogger(__name__)
@@ -1016,9 +1018,10 @@ async def get_run_recommendations(
 @router.post("/training-preflight", response_model=TrainingPreflightResultModel)
 async def run_training_preflight(
     request: TrainingPreflightRequest,
+    http_request: Request = None,
     user: dict = Depends(get_current_user),
 ) -> TrainingPreflightResultModel:
-    """Run a local-only training preflight without provider calls or job launch."""
+    """Run training preflight without launching provider jobs."""
 
     agent_session = await _check_session_access(
         request.session_id,
@@ -1044,7 +1047,12 @@ async def run_training_preflight(
     dataset_discovery = await session_manager.get_latest_dataset_discovery(
         request.session_id
     )
-    result = run_local_training_preflight(
+    hf_token = (
+        resolve_hf_request_token(http_request)
+        if http_request is not None
+        else (getattr(agent_session, "hf_token", None) or _user_hf_token(user))
+    )
+    result = await execute_training_preflight(
         session_id=request.session_id,
         run_id=request.run_id,
         recommendation=recommendation,
@@ -1061,6 +1069,7 @@ async def run_training_preflight(
             "agent_session_active": bool(getattr(agent_session, "is_active", False)),
         },
         allow_unknown_override=request.allow_unknown_override,
+        hf_token=hf_token,
     )
     saved = await session_manager.record_training_preflight(
         session_id=request.session_id,
