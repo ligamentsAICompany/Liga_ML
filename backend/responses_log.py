@@ -70,6 +70,17 @@ def _hub_model_url(value: Any) -> str | None:
     return text
 
 
+def _hub_only_artifact(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("https://huggingface.co/") and not text.startswith(
+        (
+            "https://huggingface.co/jobs/",
+            "https://huggingface.co/datasets/",
+            "https://huggingface.co/spaces/",
+        )
+    )
+
+
 def redact_response_value(value: Any) -> Any:
     """Return a copy of value with common token/secret patterns removed."""
     if value is None:
@@ -289,6 +300,15 @@ def _extract_hf_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None:
     if message:
         extracted["message"] = message
         extracted["failureReason"] = message
+    for key in (
+        "finalModelUrl",
+        "final_model_url",
+        "model_url",
+        "hubModelId",
+        "hub_model_id",
+    ):
+        if data.get(key) not in {None, ""}:
+            extracted[key] = data[key]
     if data.get("success") is not None:
         extracted["success"] = data.get("success")
     return extracted
@@ -595,6 +615,20 @@ async def build_responses_log(
                 and str(prior.get("final_artifact_or_result") or "").startswith("gs://")
             ):
                 final_artifact = prior["final_artifact_or_result"]
+            run_type = (
+                _as_str(data.get("training_goal"))
+                or _as_str(session.get("training_goal"))
+                or "agent-decide"
+            )
+            result_storage = (
+                _as_str(data.get("output_policy"))
+                or _as_str(session.get("output_policy"))
+                or "unknown"
+            )
+            if platform == "hf-jobs" and _hub_only_artifact(final_artifact):
+                result_storage = "hf-hub"
+                if "smoke" in str(final_artifact).lower():
+                    run_type = "smoke-test"
             row = {
                 "id": _row_id(session_id, platform, key[2]),
                 "display_session_number": 0,
@@ -605,12 +639,8 @@ async def build_responses_log(
                 "session_title": _as_str(session.get("title")),
                 "model_name": _as_str(session.get("model")) or "unknown",
                 "platform": platform,
-                "run_type": _as_str(data.get("training_goal"))
-                or _as_str(session.get("training_goal"))
-                or "agent-decide",
-                "result_storage": _as_str(data.get("output_policy"))
-                or _as_str(session.get("output_policy"))
-                or "unknown",
+                "run_type": run_type,
+                "result_storage": result_storage,
                 "progress": progress,
                 "job_id": display_job_id,
                 "final_artifact_or_result": final_artifact,

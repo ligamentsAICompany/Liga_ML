@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 MAX_BSON_BYTES = 15 * 1024 * 1024
+TERMINAL_RESPONSE_PROGRESS = {
+    "completed",
+    "failed",
+    "error",
+    "cancelled",
+    "interrupted",
+    "blocked",
+}
 NO_DURABLE_STORE_WARNING = (
     "MONGODB_URI is not configured; sessions will not survive restarts"
 )
@@ -54,6 +62,31 @@ def _hf_job_slug_regex(value: Any) -> dict[str, str] | None:
     if not slug:
         return None
     return {"$regex": rf"(^|/){re.escape(slug)}/?$"}
+
+
+def _response_is_terminal(row: dict[str, Any]) -> bool:
+    return str(row.get("progress") or "").lower() in TERMINAL_RESPONSE_PROGRESS
+
+
+def _hf_model_artifact(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("https://huggingface.co/") and not text.startswith(
+        (
+            "https://huggingface.co/jobs/",
+            "https://huggingface.co/datasets/",
+            "https://huggingface.co/spaces/",
+        )
+    )
+
+
+def _response_row_score(row: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return (
+        int(_response_is_terminal(row)),
+        int(bool(row.get("completed_at"))),
+        int(_hf_model_artifact(row.get("final_artifact_or_result"))),
+        int(str(row.get("result_storage") or "") == "hf-hub"),
+        int(str(row.get("run_type") or "") == "smoke-test"),
+    )
 
 
 def _find_existing_response_row(
@@ -96,11 +129,45 @@ def _find_existing_response_row(
             and hf_job_matches(doc)
         ),
     )
-    for matcher in matchers:
-        for doc in candidates:
-            if matcher(doc):
-                return doc
-    return {}
+    matches = [doc for matcher in matchers for doc in candidates if matcher(doc)]
+    if not matches:
+        return {}
+    return max(matches, key=_response_row_score)
+
+
+def _merge_response_row(
+    existing: dict[str, Any], row: dict[str, Any]
+) -> dict[str, Any]:
+    if not existing:
+        return row
+    merged = dict(row)
+    existing_terminal = _response_is_terminal(existing)
+    incoming_terminal = _response_is_terminal(row)
+    if existing_terminal and not incoming_terminal:
+        for key in ("progress", "provider_metadata", "error"):
+            if existing.get(key) is not None:
+                merged[key] = existing[key]
+    if existing.get("completed_at") and not row.get("completed_at"):
+        merged["completed_at"] = existing["completed_at"]
+    if (
+        str(existing.get("result_storage") or "") == "hf-hub"
+        and str(row.get("result_storage") or "") != "hf-hub"
+    ):
+        merged["result_storage"] = "hf-hub"
+    if (
+        str(existing.get("run_type") or "") == "smoke-test"
+        and str(row.get("run_type") or "") == "agent-decide"
+    ):
+        merged["run_type"] = "smoke-test"
+    if _hf_model_artifact(existing.get("final_artifact_or_result")) and not (
+        _hf_model_artifact(row.get("final_artifact_or_result"))
+    ):
+        merged["final_artifact_or_result"] = existing["final_artifact_or_result"]
+    if _hf_model_artifact(merged.get("final_artifact_or_result")):
+        merged["result_storage"] = "hf-hub"
+        if "smoke" in str(merged.get("final_artifact_or_result") or "").lower():
+            merged["run_type"] = "smoke-test"
+    return merged
 
 
 def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
@@ -755,6 +822,13 @@ class MongoSessionStore(NoopSessionStore):
                     "display_session_number": 1,
                     "batch_number": 1,
                     "created_at": 1,
+                    "run_type": 1,
+                    "result_storage": 1,
+                    "progress": 1,
+                    "final_artifact_or_result": 1,
+                    "completed_at": 1,
+                    "provider_metadata": 1,
+                    "error": 1,
                 },
             )
             existing_by_id = {str(doc["_id"]): doc async for doc in cursor}
@@ -773,6 +847,13 @@ class MongoSessionStore(NoopSessionStore):
                     "display_session_number": 1,
                     "batch_number": 1,
                     "created_at": 1,
+                    "run_type": 1,
+                    "result_storage": 1,
+                    "progress": 1,
+                    "final_artifact_or_result": 1,
+                    "completed_at": 1,
+                    "provider_metadata": 1,
+                    "error": 1,
                 },
             )
             async for doc in cursor:
@@ -783,9 +864,9 @@ class MongoSessionStore(NoopSessionStore):
             if not row_id:
                 continue
             row_user_id = str(row.get("user_id") or user_id)
-            existing = existing_by_id.get(row_id) or _find_existing_response_row(
+            existing = _find_existing_response_row(
                 existing_candidates, row, row_user_id
-            )
+            ) or existing_by_id.get(row_id)
             row.pop("_id", None)
             row.pop("inserted_at", None)
             row.pop("schema_version", None)
@@ -808,8 +889,28 @@ class MongoSessionStore(NoopSessionStore):
                 and not str(row.get("job_id") or "").startswith("https://")
             ):
                 row["job_id"] = existing["job_id"]
+            row = _merge_response_row(existing, row)
             row["user_id"] = row_user_id
             row["updated_at"] = now
+            if str(row.get("platform") or "") == "hf-jobs" and row.get("job_id"):
+                slug_regex = _hf_job_slug_regex(row.get("job_id"))
+                has_duplicate = any(
+                    str(candidate.get("_id") or "") != row_id
+                    and str(candidate.get("platform") or "") == "hf-jobs"
+                    and _same_hf_job_id(candidate.get("job_id"), row.get("job_id"))
+                    for candidate in existing_candidates
+                )
+                if slug_regex and has_duplicate:
+                    ops.append(
+                        DeleteMany(
+                            {
+                                "user_id": row_user_id,
+                                "platform": "hf-jobs",
+                                "job_id": slug_regex,
+                                "_id": {"$ne": row_id},
+                            }
+                        )
+                    )
             ops.append(
                 UpdateOne(
                     {"_id": row_id},

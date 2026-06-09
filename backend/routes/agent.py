@@ -691,18 +691,16 @@ async def get_responses(
                         user_id=user["user_id"], **filters
                     )
             else:
-                task = asyncio.create_task(
-                    _sync_response_sessions(user["user_id"], stale_session_ids)
+                await _sync_response_sessions(user["user_id"], stale_session_ids)
+                response_page = await store.list_response_rows(
+                    user_id=user["user_id"], **filters
                 )
-                _response_sync_tasks.add(task)
-                task.add_done_callback(_response_sync_tasks.discard)
-                hf_task = asyncio.create_task(
-                    _refresh_stale_hf_rows_from_hub(
-                        response_page.get("rows", []), user_id=user["user_id"]
+                if await _refresh_stale_hf_rows_from_hub(
+                    response_page.get("rows", []), user_id=user["user_id"]
+                ):
+                    response_page = await store.list_response_rows(
+                        user_id=user["user_id"], **filters
                     )
-                )
-                _response_sync_tasks.add(hf_task)
-                hf_task.add_done_callback(_response_sync_tasks.discard)
         return response_page
     return paginate_response_rows(
         filter_response_rows(rows, **filters),
