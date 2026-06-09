@@ -47,6 +47,43 @@ async def _store_with_usage(monkeypatch, estimate=1.25, budget="1"):
     return store, run_id
 
 
+async def _store_with_vertex_smoke_usage(monkeypatch):
+    monkeypatch.delenv("DEFAULT_DAILY_BUDGET_USD", raising=False)
+    monkeypatch.delenv("GCLOUD_DAILY_BUDGET_USD", raising=False)
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s-vertex", provider="gcp-vertex")
+    run_id = run["run_id"]
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s-vertex",
+        event_type="approval_required",
+        payload={
+            "tools": [
+                {
+                    "tool": "gcp_vertex_jobs",
+                    "tool_call_id": "vertex-call-1",
+                    "approval_id": "vertex-call-1",
+                    "provider": "gcp-vertex",
+                    "arguments": {
+                        "operation": "run",
+                        "training_goal": "smoke-test",
+                        "machine_type": "n1-standard-8",
+                        "accelerator_type": "NVIDIA_TESLA_T4",
+                        "accelerator_count": 1,
+                        "replica_count": 1,
+                        "max_run_hours": 1,
+                        "display_name": "liga-vertex-smoke",
+                        "output_dir": "gs://liga-training/vertex-outputs/smoke",
+                        "output_policy": "cloud-private",
+                    },
+                    "metadata": {"HF_TOKEN": "hf_secret", "run_type": "smoke-test"},
+                }
+            ]
+        },
+    )
+    return store, run_id
+
+
 @pytest.mark.asyncio
 async def test_usage_entry_from_approval_pending(monkeypatch):
     store, run_id = await _store_with_usage(monkeypatch)
@@ -61,6 +98,105 @@ async def test_usage_entry_from_approval_pending(monkeypatch):
     assert entries[0]["cost_confidence"] == "estimated"
     assert entries[0]["budget_cap_usd"] == 1
     assert "exceeds configured daily budget" in entries[0]["warning"]
+
+
+@pytest.mark.asyncio
+async def test_vertex_smoke_approval_creates_non_zero_estimate(monkeypatch):
+    store, run_id = await _store_with_vertex_smoke_usage(monkeypatch)
+
+    entries = await store.list_usage_entries(run_id=run_id)
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["provider"] == "gcp-vertex"
+    assert entry["tool_name"] == "gcp_vertex_jobs"
+    assert entry["status"] == "approval_required"
+    assert entry["estimated_cost_usd"] is not None
+    assert entry["estimated_cost_usd"] > 0
+    assert entry.get("known_cost_usd") in (None, 0)
+    assert entry["cost_source"] == "static_estimate"
+    assert entry["cost_confidence"] == "estimated"
+    assert entry["instance_type"] == "n1-standard-8 + NVIDIA_TESLA_T4"
+    assert entry["instance_count"] == 1
+    assert entry["max_runtime_seconds"] == 3600
+    assert entry["output_policy"] == "cloud-private"
+    assert entry["metadata"]["arguments"]["training_goal"] == "smoke-test"
+    assert entry["metadata"]["arguments"]["accelerator_count"] == 1
+    assert "hf_secret" not in str(entry).lower()
+
+
+@pytest.mark.asyncio
+async def test_vertex_job_launch_confirms_usage_without_duplicate(monkeypatch):
+    store, run_id = await _store_with_vertex_smoke_usage(monkeypatch)
+
+    launch_payload = {
+        "tool": "gcp_vertex_jobs",
+        "tool_call_id": "vertex-call-1",
+        "state": "running",
+        "jobName": "projects/489651394276/locations/us-central1/customJobs/1263998000355606528",
+        "jobUrl": "https://console.cloud.google.com/vertex-ai/locations/us-central1/training/1263998000355606528",
+        "outputDir": "gs://liga-training/vertex-outputs/smoke",
+        "machine_type": "n1-standard-8",
+        "accelerator_type": "NVIDIA_TESLA_T4",
+        "accelerator_count": 1,
+        "replica_count": 1,
+        "max_run_hours": 1,
+        "training_goal": "smoke-test",
+        "outputPolicy": "cloud-private",
+    }
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s-vertex",
+        event_type="tool_state_change",
+        payload=launch_payload,
+    )
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s-vertex",
+        event_type="tool_state_change",
+        payload=launch_payload,
+    )
+
+    entries = await store.list_usage_entries(run_id=run_id)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["status"] == "running"
+    assert entry["approved"] is True
+    assert entry["job_id"].endswith("/customJobs/1263998000355606528")
+    assert entry["artifact_url"] == "gs://liga-training/vertex-outputs/smoke"
+    assert entry["estimated_cost_usd"] is not None
+    assert entry["estimated_cost_usd"] > 0
+    assert entry.get("known_cost_usd") in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_vertex_usage_summary_and_api_include_estimate(monkeypatch):
+    store, run_id = await _store_with_vertex_smoke_usage(monkeypatch)
+    monkeypatch.setattr(agent.session_manager, "usage_summary", store.usage_summary)
+    monkeypatch.setattr(
+        agent.session_manager, "list_usage_entries", store.list_usage_entries
+    )
+
+    async def _allow_access(*args, **kwargs):
+        return SimpleNamespace()
+
+    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+
+    summary = await store.usage_summary(session_id="s-vertex")
+    api_summary = await agent.usage_summary(
+        session_id="s-vertex", user={"user_id": "dev"}
+    )
+    api_entries = await agent.list_usage(session_id="s-vertex", user={"user_id": "dev"})
+
+    assert summary["total_estimated_cost_usd"] > 0
+    assert summary["total_known_cost_usd"] == 0
+    assert summary["cost_by_provider"]["gcp-vertex"]["estimated_cost_usd"] > 0
+    assert summary["cost_by_run"][run_id]["estimated_cost_usd"] > 0
+    assert api_summary.total_estimated_cost_usd > 0
+    assert api_summary.recent_usage_entries[0].provider == "gcp-vertex"
+    assert api_entries[0].provider == "gcp-vertex"
+    assert api_entries[0].estimated_cost_usd is not None
+    assert api_entries[0].estimated_cost_usd > 0
 
 
 @pytest.mark.asyncio

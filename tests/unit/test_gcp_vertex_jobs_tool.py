@@ -148,6 +148,8 @@ async def test_run_command_submits_vertex_custom_job(monkeypatch):
             "machine_type": "n1-standard-8",
             "accelerator_type": "NVIDIA_TESLA_T4",
             "accelerator_count": 1,
+            "max_run_hours": 1,
+            "training_goal": "smoke-test",
             "env": {"DATASET_ID": "ligaments/gst"},
         }
     )
@@ -170,6 +172,13 @@ async def test_run_command_submits_vertex_custom_job(monkeypatch):
     assert job.run_kwargs["sync"] is False
     assert session.events[0].data["tool"] == "gcp_vertex_jobs"
     assert session.events[0].data["state"] == "running"
+    assert session.events[0].data["provider"] == "gcp-vertex"
+    assert session.events[0].data["machine_type"] == "n1-standard-8"
+    assert session.events[0].data["accelerator_type"] == "NVIDIA_TESLA_T4"
+    assert session.events[0].data["accelerator_count"] == 1
+    assert session.events[0].data["max_run_hours"] == 1
+    assert session.events[0].data["training_goal"] == "smoke-test"
+    assert session.events[0].data["outputDir"] == "gs://liga-training/outputs/gst-train"
 
 
 @pytest.mark.asyncio
