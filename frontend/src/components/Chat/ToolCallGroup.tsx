@@ -15,6 +15,15 @@ import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunP
 import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
 import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
+import {
+  buildManualPreflightRequest,
+  createManualPreflightErrorMarkdown,
+  createManualPreflightNotRunMarkdown,
+  PREFLIGHT_ACTION_COPY,
+  runManualTrainingPreflight,
+  type ManualPreflightState,
+} from '@/lib/training-preflight-action';
+import { runTrainingPreflight } from '@/lib/training-preflight-api';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
@@ -889,6 +898,7 @@ const EMPTY_AGENTS: Record<string, ResearchAgentState> = {};
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
   const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getJobRuntimeState, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
+  const activeSessionId = useAgentStore(s => s.activeSessionId);
   const researchAgents = useAgentStore(s => {
     const activeId = s.activeSessionId;
     return (activeId && s.sessionStates[activeId]?.researchAgents) || EMPTY_AGENTS;
@@ -919,6 +929,53 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
 
   // ── Panel lock state (for auto-follow vs user-selected) ───────────
   const [lockedToolId, setLockedToolId] = useState<string | null>(null);
+  const [preflightStates, setPreflightStates] = useState<Record<string, ManualPreflightState>>({});
+
+  const handleRunPreflight = useCallback(
+    async (tool: DynamicToolPart) => {
+      if (!activeSessionId) {
+        const markdown = createManualPreflightErrorMarkdown('No active session is available for preflight.');
+        setPreflightStates(prev => ({
+          ...prev,
+          [tool.toolCallId]: {
+            status: 'error',
+            disabled: false,
+            error: 'No active session is available for preflight.',
+            markdown,
+          },
+        }));
+        setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+        setRightPanelOpen(true);
+        return;
+      }
+
+      const input = tool.input as Record<string, unknown> | undefined;
+      const runId = typeof input?.run_id === 'string'
+        ? input.run_id
+        : typeof input?.runId === 'string'
+          ? input.runId
+          : undefined;
+      const request = buildManualPreflightRequest({
+        sessionId: activeSessionId,
+        runId,
+        plannerOutput: tool.output,
+        plannerInput: input,
+      });
+
+      await runManualTrainingPreflight({
+        request,
+        run: runTrainingPreflight,
+        onStateChange: (next) => {
+          setPreflightStates(prev => ({ ...prev, [tool.toolCallId]: next }));
+          if (next.markdown) {
+            setPanel({ title: 'Training Preflight', output: { content: next.markdown, language: 'markdown' } }, 'output');
+            setRightPanelOpen(true);
+          }
+        },
+      });
+    },
+    [activeSessionId, setPanel, setRightPanelOpen],
+  );
 
   // Reset submission state when new (unseen) pending tools arrive — e.g. second approval round
   useEffect(() => {
@@ -1384,6 +1441,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             !!tool.input ||
             (!isProcessing && (state === 'input-available' || state === 'input-streaming'));
           const localDecision = decisions[tool.toolCallId];
+          const preflightState = preflightStates[tool.toolCallId] ?? { status: 'not_run' as const };
 
           const cancelled = isCancelledTool(tool);
           const currentlyHasError = state === 'output-error';
@@ -1670,6 +1728,108 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   <OpenInNewIcon sx={{ fontSize: 14, color: 'var(--muted-text)', opacity: 0.6 }} />
                 )}
               </Stack>
+
+              {tool.toolName === 'training_planner' && (
+                <Box
+                  sx={{
+                    px: 1.5,
+                    pb: 1.25,
+                    pt: 0.25,
+                    borderTop: '1px solid rgba(255,255,255,0.03)',
+                    bgcolor: 'rgba(255,255,255,0.015)',
+                  }}
+                >
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    alignItems={{ xs: 'stretch', sm: 'center' }}
+                  >
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography
+                        variant="body2"
+                        sx={{ color: 'var(--text)', fontSize: '0.73rem', fontWeight: 600 }}
+                      >
+                        {PREFLIGHT_ACTION_COPY.staticNotVerified}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.25 }}
+                      >
+                        {PREFLIGHT_ACTION_COPY.notLaunch} {PREFLIGHT_ACTION_COPY.noJobs} {PREFLIGHT_ACTION_COPY.noResources}{' '}
+                        {PREFLIGHT_ACTION_COPY.unknownNotPassed} {PREFLIGHT_ACTION_COPY.approvalRequired}
+                      </Typography>
+                      {preflightState.status === 'checking' && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Preflight is running. Repeat clicks are disabled.
+                        </Typography>
+                      )}
+                      {preflightState.status === 'error' && preflightState.error && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--accent-red)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          {preflightState.error}
+                        </Typography>
+                      )}
+                      {preflightState.status === 'success' && preflightState.result && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: preflightState.result.launch_ready ? 'var(--accent-green)' : 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Latest preflight: {String(preflightState.result.status)} · launch_ready={String(preflightState.result.launch_ready)}
+                        </Typography>
+                      )}
+                    </Box>
+                    <Button
+                      size="small"
+                      disabled={preflightState.status === 'checking' || !activeSessionId}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleRunPreflight(tool);
+                      }}
+                      sx={{
+                        textTransform: 'none',
+                        color: 'var(--accent-yellow)',
+                        border: '1px solid rgba(255,193,59,0.35)',
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        px: 1.5,
+                        py: 0.6,
+                        borderRadius: '8px',
+                        whiteSpace: 'nowrap',
+                        '&:hover': { bgcolor: 'rgba(255,193,59,0.08)', borderColor: 'var(--accent-yellow)' },
+                        '&.Mui-disabled': { color: 'var(--muted-text)', borderColor: 'var(--tool-border)', opacity: 0.55 },
+                      }}
+                    >
+                      {preflightState.status === 'checking' ? 'Running preflight...' : 'Run preflight check'}
+                    </Button>
+                    {preflightState.status === 'not_run' && (
+                      <Button
+                        size="small"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          const markdown = createManualPreflightNotRunMarkdown();
+                          setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+                          setRightPanelOpen(true);
+                        }}
+                        sx={{
+                          textTransform: 'none',
+                          color: 'var(--muted-text)',
+                          fontSize: '0.7rem',
+                          px: 1,
+                          whiteSpace: 'nowrap',
+                          '&:hover': { color: 'var(--text)', bgcolor: 'rgba(255,255,255,0.04)' },
+                        }}
+                      >
+                        View safety note
+                      </Button>
+                    )}
+                  </Stack>
+                </Box>
+              )}
 
               {/* Research sub-agent rolling steps (visible only while running) */}
               {tool.toolName === 'research' && !cancelled && state !== 'output-available' && state !== 'output-error' && state !== 'output-denied' && researchAgents[tool.toolCallId] && (
