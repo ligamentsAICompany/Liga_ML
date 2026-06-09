@@ -680,10 +680,18 @@ class GcpVertexJobsTool:
                     data={
                         "tool_call_id": self.tool_call_id,
                         "tool": "gcp_vertex_jobs",
+                        "provider": "gcp-vertex",
                         "state": "running",
                         "jobName": resource_name,
                         "jobUrl": console_url,
                         "outputDir": output_dir,
+                        "machine_type": machine_spec.get("machine_type"),
+                        "accelerator_type": machine_spec.get("accelerator_type"),
+                        "accelerator_count": machine_spec.get("accelerator_count"),
+                        "replica_count": worker_pool_specs[0]["replica_count"],
+                        "max_run_hours": args.get("max_run_hours"),
+                        "training_goal": training_goal,
+                        "outputPolicy": output_policy,
                     },
                 )
             )

@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Iterable, Literal
 
+from agent.core.cost_estimation import (
+    GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR,
+    GCP_VERTEX_MACHINE_PRICE_USD_PER_HOUR,
+)
 from agent.core.redact import SECRET_KEY_RE, redact_text
 
 UsageProvider = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker", "llm", "unknown"]
@@ -206,6 +210,49 @@ def _instance_count(args: dict[str, Any]) -> int | None:
     return _int_or_none(args.get("instance_count") or args.get("replica_count"))
 
 
+def _vertex_static_estimate(args: dict[str, Any]) -> float | None:
+    operation = str(args.get("operation") or "run").strip().lower()
+    if operation != "run":
+        return 0.0
+    runtime_seconds = _runtime_cap_seconds("gcp-vertex", args)
+    if runtime_seconds is None or runtime_seconds <= 0:
+        return None
+    machine_type = str(args.get("machine_type") or "n1-standard-8")
+    machine_price = GCP_VERTEX_MACHINE_PRICE_USD_PER_HOUR.get(machine_type)
+    if machine_price is None:
+        return None
+    accelerator_total = 0.0
+    accelerator_type = str(args.get("accelerator_type") or "")
+    if accelerator_type:
+        accelerator_price = GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR.get(
+            accelerator_type
+        )
+        if accelerator_price is None:
+            return None
+        accelerator_count = _int_or_none(args.get("accelerator_count")) or 1
+        if accelerator_count <= 0:
+            return None
+        accelerator_total = accelerator_price * accelerator_count
+    replica_count = _int_or_none(args.get("replica_count")) or 1
+    if replica_count <= 0:
+        return None
+    runtime_hours = runtime_seconds / 3600
+    return round((machine_price + accelerator_total) * replica_count * runtime_hours, 4)
+
+
+def _estimated_cost_for_provider(
+    provider: str, explicit: Any, args: dict[str, Any]
+) -> tuple[float | None, str]:
+    estimated = _float_or_none(explicit)
+    if estimated is not None:
+        return estimated, "approval_estimate"
+    if provider == "gcp-vertex":
+        static_estimate = _vertex_static_estimate(args)
+        if static_estimate is not None:
+            return static_estimate, "static_estimate"
+    return None, "unknown"
+
+
 def _budget_cap(
     provider: str, payload: dict[str, Any], args: dict[str, Any]
 ) -> float | None:
@@ -314,9 +361,11 @@ def usage_from_approval_tool(
         or ""
     )
     usage_id = f"{run_id or session_id}:approval:{approval_id or tool_name}"
-    estimated_cost = _float_or_none(
+    estimated_cost, cost_source = _estimated_cost_for_provider(
+        provider,
         tool_payload.get("estimated_cost_usd")
-        or event_payload.get("estimated_cost_usd")
+        or event_payload.get("estimated_cost_usd"),
+        args,
     )
     entry = base_usage_entry(
         session_id=session_id,
@@ -330,9 +379,7 @@ def usage_from_approval_tool(
         {
             "status": "approval_required",
             "estimated_cost_usd": estimated_cost,
-            "cost_source": "approval_estimate"
-            if estimated_cost is not None
-            else "unknown",
+            "cost_source": cost_source,
             "cost_confidence": "estimated" if estimated_cost is not None else "unknown",
             "instance_type": _instance_type(provider, args),
             "instance_count": _instance_count(args),
@@ -410,9 +457,10 @@ def usage_from_tool_state(
         "updated_at": now,
         "started_at": now if status == "running" else None,
         "completed_at": now if status in TERMINAL_STATES else None,
+        "estimated_cost_usd": None,
         "known_cost_usd": None,
-        "cost_source": "unknown",
-        "cost_confidence": "estimated",
+        "cost_source": None,
+        "cost_confidence": None,
         "output_policy": payload.get("outputPolicy"),
         "approved": True if status in {"approved", "running", "succeeded"} else None,
         "quota_status": "blocked" if status == "blocked" else "unknown",
@@ -424,6 +472,24 @@ def usage_from_tool_state(
         "error_summary": payload.get("failureReason") or payload.get("reason"),
         "metadata": sanitize_metadata(payload),
     }
+    if provider == "gcp-vertex":
+        estimated_cost, cost_source = _estimated_cost_for_provider(
+            provider, payload.get("estimated_cost_usd"), payload
+        )
+        if estimated_cost is not None:
+            updates["estimated_cost_usd"] = estimated_cost
+            updates["cost_source"] = cost_source
+            updates["cost_confidence"] = "estimated"
+        updates["instance_type"] = _instance_type(provider, payload)
+        updates["instance_count"] = _instance_count(payload)
+        updates["max_runtime_seconds"] = _runtime_cap_seconds(provider, payload)
+        updates["dataset_name"] = payload.get("dataset_name") or payload.get(
+            "dataset_id"
+        )
+        updates["model_name"] = payload.get("model_id") or payload.get("base_model")
+        updates["output_policy"] = payload.get("outputPolicy") or payload.get(
+            "output_policy"
+        )
     return usage_id, updates
 
 
