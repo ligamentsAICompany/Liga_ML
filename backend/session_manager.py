@@ -779,6 +779,7 @@ class SessionManager:
                 hf_username=hf_username,
             )
             return started
+        await self.persist_session_snapshot(agent_session, runtime_state="idle")
         if preload_sandbox:
             self._start_cpu_sandbox_preload(agent_session)
         logger.info("Restored session %s for user %s", session_id, owner or user_id)
@@ -1506,8 +1507,46 @@ class SessionManager:
                 logger.debug(
                     "Failed to load persisted events for %s: %s", session_id, e
                 )
+            if hasattr(store, "load_trace_messages"):
+                try:
+                    for trace in await store.load_trace_messages(session_id):
+                        event = self._response_event_from_trace_message(trace)
+                        if event:
+                            events.append(event)
+                except Exception as e:
+                    logger.debug(
+                        "Failed to load persisted trace messages for %s: %s",
+                        session_id,
+                        e,
+                    )
 
         return events
+
+    def _response_event_from_trace_message(
+        self, trace: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        message = trace.get("message")
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            return None
+        tool = str(message.get("name") or "").strip()
+        if tool not in {"hf_jobs", "gcp_vertex_jobs", "aws_sagemaker_jobs"}:
+            return None
+        output = message.get("content")
+        if output in {None, ""}:
+            return None
+        output_text = str(output)
+        return {
+            "event_type": "tool_output",
+            "created_at": trace.get("created_at"),
+            "data": {
+                "tool": tool,
+                "tool_call_id": message.get("tool_call_id"),
+                "output": output_text,
+                "success": not output_text.lstrip()
+                .lower()
+                .startswith(("error:", "tool error:")),
+            },
+        }
 
     @property
     def active_session_count(self) -> int:

@@ -8,8 +8,10 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from dependencies import (
@@ -145,6 +147,15 @@ AVAILABLE_MODELS = _available_models()
 VALID_CLOUD_PROVIDERS = {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
 VALID_TRAINING_GOALS = {"smoke-test", "production", "agent-decide"}
 VALID_OUTPUT_POLICIES = {"cloud-private", "hf-hub", "cloud-and-hf-hub"}
+HF_JOB_URL_RE = re.compile(r"https://huggingface\.co/jobs/([^/\s]+)/([^/\s`\"')\]]+)")
+TERMINAL_RESPONSE_PROGRESS = {
+    "completed",
+    "failed",
+    "error",
+    "cancelled",
+    "interrupted",
+    "blocked",
+}
 
 
 def _is_premium_model(model_id: str) -> bool:
@@ -470,15 +481,133 @@ async def _sync_response_rows(
 
 
 def _stale_response_session_ids(rows: list[dict[str, Any]]) -> set[str]:
-    terminal = {"completed", "failed", "error", "cancelled", "interrupted", "blocked"}
     return {
         str(row.get("session_id"))
         for row in rows
         if row.get("platform") in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
-        and str(row.get("progress") or "").lower() not in terminal
+        and str(row.get("progress") or "").lower() not in TERMINAL_RESPONSE_PROGRESS
         and row.get("session_id")
         and row.get("job_id")
     }
+
+
+def _hf_job_identity(row: dict[str, Any]) -> tuple[str | None, str | None]:
+    raw_job = str(row.get("job_id") or row.get("final_artifact_or_result") or "")
+    match = HF_JOB_URL_RE.search(raw_job)
+    if match:
+        return match.group(2).rstrip("/"), match.group(1)
+    if raw_job and "/" not in raw_job and not raw_job.startswith("http"):
+        return raw_job.rstrip("/"), None
+    return None, None
+
+
+def _normalize_hf_job_progress(stage: Any) -> str:
+    text = str(stage or "").strip().lower()
+    if text in {"completed", "complete", "succeeded", "success", "done", "finished"}:
+        return "completed"
+    if text in {"failed", "failure", "expired"}:
+        return "failed"
+    if text in {"error", "errored"}:
+        return "error"
+    if text in {"canceled", "cancelled", "cancelling"}:
+        return "cancelled"
+    if text in {"scheduling", "scheduled", "pending"}:
+        return "queued"
+    if text in {"running", "queued"}:
+        return text
+    return text or "unknown"
+
+
+def _completed_at_from_hf_job(job_info: Any) -> str:
+    for attr in ("updated_at", "last_modified", "created_at"):
+        value = getattr(job_info, attr, None)
+        if isinstance(value, datetime):
+            parsed = value if value.tzinfo else value.replace(tzinfo=UTC)
+            return parsed.isoformat()
+    return datetime.now(UTC).isoformat()
+
+
+def _hub_only_artifact(value: Any) -> bool:
+    text = str(value or "")
+    return text.startswith("https://huggingface.co/") and not text.startswith(
+        (
+            "https://huggingface.co/jobs/",
+            "https://huggingface.co/datasets/",
+            "https://huggingface.co/spaces/",
+        )
+    )
+
+
+def _hf_inspected_response_row(row: dict[str, Any], job_info: Any) -> dict[str, Any]:
+    status = getattr(job_info, "status", None)
+    stage = getattr(status, "stage", None)
+    progress = _normalize_hf_job_progress(stage)
+    updated = dict(row)
+    updated["progress"] = progress
+    updated["provider_metadata"] = {
+        **dict(row.get("provider_metadata") or {}),
+        "tool": "hf_jobs",
+        "state": str(stage or progress).upper(),
+        "refreshed_from": "hf_jobs_inspect",
+    }
+    if progress in TERMINAL_RESPONSE_PROGRESS:
+        updated["completed_at"] = row.get("completed_at") or _completed_at_from_hf_job(
+            job_info
+        )
+    if _hub_only_artifact(row.get("final_artifact_or_result")):
+        updated["result_storage"] = "hf-hub"
+        if "smoke" in str(row.get("final_artifact_or_result") or "").lower():
+            updated["run_type"] = "smoke-test"
+    return updated
+
+
+async def _inspect_hf_job_status(job_id: str, namespace: str | None) -> Any:
+    from huggingface_hub import HfApi
+
+    kwargs: dict[str, Any] = {"job_id": job_id}
+    if namespace:
+        kwargs["namespace"] = namespace
+    return await asyncio.to_thread(HfApi().inspect_job, **kwargs)
+
+
+async def _refresh_stale_hf_rows_from_hub(
+    rows: list[dict[str, Any]],
+    *,
+    user_id: str,
+    inspect_job: Any = None,
+) -> bool:
+    stale_hf_rows = [
+        row
+        for row in rows
+        if row.get("platform") == "hf-jobs"
+        and str(row.get("progress") or "").lower() not in TERMINAL_RESPONSE_PROGRESS
+        and row.get("job_id")
+    ]
+    if not stale_hf_rows:
+        return False
+    inspector = inspect_job or _inspect_hf_job_status
+    refreshed: list[dict[str, Any]] = []
+    for row in stale_hf_rows:
+        job_id, namespace = _hf_job_identity(row)
+        if not job_id:
+            continue
+        try:
+            job_info = await inspector(job_id, namespace)
+        except Exception as e:
+            logger.debug("HF Jobs stale row refresh failed for %s: %s", job_id, e)
+            continue
+        updated = _hf_inspected_response_row(row, job_info)
+        if updated.get("progress") != row.get("progress") or updated.get(
+            "completed_at"
+        ) != row.get("completed_at"):
+            refreshed.append(updated)
+    if not refreshed:
+        return False
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
+        await store.upsert_response_rows(refreshed, user_id=user_id)
+        return True
+    return False
 
 
 async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
@@ -555,12 +684,23 @@ async def get_responses(
                 response_page = await store.list_response_rows(
                     user_id=user["user_id"], **filters
                 )
+                if await _refresh_stale_hf_rows_from_hub(
+                    response_page.get("rows", []), user_id=user["user_id"]
+                ):
+                    response_page = await store.list_response_rows(
+                        user_id=user["user_id"], **filters
+                    )
             else:
-                task = asyncio.create_task(
-                    _sync_response_sessions(user["user_id"], stale_session_ids)
+                await _sync_response_sessions(user["user_id"], stale_session_ids)
+                response_page = await store.list_response_rows(
+                    user_id=user["user_id"], **filters
                 )
-                _response_sync_tasks.add(task)
-                task.add_done_callback(_response_sync_tasks.discard)
+                if await _refresh_stale_hf_rows_from_hub(
+                    response_page.get("rows", []), user_id=user["user_id"]
+                ):
+                    response_page = await store.list_response_rows(
+                        user_id=user["user_id"], **filters
+                    )
         return response_page
     return paginate_response_rows(
         filter_response_rows(rows, **filters),

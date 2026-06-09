@@ -1,6 +1,7 @@
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -108,7 +109,7 @@ async def test_hf_terminal_row_extracts_job_and_artifact():
     assert row["model_name"] == "Qwen/Qwen2.5-0.5B-Instruct"
     assert row["platform"] == "hf-jobs"
     assert row["run_type"] == "smoke-test"
-    assert row["result_storage"] == "cloud-and-hf-hub"
+    assert row["result_storage"] == "hf-hub"
     assert row["progress"] == "completed"
     assert row["job_id"] == "https://huggingface.co/jobs/acme/123"
     assert row["final_artifact_or_result"] == "https://huggingface.co/acme/final-model"
@@ -152,6 +153,71 @@ LIGA_FINAL_MODEL_URL=https://huggingface.co/acme/final-model
     assert row["progress"] == "completed"
     assert row["job_id"] == "https://huggingface.co/jobs/acme/job-123"
     assert row["completed_at"] == "2026-01-01T00:01:00+00:00"
+    assert row["final_artifact_or_result"] == "https://huggingface.co/acme/final-model"
+
+
+@pytest.mark.asyncio
+async def test_hf_approved_job_preserves_tool_metadata_after_terminal_output():
+    events = [
+        {
+            "event_type": "approval_required",
+            "created_at": datetime(2026, 1, 1, tzinfo=UTC),
+            "data": {
+                "tools": [
+                    {
+                        "tool": "hf_jobs",
+                        "tool_call_id": "functions.hf_jobs:23",
+                        "arguments": {
+                            "operation": "run",
+                            "template": "sft",
+                            "training_goal": "smoke-test",
+                            "output_policy": "hf-hub",
+                            "hub_model_id": "acme/final-model",
+                        },
+                    }
+                ]
+            },
+        },
+        _event(
+            "hf_jobs",
+            "running",
+            tool_call_id="functions.hf_jobs:23",
+            jobUrl="https://huggingface.co/jobs/acme/job-123",
+            created_at=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        ),
+        _tool_output(
+            "hf_jobs",
+            """
+Python job completed!
+
+**Job ID:** job-123
+**Final Status:** COMPLETED
+**View at:** https://huggingface.co/jobs/acme/job-123
+""",
+            tool_call_id="functions.hf_jobs:23",
+            created_at=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+        ),
+    ]
+
+    result = await build_responses_log(
+        [
+            _session(
+                "s1",
+                goal="agent-decide",
+                output_policy="cloud-and-hf-hub",
+                events=events,
+            )
+        ],
+        load_events=lambda _sid: events,
+    )
+
+    assert len(result["rows"]) == 1
+    row = result["rows"][0]
+    assert row["progress"] == "completed"
+    assert row["completed_at"] == "2026-01-01T00:02:00+00:00"
+    assert row["job_id"] == "https://huggingface.co/jobs/acme/job-123"
+    assert row["run_type"] == "smoke-test"
+    assert row["result_storage"] == "hf-hub"
     assert row["final_artifact_or_result"] == "https://huggingface.co/acme/final-model"
 
 
@@ -733,12 +799,20 @@ class _AsyncListCursor:
 
 class _FakeResponseRowsCollection:
     def __init__(self, existing_doc):
-        self.existing_doc = existing_doc
+        if isinstance(existing_doc, list):
+            self.existing_docs = list(existing_doc)
+        else:
+            self.existing_docs = [existing_doc]
         self.ops = []
 
     def find(self, query, *_args, **_kwargs):
         if "$or" in query:
-            return _AsyncListCursor([self.existing_doc])
+            return _AsyncListCursor(self.existing_docs)
+        if "_id" in query and isinstance(query["_id"], dict):
+            row_ids = set(query["_id"].get("$in") or [])
+            return _AsyncListCursor(
+                [doc for doc in self.existing_docs if doc.get("_id") in row_ids]
+            )
         return _AsyncListCursor([])
 
     async def bulk_write(self, ops, **_kwargs):
@@ -795,6 +869,180 @@ async def test_mongo_upsert_preserves_sequence_when_vertex_identity_matches():
     assert update["batch_number"] == 1
     assert update["created_at"] == "2026-01-01T00:00:00+00:00"
     assert update["progress"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_mongo_upsert_matches_hf_job_url_with_terminal_short_id():
+    existing_doc = {
+        "_id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "user_id": "dev",
+        "session_id": "persisted",
+        "platform": "hf-jobs",
+        "job_id": "https://huggingface.co/jobs/acme/job-123",
+        "actual_sequence_number": 11,
+        "display_session_number": 11,
+        "batch_number": 1,
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    store = MongoSessionStore("mongodb://example.invalid", "liga_ml")
+    store.enabled = True
+    store.db = _FakeMongoDb(existing_doc)
+
+    await store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:hf-jobs:job-123",
+                "display_session_number": 1,
+                "actual_sequence_number": 1,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "platform": "hf-jobs",
+                "progress": "completed",
+                "job_id": "job-123",
+                "final_artifact_or_result": "https://huggingface.co/acme/final-model",
+                "created_at": "2026-01-01T00:01:00+00:00",
+                "completed_at": "2026-01-01T00:02:00+00:00",
+                "inserted_at": "2026-01-01T00:00:00+00:00",
+                "schema_version": 1,
+            }
+        ],
+        user_id="dev",
+    )
+
+    [op] = store.db.response_rows.ops
+    assert op._filter == {"_id": existing_doc["_id"]}
+    update = op._doc["$set"]
+    assert update["id"] == existing_doc["id"]
+    assert update["actual_sequence_number"] == 11
+    assert update["display_session_number"] == 11
+    assert update["batch_number"] == 1
+    assert update["created_at"] == "2026-01-01T00:00:00+00:00"
+    assert update["progress"] == "completed"
+    assert update["job_id"] == "https://huggingface.co/jobs/acme/job-123"
+    assert "inserted_at" not in update
+    assert "schema_version" not in update
+
+
+@pytest.mark.asyncio
+async def test_mongo_upsert_keeps_terminal_hf_fields_when_stale_row_replays():
+    existing_doc = {
+        "_id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "user_id": "dev",
+        "session_id": "persisted",
+        "platform": "hf-jobs",
+        "run_type": "smoke-test",
+        "result_storage": "hf-hub",
+        "progress": "completed",
+        "job_id": "https://huggingface.co/jobs/acme/job-123",
+        "final_artifact_or_result": "https://huggingface.co/acme/final-smoke",
+        "actual_sequence_number": 11,
+        "display_session_number": 11,
+        "batch_number": 1,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:02:00+00:00",
+        "provider_metadata": {"state": "COMPLETED"},
+    }
+    store = MongoSessionStore("mongodb://example.invalid", "liga_ml")
+    store.enabled = True
+    store.db = _FakeMongoDb(existing_doc)
+
+    await store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:hf-jobs:job-123",
+                "display_session_number": 1,
+                "actual_sequence_number": 1,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "platform": "hf-jobs",
+                "run_type": "agent-decide",
+                "result_storage": "cloud-and-hf-hub",
+                "progress": "running",
+                "job_id": "job-123",
+                "final_artifact_or_result": "https://huggingface.co/jobs/acme/job-123",
+                "created_at": "2026-01-01T00:01:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {"state": "RUNNING"},
+            }
+        ],
+        user_id="dev",
+    )
+
+    [op] = store.db.response_rows.ops
+    update = op._doc["$set"]
+    assert update["progress"] == "completed"
+    assert update["completed_at"] == "2026-01-01T00:02:00+00:00"
+    assert update["result_storage"] == "hf-hub"
+    assert update["run_type"] == "smoke-test"
+    assert (
+        update["final_artifact_or_result"] == "https://huggingface.co/acme/final-smoke"
+    )
+    assert update["provider_metadata"]["state"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_mongo_upsert_removes_duplicate_stale_hf_rows_for_same_job():
+    canonical_doc = {
+        "_id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+        "user_id": "dev",
+        "session_id": "persisted",
+        "platform": "hf-jobs",
+        "progress": "completed",
+        "job_id": "https://huggingface.co/jobs/acme/job-123",
+        "actual_sequence_number": 11,
+        "display_session_number": 11,
+        "batch_number": 1,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "completed_at": "2026-01-01T00:02:00+00:00",
+    }
+    duplicate_doc = {
+        "_id": "persisted:hf-jobs:job-123",
+        "id": "persisted:hf-jobs:job-123",
+        "user_id": "dev",
+        "session_id": "persisted",
+        "platform": "hf-jobs",
+        "progress": "running",
+        "job_id": "job-123",
+        "actual_sequence_number": 15,
+        "display_session_number": 15,
+        "batch_number": 1,
+        "created_at": "2026-01-01T00:01:00+00:00",
+        "completed_at": None,
+    }
+    store = MongoSessionStore("mongodb://example.invalid", "liga_ml")
+    store.enabled = True
+    store.db = _FakeMongoDb([canonical_doc, duplicate_doc])
+
+    await store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:hf-jobs:job-123",
+                "session_id": "persisted",
+                "platform": "hf-jobs",
+                "progress": "completed",
+                "job_id": "job-123",
+                "final_artifact_or_result": "https://huggingface.co/acme/final-smoke",
+                "created_at": "2026-01-01T00:01:00+00:00",
+                "completed_at": "2026-01-01T00:02:00+00:00",
+            }
+        ],
+        user_id="dev",
+    )
+
+    update_ops = [
+        op for op in store.db.response_rows.ops if op.__class__.__name__ == "UpdateOne"
+    ]
+    delete_ops = [
+        op for op in store.db.response_rows.ops if op.__class__.__name__ == "DeleteMany"
+    ]
+    assert len(update_ops) == 1
+    assert len(delete_ops) == 1
+    assert update_ops[0]._filter == {"_id": canonical_doc["_id"]}
+    assert delete_ops[0]._filter["_id"] == {"$ne": canonical_doc["_id"]}
+    assert delete_ops[0]._filter["platform"] == "hf-jobs"
 
 
 class _DurableResponseStore:
@@ -964,6 +1212,146 @@ async def test_responses_routes_refresh_stale_hf_rows_from_persisted_events(
 
     assert rows["rows"][0]["progress"] == "completed"
     assert rows["rows"][0]["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_responses_routes_default_unfiltered_refreshes_stale_hf_terminal_row(
+    monkeypatch,
+):
+    manager = _StoreBackedManager()
+    await manager.persistence_store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/persisted",
+                "display_session_number": 15,
+                "actual_sequence_number": 15,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "short_session_id": "persiste",
+                "session_title": "Persisted HF run",
+                "model_name": "moonshotai/Kimi-K2.6",
+                "platform": "hf-jobs",
+                "run_type": "agent-decide",
+                "result_storage": "cloud-and-hf-hub",
+                "progress": "running",
+                "job_id": "https://huggingface.co/jobs/acme/persisted",
+                "final_artifact_or_result": "https://huggingface.co/acme/final-smoke",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {},
+            }
+        ]
+    )
+    manager.sessions = {}
+
+    async def completed_events(session_id):
+        assert session_id == "persisted"
+        return [
+            _event(
+                "hf_jobs",
+                "running",
+                tool_call_id="hf-jobs:1",
+                jobUrl="https://huggingface.co/jobs/acme/persisted",
+                output_policy="cloud-and-hf-hub",
+                training_goal="agent-decide",
+            ),
+            _tool_output(
+                "hf_jobs",
+                """
+**Job Details** (1 job):
+
+```json
+[{"id": "persisted", "status": {"stage": "COMPLETED"}}]
+```
+""",
+                tool_call_id="hf-jobs:1",
+                hubModelId="acme/final-smoke",
+            ),
+        ]
+
+    manager.load_response_events = completed_events
+    monkeypatch.setattr(agent, "session_manager", manager)
+
+    unfiltered = await agent.get_responses(
+        page=1,
+        page_size=20,
+        user={"user_id": "dev"},
+    )
+    filtered = await agent.get_responses(
+        job_id="persisted",
+        page=1,
+        page_size=20,
+        user={"user_id": "dev"},
+    )
+    repeated = await agent.get_responses(
+        page=1,
+        page_size=20,
+        user={"user_id": "dev"},
+    )
+
+    assert unfiltered["rows"][0]["progress"] == "completed"
+    assert unfiltered["rows"][0]["completed_at"] is not None
+    assert unfiltered["rows"][0]["result_storage"] == "hf-hub"
+    assert unfiltered["rows"][0]["run_type"] == "smoke-test"
+    assert (
+        unfiltered["rows"][0]["final_artifact_or_result"]
+        == "https://huggingface.co/acme/final-smoke"
+    )
+    assert filtered["rows"][0] == unfiltered["rows"][0]
+    assert repeated["rows"][0] == unfiltered["rows"][0]
+
+
+@pytest.mark.asyncio
+async def test_responses_routes_refresh_stale_hf_rows_from_existing_job_inspect(
+    monkeypatch,
+):
+    manager = _StoreBackedManager()
+    await manager.persistence_store.upsert_response_rows(
+        [
+            {
+                "id": "persisted:hf-jobs:https://huggingface.co/jobs/acme/job-123",
+                "display_session_number": 11,
+                "actual_sequence_number": 11,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "short_session_id": "persiste",
+                "session_title": "Persisted HF run",
+                "model_name": "moonshotai/Kimi-K2.6",
+                "platform": "hf-jobs",
+                "run_type": "agent-decide",
+                "result_storage": "cloud-and-hf-hub",
+                "progress": "running",
+                "job_id": "https://huggingface.co/jobs/acme/job-123",
+                "final_artifact_or_result": "https://huggingface.co/acme/final-smoke",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {},
+            }
+        ]
+    )
+    monkeypatch.setattr(agent, "session_manager", manager)
+
+    async def fake_inspect(job_id, namespace):
+        assert job_id == "job-123"
+        assert namespace == "acme"
+        return SimpleNamespace(
+            status=SimpleNamespace(stage="COMPLETED"),
+            updated_at=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+        )
+
+    refreshed = await agent._refresh_stale_hf_rows_from_hub(
+        list(manager.persistence_store.response_rows),
+        user_id="dev",
+        inspect_job=fake_inspect,
+    )
+
+    assert refreshed is True
+    [row] = manager.persistence_store.response_rows
+    assert row["progress"] == "completed"
+    assert row["completed_at"] == "2026-01-01T00:02:00+00:00"
+    assert row["result_storage"] == "hf-hub"
+    assert row["run_type"] == "smoke-test"
+    assert row["job_id"] == "https://huggingface.co/jobs/acme/job-123"
 
 
 @pytest.mark.asyncio

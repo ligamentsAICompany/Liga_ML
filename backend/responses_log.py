@@ -59,6 +59,28 @@ JSON_STAGE_RE = re.compile(r'"stage"\s*:\s*"([^"]+)"')
 JSON_MESSAGE_RE = re.compile(r'"message"\s*:\s*("([^"]*)"|null)')
 
 
+def _hub_model_url(value: Any) -> str | None:
+    text = _as_str(value)
+    if not text:
+        return None
+    if text.startswith("https://huggingface.co/"):
+        return text
+    if "/" in text and not text.startswith("http"):
+        return f"https://huggingface.co/{text.strip('/')}"
+    return text
+
+
+def _hub_only_artifact(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text.startswith("https://huggingface.co/") and not text.startswith(
+        (
+            "https://huggingface.co/jobs/",
+            "https://huggingface.co/datasets/",
+            "https://huggingface.co/spaces/",
+        )
+    )
+
+
 def redact_response_value(value: Any) -> Any:
     """Return a copy of value with common token/secret patterns removed."""
     if value is None:
@@ -278,6 +300,15 @@ def _extract_hf_tool_output_data(data: dict[str, Any]) -> dict[str, Any] | None:
     if message:
         extracted["message"] = message
         extracted["failureReason"] = message
+    for key in (
+        "finalModelUrl",
+        "final_model_url",
+        "model_url",
+        "hubModelId",
+        "hub_model_id",
+    ):
+        if data.get(key) not in {None, ""}:
+            extracted[key] = data[key]
     if data.get("success") is not None:
         extracted["success"] = data.get("success")
     return extracted
@@ -337,6 +368,56 @@ def _response_event_data(event: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _request_metadata_from_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    tool = str(payload.get("tool") or "")
+    if tool not in JOB_TO_PLATFORM:
+        return None
+    args = (
+        payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+    )
+    metadata = (
+        payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    )
+    extracted: dict[str, Any] = {
+        "tool": tool,
+        "tool_call_id": payload.get("tool_call_id"),
+    }
+    for source in (args, metadata):
+        for key in (
+            "training_goal",
+            "output_policy",
+            "hub_model_id",
+            "hubModelId",
+            "model_name",
+            "model",
+            "dataset_name",
+            "dataset",
+        ):
+            value = source.get(key)
+            if value not in {None, ""} and key not in extracted:
+                extracted[key] = value
+    return {key: value for key, value in extracted.items() if value not in {None, ""}}
+
+
+def _request_metadata_from_event(event: dict[str, Any]) -> list[dict[str, Any]]:
+    data = event.get("data") or {}
+    if not isinstance(data, dict):
+        return []
+    if event.get("event_type") == "tool_call":
+        metadata = _request_metadata_from_payload(data)
+        return [metadata] if metadata else []
+    if event.get("event_type") == "approval_required":
+        tools = data.get("tools") if isinstance(data.get("tools"), list) else []
+        return [
+            metadata
+            for tool in tools
+            if isinstance(tool, dict)
+            for metadata in [_request_metadata_from_payload(tool)]
+            if metadata
+        ]
+    return []
+
+
 def _final_artifact(platform: str, data: dict[str, Any]) -> str:
     markers = _markers_from_payload(
         data.get("logs"),
@@ -352,13 +433,18 @@ def _final_artifact(platform: str, data: dict[str, Any]) -> str:
             f"https://huggingface.co/{markers['LIGA_HUB_MODEL_ID']}"
         )
     if platform == "hf-jobs":
+        hub_model_url = _hub_model_url(
+            data.get("finalModelUrl")
+            or data.get("final_model_url")
+            or data.get("model_url")
+            or data.get("hubModelId")
+            or data.get("hub_model_id")
+        )
+        if hub_model_url:
+            return redact_response_value(hub_model_url)
         return (
             _as_str(
-                data.get("finalModelUrl")
-                or data.get("final_model_url")
-                or data.get("hubModelId")
-                or data.get("hub_model_id")
-                or data.get("jobUrl")
+                data.get("jobUrl")
                 or data.get("failureReason")
                 or data.get("failure_reason")
                 or data.get("error")
@@ -460,6 +546,7 @@ async def build_responses_log(
 ) -> dict[str, list[dict[str, Any]]]:
     """Build response rows from persisted/live session events."""
     rows_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    request_metadata_by_call: dict[str, dict[str, Any]] = {}
     discovery_order = 0
 
     for session in sessions:
@@ -470,9 +557,19 @@ async def build_responses_log(
         for event in events or []:
             if not isinstance(event, dict):
                 continue
+            for request_metadata in _request_metadata_from_event(event):
+                tool_call_id = _as_str(request_metadata.get("tool_call_id"))
+                if tool_call_id:
+                    request_metadata_by_call[tool_call_id] = {
+                        **request_metadata_by_call.get(tool_call_id, {}),
+                        **request_metadata,
+                    }
             data = _response_event_data(event)
             if not data:
                 continue
+            tool_call_id = _as_str(data.get("tool_call_id"))
+            if tool_call_id and tool_call_id in request_metadata_by_call:
+                data = {**request_metadata_by_call[tool_call_id], **data}
             tool = str(data.get("tool") or "")
             platform = JOB_TO_PLATFORM.get(tool)
             if not platform:
@@ -504,6 +601,7 @@ async def build_responses_log(
             )
             failure_reason = _failure_reason(data)
             final_artifact = _final_artifact(platform, data)
+            completed_at = _completed_at(progress, event, session)
             if (
                 prior
                 and final_artifact in {"unknown", raw_state, progress}
@@ -517,6 +615,20 @@ async def build_responses_log(
                 and str(prior.get("final_artifact_or_result") or "").startswith("gs://")
             ):
                 final_artifact = prior["final_artifact_or_result"]
+            run_type = (
+                _as_str(data.get("training_goal"))
+                or _as_str(session.get("training_goal"))
+                or "agent-decide"
+            )
+            result_storage = (
+                _as_str(data.get("output_policy"))
+                or _as_str(session.get("output_policy"))
+                or "unknown"
+            )
+            if platform == "hf-jobs" and _hub_only_artifact(final_artifact):
+                result_storage = "hf-hub"
+                if "smoke" in str(final_artifact).lower():
+                    run_type = "smoke-test"
             row = {
                 "id": _row_id(session_id, platform, key[2]),
                 "display_session_number": 0,
@@ -527,13 +639,14 @@ async def build_responses_log(
                 "session_title": _as_str(session.get("title")),
                 "model_name": _as_str(session.get("model")) or "unknown",
                 "platform": platform,
-                "run_type": _as_str(session.get("training_goal")) or "agent-decide",
-                "result_storage": _as_str(session.get("output_policy")) or "unknown",
+                "run_type": run_type,
+                "result_storage": result_storage,
                 "progress": progress,
                 "job_id": display_job_id,
                 "final_artifact_or_result": final_artifact,
                 "created_at": prior.get("created_at") if prior else created_at,
-                "completed_at": _completed_at(progress, event, session),
+                "completed_at": completed_at
+                or (prior.get("completed_at") if prior else None),
                 "provider_metadata": _provider_metadata(data),
                 "error": failure_reason if progress in TERMINAL_STATES else None,
                 "user_id": _as_str(session.get("user_id")) or "dev",

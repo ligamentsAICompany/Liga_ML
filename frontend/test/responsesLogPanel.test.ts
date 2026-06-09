@@ -162,6 +162,43 @@ test('responses pagination renders rows safely when total_pages is missing', () 
   assert.equal(pagination.label, 'Page 1 of 1 • 1 responses');
 });
 
+test('responses pagination avoids transient zero label while loading', () => {
+  const pagination = createResponsesPaginationModel(null, { loading: true });
+
+  assert.equal(pagination.label, 'Loading responses...');
+  assert.equal(pagination.canGoPrevious, false);
+  assert.equal(pagination.canGoNext, false);
+});
+
+test('responses dialog model renders loading then terminal HF row', () => {
+  const loading = createResponsesPaginationModel(null, { loading: true });
+  const panel = createResponsesPanelModel({
+    rows: [
+      {
+        display_session_number: 11,
+        actual_sequence_number: 11,
+        batch_number: 1,
+        session_id: '00a5ec95-6130-4ea4-9d72-c6b26116e051',
+        model_name: 'moonshotai/Kimi-K2.6',
+        platform: 'hf-jobs',
+        run_type: 'smoke-test',
+        result_storage: 'hf-hub',
+        progress: 'completed',
+        job_id: 'https://huggingface.co/jobs/ligaments-dev/6a277fd3ece949d7b3dcc4db',
+        final_artifact_or_result: 'https://huggingface.co/ligaments-dev/gst-qwen2.5-0.5b-sft-smoke',
+        completed_at: '2026-06-09T02:52:03.051000+00:00',
+      },
+    ],
+  });
+
+  assert.equal(loading.label, 'Loading responses...');
+  assert.equal(panel.rows[0].cells.progress, 'completed');
+  assert.equal(panel.rows[0].cells.storage, 'hf-hub');
+  assert.equal(panel.rows[0].cells.runType, 'smoke-test');
+  assert.match(panel.rows[0].cells.result, /gst-qwen2\.5-0\.5b-sft-smoke/);
+  assert.notEqual(panel.rows[0].cells.completedAt, '-');
+});
+
 test('responses panel distinguishes filtered empty state from global no-data state', () => {
   const empty = createResponsesPanelModel({ rows: [] });
   const filtered = createResponsesPanelModel({ rows: [], filtersActive: true });
@@ -219,4 +256,12 @@ test('responses dialog source does not clear fetched rows on close', () => {
 
   assert.match(buttonSource, /setOpen\(false\)/);
   assert.doesNotMatch(buttonSource, /setRows\(\[\]\)/);
+});
+
+test('chat hydration clears stale processing when backend is terminal', () => {
+  const hookSource = readFileSync('src/hooks/useAgentChat.ts', 'utf8');
+
+  assert.match(hookSource, /backendIsProcessing/);
+  assert.match(hookSource, /updateSession\(sessionId,\s*\{\s*isProcessing:\s*false,\s*activityStatus:\s*\{\s*type:\s*'idle'\s*\}/s);
+  assert.match(hookSource, /fresh\.info && !fresh\.info\.is_processing/);
 });

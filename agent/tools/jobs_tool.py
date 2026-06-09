@@ -23,6 +23,8 @@ from agent.core.hf_access import (
 )
 from agent.core.hub_artifacts import build_hub_artifact_sitecustomize
 from agent.core.session import Event
+from agent.training_templates.sft import SftTemplateConfig, build_sft_training_script
+from agent.training_templates.validation import validate_sft_template_request
 from agent.tools.trackio_seed import ensure_trackio_dashboard
 from agent.tools.types import ToolResult
 from agent.tools.utilities import (
@@ -548,6 +550,70 @@ class HfJobsTool:
         try:
             script = args.get("script")
             command = args.get("command")
+            template = str(args.get("template") or "").strip().lower()
+
+            if template:
+                if script or command:
+                    raise ValueError(
+                        "'template' cannot be combined with 'script' or 'command'."
+                    )
+                if template != "sft":
+                    raise ValueError(
+                        f"Unsupported template: {template}. Available templates: sft."
+                    )
+                template_args = {
+                    **args,
+                    "output_policy": str(
+                        args.get("output_policy") or "cloud-and-hf-hub"
+                    ).strip(),
+                    "trackio_mode": str(args.get("trackio_mode") or "disabled").strip(),
+                }
+                validation_errors = validate_sft_template_request(template_args)
+                if validation_errors:
+                    raise ValueError("; ".join(validation_errors))
+                script = build_sft_training_script(
+                    SftTemplateConfig(
+                        dataset_name=str(template_args.get("dataset_name") or ""),
+                        dataset_config=template_args.get("dataset_config"),
+                        dataset_split=str(
+                            template_args.get("dataset_split") or "train"
+                        ),
+                        eval_dataset_split=template_args.get("eval_dataset_split"),
+                        validation_split_ratio=float(
+                            template_args.get("validation_split_ratio") or 0.1
+                        ),
+                        model_name=str(template_args.get("model_name") or ""),
+                        hub_model_id=str(template_args.get("hub_model_id") or ""),
+                        training_goal=str(
+                            template_args.get("training_goal") or "agent-decide"
+                        ),
+                        output_policy=str(template_args["output_policy"]),
+                        task_type=str(template_args.get("task_type") or "sft"),
+                        column_mapping=dict(template_args.get("column_mapping") or {}),
+                        max_train_samples=template_args.get("max_train_samples"),
+                        max_eval_samples=template_args.get("max_eval_samples"),
+                        num_train_epochs=int(
+                            template_args.get("num_train_epochs") or 1
+                        ),
+                        max_length=int(template_args.get("max_length") or 1024),
+                        learning_rate=float(template_args.get("learning_rate") or 2e-4),
+                        per_device_train_batch_size=int(
+                            template_args.get("per_device_train_batch_size") or 1
+                        ),
+                        gradient_accumulation_steps=int(
+                            template_args.get("gradient_accumulation_steps") or 8
+                        ),
+                        trackio_mode=str(template_args["trackio_mode"]),
+                        trackio_project=template_args.get("trackio_project"),
+                        trackio_space_id=template_args.get("trackio_space_id"),
+                        run_name=template_args.get("run_name"),
+                        dataset_source=str(template_args.get("dataset_source") or "hf"),
+                        train_gcs_uri=template_args.get("train_gcs_uri"),
+                        staged_train_uri=template_args.get("staged_train_uri"),
+                        train_rows=template_args.get("train_rows"),
+                        source_format=template_args.get("source_format"),
+                    )
+                )
 
             # Validate mutually exclusive parameters
             if script and command:
@@ -1117,6 +1183,8 @@ HF_JOBS_TOOL_SPEC = {
         "and fix failures before submitting. If skipped, state why before calling hf_jobs.\n"
         "- Training config MUST include push_to_hub=True and hub_model_id. "
         "Job storage is EPHEMERAL — all files are deleted when the job ends. Without push_to_hub, trained models are lost permanently.\n"
+        "- For normal SFT jobs, prefer `template='sft'` over ad hoc scripts. "
+        "The stable SFT template pins runtime-sensitive dependencies and handles current TRL SFTConfig/SFTTrainer args, tokenizer pad/eos setup, dataset row formatting, and Hub upload markers.\n"
         "- Include trackio monitoring and provide the dashboard URL to the user. "
         "When the script uses report_to='trackio', also pass `trackio_space_id` "
         "(e.g. '<username>/ml-intern-<8char>') and `trackio_project` as tool args — "
@@ -1133,7 +1201,8 @@ HF_JOBS_TOOL_SPEC = {
         "3. Upgrade to larger GPU (a10g→a100→h100)\n"
         "Do NOT switch training methods (e.g. full SFT to LoRA) or reduce max_length — those change what the user gets and require explicit approval.\n\n"
         "Examples:\n"
-        "Training: {'operation': 'run', 'script': '/app/train.py', 'dependencies': ['transformers', 'trl', 'torch', 'datasets', 'trackio'], 'hardware_flavor': 'a100-large', 'timeout': '8h'}\n"
+        "SFT template: {'operation': 'run', 'template': 'sft', 'dataset_name': 'trl-lib/Capybara', 'dataset_split': 'train', 'model_name': 'Qwen/Qwen2.5-0.5B-Instruct', 'hub_model_id': '<namespace>/qwen25-capybara-sft', 'training_goal': 'smoke-test', 'output_policy': 'cloud-and-hf-hub', 'max_train_samples': 5, 'timeout': '2h'}\n"
+        "Custom Python: {'operation': 'run', 'script': '/app/train.py', 'dependencies': ['transformers', 'trl', 'torch', 'datasets', 'trackio'], 'hardware_flavor': 'a100-large', 'timeout': '8h'}\n"
         "Monitor: {'operation': 'ps'}, {'operation': 'logs', 'job_id': 'xxx'}, {'operation': 'cancel', 'job_id': 'xxx'}"
         "Docker: {'operation': 'run', 'command': ['duckdb', '-c', 'select 1 + 2'], 'image': 'duckdb/duckdb', 'hardware_flavor': 'cpu-basic', 'timeout': '1h'}\n"
     ),
@@ -1165,6 +1234,60 @@ HF_JOBS_TOOL_SPEC = {
                     "For GPU/model-loading training scripts, smoke-test in a GPU sandbox before submission. "
                     "Mutually exclusive with 'command'."
                 ),
+            },
+            "template": {
+                "type": "string",
+                "enum": ["sft"],
+                "description": (
+                    "Use the stable SFT template instead of an ad hoc script. "
+                    "Mutually exclusive with 'script' and 'command'."
+                ),
+            },
+            "dataset_name": {
+                "type": "string",
+                "description": "Dataset repo/path for template='sft', for example 'trl-lib/Capybara'.",
+            },
+            "dataset_config": {
+                "type": "string",
+                "description": "Optional dataset config/name for template='sft'.",
+            },
+            "dataset_split": {
+                "type": "string",
+                "description": "Dataset split for template='sft'. Default: train.",
+            },
+            "eval_dataset_split": {
+                "type": "string",
+                "description": "Optional eval split for template='sft'.",
+            },
+            "model_name": {
+                "type": "string",
+                "description": "Base model id for template='sft'.",
+            },
+            "hub_model_id": {
+                "type": "string",
+                "description": "Target Hub model id required for hf-hub or cloud-and-hf-hub template outputs.",
+            },
+            "training_goal": {
+                "type": "string",
+                "enum": ["smoke-test", "production", "agent-decide"],
+                "description": "Training goal metadata for template='sft'.",
+            },
+            "output_policy": {
+                "type": "string",
+                "enum": ["cloud-private", "hf-hub", "cloud-and-hf-hub"],
+                "description": "Final artifact storage policy for template='sft'.",
+            },
+            "max_train_samples": {
+                "type": "integer",
+                "description": "Optional row cap for template='sft' smoke/pilot runs.",
+            },
+            "max_eval_samples": {
+                "type": "integer",
+                "description": "Optional eval row cap for template='sft'.",
+            },
+            "column_mapping": {
+                "type": "object",
+                "description": "Optional template='sft' mapping, e.g. {'user': 'prompt', 'assistant': 'completion'}.",
             },
             "dependencies": {
                 "type": "array",

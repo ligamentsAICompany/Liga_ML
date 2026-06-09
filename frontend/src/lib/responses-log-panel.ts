@@ -150,7 +150,19 @@ export function createResponsesQueryParams({
   return params;
 }
 
-export function createResponsesPaginationModel(payload: ResponsesPagePayload | null) {
+export function createResponsesPaginationModel(
+  payload: ResponsesPagePayload | null,
+  options: { loading?: boolean } = {},
+) {
+  if (options.loading && !payload) {
+    return {
+      label: 'Loading responses...',
+      canGoPrevious: false,
+      canGoNext: false,
+      previousPage: 1,
+      nextPage: 1,
+    };
+  }
   const page = payload?.page || 1;
   const rowCount = payload?.rows?.length || 0;
   const totalRows = payload?.total_rows || rowCount;

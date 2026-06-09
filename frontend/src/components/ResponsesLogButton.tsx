@@ -57,8 +57,8 @@ export default function ResponsesLogButton() {
     [rows, error, filtersActive],
   );
   const pagination = useMemo(
-    () => createResponsesPaginationModel(pagePayload),
-    [pagePayload],
+    () => createResponsesPaginationModel(pagePayload, { loading }),
+    [loading, pagePayload],
   );
 
   const loadResponses = useCallback(async (targetPage = page) => {
