@@ -112,6 +112,20 @@ function fallbackLine(fallback: TrainingPreflightFallbackResult): string {
   return parts.join(' | ');
 }
 
+function verifiedFallbackLines(result: TrainingPreflightResult): string[] {
+  const fallback = result.verified_fallback;
+  if (!fallback) {
+    return ['No verified fallback is available from this preflight result.'];
+  }
+  return [
+    fallbackLine(fallback),
+    'Verified fallback is advisory only.',
+    'Fallback was not automatically launched.',
+    'Fallback launch still requires explicit approval.',
+    'No jobs or resources were created for the fallback.',
+  ];
+}
+
 function metadataBool(metadata: TrainingPreflightResult['metadata'], key: 'provider_jobs_launched' | 'resources_created'): boolean {
   return (metadata as Record<string, unknown> | undefined)?.[key] === true;
 }
@@ -184,6 +198,7 @@ function normalizeResult(input: unknown): TrainingPreflightResult {
       metadata: {},
     },
     fallbacks: [],
+    verified_fallback: null,
     verified_recommendation: null,
     blocking_reasons: [],
     warning_reasons: [],
@@ -229,6 +244,7 @@ export function createTrainingPreflightPanel(input: unknown): TrainingPreflightP
   appendSection(lines, 'Warnings', (result.warning_reasons ?? []).map(cleanText));
   appendSection(lines, 'Unknowns', (result.unknown_reasons ?? []).map(cleanText));
   appendSection(lines, 'Fallbacks', (result.fallbacks ?? []).map(fallbackLine));
+  appendSection(lines, 'Verified Fallback', verifiedFallbackLines(result));
   appendSection(lines, 'Safety Metadata', safetyLines(result));
   appendSection(lines, 'Cache Info', cacheLines(result));
 

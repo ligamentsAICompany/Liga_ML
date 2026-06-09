@@ -253,6 +253,7 @@ class TrainingPreflightResultModel(BaseModel):
     output_policy: OutputPolicy | str
     primary: TrainingPreflightProviderResultModel
     fallbacks: list[TrainingPreflightFallbackResultModel] = Field(default_factory=list)
+    verified_fallback: TrainingPreflightFallbackResultModel | None = None
     verified_recommendation: dict[str, Any] | None = None
     blocking_reasons: list[str] = Field(default_factory=list)
     warning_reasons: list[str] = Field(default_factory=list)

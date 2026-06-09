@@ -131,6 +131,7 @@ export interface TrainingPreflightResult {
   output_policy: OutputPolicy | string;
   primary: TrainingPreflightProviderResult;
   fallbacks: TrainingPreflightFallbackResult[];
+  verified_fallback?: TrainingPreflightFallbackResult | null;
   verified_recommendation?: Record<string, unknown> | null;
   blocking_reasons: string[];
   warning_reasons: string[];

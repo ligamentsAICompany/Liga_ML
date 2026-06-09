@@ -66,6 +66,7 @@ function result(overrides: Partial<TrainingPreflightResult> = {}): TrainingPrefl
       ],
     },
     fallbacks: [],
+    verified_fallback: null,
     verified_recommendation: {
       recommendation: {
         selected_provider: { provider_id: 'hf-jobs', display_name: 'Hugging Face Jobs' },
@@ -160,6 +161,22 @@ test('preflight panel renders verified fallback and cache info', () => {
         metadata: {},
       },
     ],
+    verified_fallback: {
+      fallback_id: 'fb1',
+      provider: 'hf-jobs',
+      model_id: 'Qwen/Qwen2.5-1.5B-Instruct',
+      hardware_id: 'hf-jobs:a10g-small',
+      status: 'passed',
+      launch_ready: true,
+      checks: [],
+      reason: 'Use larger hardware after review.',
+      metadata: {
+        advisory_only: true,
+        fallback_executed: false,
+        provider_jobs_launched: false,
+        resources_created: false,
+      },
+    },
     cache: {
       cache_key: 'session:s1:preflight',
       hit: true,
@@ -170,7 +187,12 @@ test('preflight panel renders verified fallback and cache info', () => {
   }));
 
   assert.match(panel.markdown, /Fallbacks/);
+  assert.match(panel.markdown, /Verified Fallback/);
+  assert.match(panel.markdown, /advisory only/i);
+  assert.match(panel.markdown, /not automatically launched/i);
+  assert.match(panel.markdown, /Fallback launch still requires explicit approval/i);
   assert.match(panel.markdown, /Qwen\/Qwen2\.5-1\.5B-Instruct/);
+  assert.doesNotMatch(panel.markdown, /fallback.*launched.*true/i);
   assert.match(panel.markdown, /Cache Info/);
   assert.match(panel.markdown, /cache hit: true/i);
 });

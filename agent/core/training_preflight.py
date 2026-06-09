@@ -12,6 +12,7 @@ from agent.core.model_provider_selection import (
     catalog_hardware,
     catalog_model,
     catalog_provider,
+    hardware_catalog,
 )
 from agent.core.output_policy import (
     VALID_OUTPUT_POLICIES,
@@ -203,6 +204,7 @@ class TrainingPreflightResult:
     output_policy: str
     primary: TrainingPreflightProviderResult
     fallbacks: list[TrainingPreflightFallbackResult] = field(default_factory=list)
+    verified_fallback: TrainingPreflightFallbackResult | None = None
     verified_recommendation: dict[str, Any] | None = None
     blocking_reasons: list[str] = field(default_factory=list)
     warning_reasons: list[str] = field(default_factory=list)
@@ -239,6 +241,9 @@ class TrainingPreflightResult:
                 "output_policy": self.output_policy,
                 "primary": self.primary.to_dict(),
                 "fallbacks": [fallback.to_dict() for fallback in self.fallbacks],
+                "verified_fallback": self.verified_fallback.to_dict()
+                if self.verified_fallback
+                else None,
                 "verified_recommendation": self.verified_recommendation,
                 "blocking_reasons": list(self.blocking_reasons),
                 "warning_reasons": list(self.warning_reasons),
@@ -395,6 +400,259 @@ def _has_dataset_context(
     )
 
 
+def _fallback_entries(recommendation: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(recommendation, dict):
+        return []
+    body = _recommendation_body(recommendation)
+    value = body.get("fallbacks") or recommendation.get("fallbacks")
+    return (
+        [dict(item) for item in value if isinstance(item, dict)]
+        if isinstance(value, list)
+        else []
+    )
+
+
+def _first_compatible_hardware_id(provider: str, model_id: str) -> str | None:
+    model = catalog_model(model_id) if model_id else None
+    for hardware in hardware_catalog():
+        if hardware.provider_id != provider:
+            continue
+        limit = hardware.suitable_model_size_b
+        if model is None or limit is None or model.parameter_count_b <= limit:
+            return hardware.hardware_id
+    return None
+
+
+def _status_from_reasons(
+    checks: list[TrainingPreflightCheck],
+    blocking: list[str],
+    warnings: list[str],
+    unknowns: list[str],
+) -> PreflightStatus:
+    return _derive_status(
+        checks,
+        blocking_reasons=blocking,
+        warning_reasons=warnings,
+        unknown_reasons=unknowns,
+    )
+
+
+def _fallback_preflight_result(
+    *,
+    index: int,
+    fallback: dict[str, Any],
+    provider: str,
+    model_id: str,
+    hardware_id: str | None,
+    output_policy: str,
+) -> TrainingPreflightFallbackResult:
+    fallback_option = str(fallback.get("fallback_option") or "").strip()
+    blocked_option = str(fallback.get("blocked_option") or "").strip()
+    reason = str(fallback.get("reason") or "Static planner fallback.")
+    fallback_provider = provider
+    fallback_model_id = model_id
+    fallback_hardware_id = hardware_id
+    recognized = False
+    mapping_message = (
+        "Fallback option could not be mapped to a known provider, model, or hardware."
+    )
+
+    if catalog_provider(fallback_option):
+        fallback_provider = fallback_option
+        fallback_hardware_id = _first_compatible_hardware_id(
+            fallback_provider, model_id
+        )
+        recognized = True
+        mapping_message = (
+            f"Fallback provider {fallback_provider} is in the static catalog."
+        )
+    elif hardware := catalog_hardware(fallback_option):
+        fallback_provider = hardware.provider_id
+        fallback_hardware_id = hardware.hardware_id
+        recognized = True
+        mapping_message = (
+            f"Fallback hardware {fallback_hardware_id} is in the static catalog."
+        )
+    elif catalog_model(fallback_option):
+        fallback_model_id = fallback_option
+        recognized = True
+        mapping_message = (
+            f"Fallback model {fallback_model_id} is in the static catalog."
+        )
+
+    checks: list[TrainingPreflightCheck] = [
+        _check(
+            check_id="fallback_static_mapping",
+            provider=fallback_provider,
+            category=PreflightCheckCategory.FALLBACK,
+            label="Fallback mapping",
+            status=PreflightStatus.PASSED if recognized else PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.INFO
+            if recognized
+            else PreflightSeverity.WARNING,
+            message=mapping_message,
+            error_code=None if recognized else "fallback_mapping_unknown",
+            details={
+                "blocked_option": blocked_option,
+                "fallback_option": fallback_option,
+            },
+            docs_verification_required=not recognized,
+        )
+    ]
+
+    provider_known = catalog_provider(fallback_provider) is not None
+    checks.append(
+        _check(
+            check_id="fallback_provider_catalog",
+            provider=fallback_provider,
+            category=PreflightCheckCategory.FALLBACK,
+            label="Fallback provider",
+            status=PreflightStatus.PASSED
+            if provider_known
+            else PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.INFO
+            if provider_known
+            else PreflightSeverity.WARNING,
+            message=(
+                f"Fallback provider {fallback_provider} is known."
+                if provider_known
+                else "Fallback provider is not in the static catalog."
+            ),
+            error_code=None if provider_known else "unsupported_provider",
+            docs_verification_required=not provider_known,
+        )
+    )
+
+    model_known = catalog_model(fallback_model_id) is not None
+    checks.append(
+        _check(
+            check_id="fallback_model_catalog",
+            provider=fallback_provider,
+            category=PreflightCheckCategory.FALLBACK,
+            label="Fallback model",
+            status=PreflightStatus.PASSED if model_known else PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.INFO
+            if model_known
+            else PreflightSeverity.WARNING,
+            message=(
+                f"Fallback model {fallback_model_id} is known."
+                if model_known
+                else "Fallback model is outside the static catalog."
+            ),
+            error_code=None if model_known else "model_catalog_unknown",
+            docs_verification_required=not model_known,
+        )
+    )
+
+    hardware = catalog_hardware(fallback_hardware_id) if fallback_hardware_id else None
+    hardware_known = hardware is not None and hardware.provider_id == fallback_provider
+    checks.append(
+        _check(
+            check_id="fallback_hardware_catalog",
+            provider=fallback_provider,
+            category=PreflightCheckCategory.FALLBACK,
+            label="Fallback hardware",
+            status=PreflightStatus.PASSED
+            if hardware_known
+            else PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.INFO
+            if hardware_known
+            else PreflightSeverity.WARNING,
+            message=(
+                f"Fallback hardware {fallback_hardware_id} is known for {fallback_provider}."
+                if hardware_known
+                else "Fallback hardware is not known for the fallback provider."
+            ),
+            error_code=None if hardware_known else "hardware_catalog_unknown",
+            docs_verification_required=not hardware_known,
+        )
+    )
+
+    model = catalog_model(fallback_model_id) if fallback_model_id else None
+    if recognized and model is not None and hardware is not None:
+        limit = hardware.suitable_model_size_b
+        fits = limit is None or model.parameter_count_b <= limit
+        checks.append(
+            _check(
+                check_id="fallback_model_hardware_fit",
+                provider=fallback_provider,
+                category=PreflightCheckCategory.FALLBACK,
+                label="Fallback model/hardware fit",
+                status=PreflightStatus.PASSED if fits else PreflightStatus.FAILED,
+                severity=PreflightSeverity.INFO if fits else PreflightSeverity.BLOCKING,
+                message=(
+                    "Fallback model fits the fallback hardware static memory estimate."
+                    if fits
+                    else "Fallback model exceeds the fallback hardware static memory estimate."
+                ),
+                error_code=None if fits else "hardware_memory_incompatible",
+            )
+        )
+
+    checks.append(
+        _check(
+            check_id="fallback_not_executed",
+            provider=fallback_provider,
+            category=PreflightCheckCategory.SAFETY,
+            label="Fallback execution",
+            status=PreflightStatus.SKIPPED,
+            severity=PreflightSeverity.INFO,
+            message="Fallback verification is advisory only; no fallback was automatically launched.",
+            required=False,
+            applicable=False,
+            details={
+                "advisory_only": True,
+                "fallback_executed": False,
+                "automatic_fallback_execution": False,
+            },
+        )
+    )
+
+    launch_ready, blocking, warnings, unknowns = derive_launch_ready(checks)
+    status = _status_from_reasons(checks, blocking, warnings, unknowns)
+    return TrainingPreflightFallbackResult(
+        fallback_id=f"fallback_{index}",
+        provider=fallback_provider,
+        model_id=fallback_model_id or None,
+        hardware_id=fallback_hardware_id,
+        status=status,
+        launch_ready=launch_ready,
+        checks=checks,
+        reason=reason,
+        metadata={
+            "advisory_only": True,
+            "fallback_executed": False,
+            "automatic_fallback_execution": False,
+            "provider_jobs_launched": False,
+            "resources_created": False,
+        },
+    )
+
+
+def _fallback_preflight_results(
+    *,
+    recommendation: dict[str, Any] | None,
+    provider: str,
+    model_id: str,
+    hardware_id: str | None,
+    output_policy: str,
+    include_fallbacks: bool,
+) -> list[TrainingPreflightFallbackResult]:
+    if not include_fallbacks:
+        return []
+    return [
+        _fallback_preflight_result(
+            index=index,
+            fallback=fallback,
+            provider=provider,
+            model_id=model_id,
+            hardware_id=hardware_id,
+            output_policy=output_policy,
+        )
+        for index, fallback in enumerate(_fallback_entries(recommendation), start=1)
+    ]
+
+
 def _check(
     *,
     check_id: str,
@@ -441,6 +699,7 @@ def build_training_preflight_result(
     output_policy: str,
     checks: list[TrainingPreflightCheck] | None = None,
     fallbacks: list[TrainingPreflightFallbackResult] | None = None,
+    verified_fallback: TrainingPreflightFallbackResult | None = None,
     verified_recommendation: dict[str, Any] | None = None,
     cache: TrainingPreflightCacheInfo | None = None,
     metadata: dict[str, Any] | None = None,
@@ -490,6 +749,7 @@ def build_training_preflight_result(
         output_policy=output_policy,
         primary=primary,
         fallbacks=list(fallbacks or []),
+        verified_fallback=verified_fallback,
         verified_recommendation=verified_recommendation,
         blocking_reasons=blocking,
         warning_reasons=warnings,
@@ -524,7 +784,7 @@ def run_local_training_preflight(
 ) -> TrainingPreflightResult:
     """Run Slice 2 local-only checks without provider SDKs or network calls."""
 
-    _ = include_fallbacks, force_refresh, timeout_seconds
+    _ = force_refresh, timeout_seconds
     provider = _extract_provider(recommendation)
     model_id = _extract_model_id(recommendation)
     hardware_id = _extract_hardware_id(recommendation)
@@ -774,10 +1034,33 @@ def run_local_training_preflight(
         )
     )
 
+    fallback_results = _fallback_preflight_results(
+        recommendation=recommendation,
+        provider=provider,
+        model_id=model_id,
+        hardware_id=hardware_id,
+        output_policy=output_policy,
+        include_fallbacks=include_fallbacks,
+    )
+    verified_fallback = next(
+        (
+            fallback
+            for fallback in fallback_results
+            if fallback.launch_ready and fallback.status == PreflightStatus.PASSED
+        ),
+        None,
+    )
+
     result_metadata = {
         "mode": "local_non_network",
         "live_provider_checks": False,
         "live_preflight_probe_status": "not_implemented",
+        "fallbacks_checked": include_fallbacks,
+        "fallback_count": len(fallback_results),
+        "verified_fallback_id": verified_fallback.fallback_id
+        if verified_fallback
+        else None,
+        "automatic_fallback_execution": False,
         **(metadata or {}),
     }
     result = build_training_preflight_result(
@@ -788,6 +1071,8 @@ def run_local_training_preflight(
         hardware_id=hardware_id,
         output_policy=output_policy or "unknown",
         checks=checks,
+        fallbacks=fallback_results,
+        verified_fallback=verified_fallback,
         verified_recommendation=sanitize_for_frontend(recommendation)
         if isinstance(recommendation, dict)
         else None,
@@ -1016,6 +1301,7 @@ async def run_training_preflight(
         output_policy=local.output_policy,
         checks=[*local_checks, *provider_checks],
         fallbacks=local.fallbacks,
+        verified_fallback=local.verified_fallback,
         verified_recommendation=local.verified_recommendation,
         cache=local.cache,
         metadata=combined_metadata,
