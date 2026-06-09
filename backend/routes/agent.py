@@ -1052,6 +1052,17 @@ async def run_training_preflight(
         if http_request is not None
         else (getattr(agent_session, "hf_token", None) or _user_hf_token(user))
     )
+    gcp_project_id = (
+        request.metadata.get("gcp_project_id")
+        or request.metadata.get("project_id")
+        or request.metadata.get("google_cloud_project")
+    )
+    gcp_region = (
+        request.metadata.get("gcp_region")
+        or request.metadata.get("region")
+        or request.metadata.get("google_cloud_region")
+        or request.metadata.get("location")
+    )
     result = await execute_training_preflight(
         session_id=request.session_id,
         run_id=request.run_id,
@@ -1070,6 +1081,8 @@ async def run_training_preflight(
         },
         allow_unknown_override=request.allow_unknown_override,
         hf_token=hf_token,
+        gcp_project_id=str(gcp_project_id) if gcp_project_id else None,
+        gcp_region=str(gcp_region) if gcp_region else None,
     )
     saved = await session_manager.record_training_preflight(
         session_id=request.session_id,

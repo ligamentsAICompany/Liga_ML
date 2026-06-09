@@ -804,10 +804,20 @@ def run_local_training_preflight(
 
 
 def _needs_hf_live_checks(provider: str, model_id: str, output_policy: str) -> bool:
+    if provider == "gcp-vertex":
+        return output_policy_requires_hub(output_policy)
     return (
         provider == "hf-jobs"
         or output_policy_requires_hub(output_policy)
         or bool(model_id and "/" in model_id)
+    )
+
+
+def _needs_gcp_live_checks(provider: str, output_policy: str) -> bool:
+    return provider == "gcp-vertex" and (
+        output_policy_requires_cloud_storage(output_policy)
+        or output_policy_requires_hub(output_policy)
+        or output_policy in VALID_OUTPUT_POLICIES
     )
 
 
@@ -822,6 +832,23 @@ def _local_check_superseded_by_hf(
     if check.check_id == "hub_write_live" and output_policy_requires_hub(output_policy):
         return True
     return check.check_id == "cloud_storage_live" and provider == "hf-jobs"
+
+
+def _local_check_superseded_by_gcp(
+    check: TrainingPreflightCheck,
+    *,
+    provider: str,
+    output_policy: str,
+) -> bool:
+    if provider != "gcp-vertex":
+        return False
+    if check.check_id == "provider_credentials_live":
+        return True
+    if check.check_id == "cloud_storage_live" and output_policy_requires_cloud_storage(
+        output_policy
+    ):
+        return True
+    return False
 
 
 async def run_training_preflight(
@@ -842,8 +869,11 @@ async def run_training_preflight(
     hf_token: str | None = None,
     hf_client_factory: Any | None = None,
     jobs_namespace_resolver: Any | None = None,
+    gcp_project_id: str | None = None,
+    gcp_region: str | None = None,
+    gcp_client_factory: Any | None = None,
 ) -> TrainingPreflightResult:
-    """Run training preflight, including HF read-only probes when required."""
+    """Run training preflight, including safe read-only provider probes."""
 
     local = run_local_training_preflight(
         session_id=session_id,
@@ -860,37 +890,68 @@ async def run_training_preflight(
         metadata=metadata,
         allow_unknown_override=allow_unknown_override,
     )
-    if not _needs_hf_live_checks(local.provider, local.model_id, local.output_policy):
+    needs_gcp = _needs_gcp_live_checks(local.provider, local.output_policy)
+    needs_hf = _needs_hf_live_checks(
+        local.provider, local.model_id, local.output_policy
+    )
+    if not needs_gcp and not needs_hf:
         return local
 
-    from agent.core.preflight_hf import run_hf_preflight_checks
-
-    hf_result = await run_hf_preflight_checks(
-        provider=local.provider,
-        model_id=local.model_id,
-        hardware_id=local.hardware_id,
-        output_policy=local.output_policy,
-        target_namespace=target_namespace,
-        target_repo_id=target_repo_id,
-        hf_token=hf_token,
-        timeout_seconds=timeout_seconds,
-        hf_client_factory=hf_client_factory,
-        jobs_namespace_resolver=jobs_namespace_resolver,
-    )
     local_checks = [
         check
         for check in local.primary.checks
-        if not _local_check_superseded_by_hf(
+        if not _local_check_superseded_by_gcp(
+            check,
+            provider=local.provider,
+            output_policy=local.output_policy,
+        )
+        and not _local_check_superseded_by_hf(
             check,
             provider=local.provider,
             output_policy=local.output_policy,
         )
     ]
+    provider_checks: list[TrainingPreflightCheck] = []
+    live_modes: list[str] = []
+    if needs_gcp:
+        from agent.core.preflight_gcp_vertex import run_gcp_vertex_preflight_checks
+
+        gcp_result = await run_gcp_vertex_preflight_checks(
+            provider=local.provider,
+            model_id=local.model_id,
+            hardware_id=local.hardware_id,
+            output_policy=local.output_policy,
+            target_bucket=target_bucket,
+            project_id=gcp_project_id,
+            region=gcp_region,
+            timeout_seconds=timeout_seconds,
+            gcp_client_factory=gcp_client_factory,
+        )
+        provider_checks.extend(gcp_result.checks)
+        live_modes.append("gcp_vertex_read_only")
+    if needs_hf:
+        from agent.core.preflight_hf import run_hf_preflight_checks
+
+        hf_result = await run_hf_preflight_checks(
+            provider=local.provider,
+            model_id=local.model_id,
+            hardware_id=local.hardware_id,
+            output_policy=local.output_policy,
+            target_namespace=target_namespace,
+            target_repo_id=target_repo_id,
+            hf_token=hf_token,
+            timeout_seconds=timeout_seconds,
+            hf_client_factory=hf_client_factory,
+            jobs_namespace_resolver=jobs_namespace_resolver,
+        )
+        provider_checks.extend(hf_result.checks)
+        live_modes.append("hf_read_only")
+
     combined_metadata = {
         **local.metadata,
-        "mode": "hf_read_only_live",
+        "mode": "+".join(live_modes),
         "live_provider_checks": True,
-        "live_preflight_probe_status": "hf_read_only",
+        "live_preflight_probe_status": "+".join(live_modes),
         "provider_jobs_launched": False,
         "resources_created": False,
     }
@@ -901,7 +962,7 @@ async def run_training_preflight(
         model_id=local.model_id,
         hardware_id=local.hardware_id,
         output_policy=local.output_policy,
-        checks=[*local_checks, *hf_result.checks],
+        checks=[*local_checks, *provider_checks],
         fallbacks=local.fallbacks,
         verified_recommendation=local.verified_recommendation,
         cache=local.cache,
