@@ -28,11 +28,16 @@ _WINDOWS_CREDENTIAL_PATH_RE = re.compile(
 _POSIX_CREDENTIAL_PATH_RE = re.compile(
     r"(?i)\b/[^\s\"']*(?:credentials?|service[-_]?account)[^\s\"']*\.json"
 )
+_AWS_CREDENTIALS_PATH_RE = re.compile(
+    r"(?i)\b[A-Z]:\\[^\s\"']*\.aws\\credentials\b|"
+    r"\b/[^\s\"']*\.aws/credentials\b"
+)
 
 
 def _without_credential_paths(message: str) -> str:
     out = _WINDOWS_CREDENTIAL_PATH_RE.sub("[REDACTED]", message)
-    return _POSIX_CREDENTIAL_PATH_RE.sub("[REDACTED]", out)
+    out = _POSIX_CREDENTIAL_PATH_RE.sub("[REDACTED]", out)
+    return _AWS_CREDENTIALS_PATH_RE.sub("[REDACTED]", out)
 
 
 def _safe_message(error: BaseException | str) -> str:
@@ -48,7 +53,12 @@ def _error_code(message: str, *, provider: str | None) -> str:
         return "timeout"
     if any(
         token in lower
-        for token in ("missing credential", "no credential", "credentials not found")
+        for token in (
+            "missing credential",
+            "no credential",
+            "credentials not found",
+            "unable to locate credentials",
+        )
     ):
         return "missing_credentials"
     if any(

@@ -339,7 +339,7 @@ async def test_public_model_metadata_can_be_checked_without_optional_identity():
     result = await run_training_preflight(
         session_id="s1",
         recommendation=_recommendation(
-            provider="aws-sagemaker", output_policy="cloud-private"
+            provider="local-metadata-only", output_policy="cloud-private"
         ),
         dataset_summary={"rows": 10},
         hf_token=None,

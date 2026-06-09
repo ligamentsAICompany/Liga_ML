@@ -1063,6 +1063,17 @@ async def run_training_preflight(
         or request.metadata.get("google_cloud_region")
         or request.metadata.get("location")
     )
+    aws_region = (
+        request.metadata.get("aws_region")
+        or request.metadata.get("region")
+        or request.metadata.get("aws_default_region")
+    )
+    aws_execution_role_arn = (
+        request.metadata.get("aws_execution_role_arn")
+        or request.metadata.get("execution_role_arn")
+        or request.metadata.get("sagemaker_role_arn")
+        or request.metadata.get("role_arn")
+    )
     result = await execute_training_preflight(
         session_id=request.session_id,
         run_id=request.run_id,
@@ -1083,6 +1094,10 @@ async def run_training_preflight(
         hf_token=hf_token,
         gcp_project_id=str(gcp_project_id) if gcp_project_id else None,
         gcp_region=str(gcp_region) if gcp_region else None,
+        aws_region=str(aws_region) if aws_region else None,
+        aws_execution_role_arn=str(aws_execution_role_arn)
+        if aws_execution_role_arn
+        else None,
     )
     saved = await session_manager.record_training_preflight(
         session_id=request.session_id,

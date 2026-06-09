@@ -804,7 +804,7 @@ def run_local_training_preflight(
 
 
 def _needs_hf_live_checks(provider: str, model_id: str, output_policy: str) -> bool:
-    if provider == "gcp-vertex":
+    if provider in {"gcp-vertex", "aws-sagemaker"}:
         return output_policy_requires_hub(output_policy)
     return (
         provider == "hf-jobs"
@@ -815,6 +815,14 @@ def _needs_hf_live_checks(provider: str, model_id: str, output_policy: str) -> b
 
 def _needs_gcp_live_checks(provider: str, output_policy: str) -> bool:
     return provider == "gcp-vertex" and (
+        output_policy_requires_cloud_storage(output_policy)
+        or output_policy_requires_hub(output_policy)
+        or output_policy in VALID_OUTPUT_POLICIES
+    )
+
+
+def _needs_aws_live_checks(provider: str, output_policy: str) -> bool:
+    return provider == "aws-sagemaker" and (
         output_policy_requires_cloud_storage(output_policy)
         or output_policy_requires_hub(output_policy)
         or output_policy in VALID_OUTPUT_POLICIES
@@ -851,6 +859,23 @@ def _local_check_superseded_by_gcp(
     return False
 
 
+def _local_check_superseded_by_aws(
+    check: TrainingPreflightCheck,
+    *,
+    provider: str,
+    output_policy: str,
+) -> bool:
+    if provider != "aws-sagemaker":
+        return False
+    if check.check_id == "provider_credentials_live":
+        return True
+    if check.check_id == "cloud_storage_live" and output_policy_requires_cloud_storage(
+        output_policy
+    ):
+        return True
+    return False
+
+
 async def run_training_preflight(
     *,
     session_id: str,
@@ -872,6 +897,9 @@ async def run_training_preflight(
     gcp_project_id: str | None = None,
     gcp_region: str | None = None,
     gcp_client_factory: Any | None = None,
+    aws_region: str | None = None,
+    aws_execution_role_arn: str | None = None,
+    aws_client_factory: Any | None = None,
 ) -> TrainingPreflightResult:
     """Run training preflight, including safe read-only provider probes."""
 
@@ -891,16 +919,22 @@ async def run_training_preflight(
         allow_unknown_override=allow_unknown_override,
     )
     needs_gcp = _needs_gcp_live_checks(local.provider, local.output_policy)
+    needs_aws = _needs_aws_live_checks(local.provider, local.output_policy)
     needs_hf = _needs_hf_live_checks(
         local.provider, local.model_id, local.output_policy
     )
-    if not needs_gcp and not needs_hf:
+    if not needs_gcp and not needs_aws and not needs_hf:
         return local
 
     local_checks = [
         check
         for check in local.primary.checks
         if not _local_check_superseded_by_gcp(
+            check,
+            provider=local.provider,
+            output_policy=local.output_policy,
+        )
+        and not _local_check_superseded_by_aws(
             check,
             provider=local.provider,
             output_policy=local.output_policy,
@@ -929,6 +963,24 @@ async def run_training_preflight(
         )
         provider_checks.extend(gcp_result.checks)
         live_modes.append("gcp_vertex_read_only")
+    if needs_aws:
+        from agent.core.preflight_aws_sagemaker import (
+            run_aws_sagemaker_preflight_checks,
+        )
+
+        aws_result = await run_aws_sagemaker_preflight_checks(
+            provider=local.provider,
+            model_id=local.model_id,
+            hardware_id=local.hardware_id,
+            output_policy=local.output_policy,
+            target_bucket=target_bucket,
+            aws_region=aws_region,
+            execution_role_arn=aws_execution_role_arn,
+            timeout_seconds=timeout_seconds,
+            aws_client_factory=aws_client_factory,
+        )
+        provider_checks.extend(aws_result.checks)
+        live_modes.append("aws_sagemaker_read_only")
     if needs_hf:
         from agent.core.preflight_hf import run_hf_preflight_checks
 
