@@ -14,6 +14,7 @@ import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
 import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
@@ -502,6 +503,14 @@ function createPreflightPanel(
       title: 'Training Planner',
       output: { content: panel.markdown, language: 'markdown' },
       ...(input ? { input: { content: JSON.stringify(input, null, 2), language: 'json' } } : {}),
+    };
+  }
+  if (toolName === 'training_preflight') {
+    const panel = createTrainingPreflightPanel(output as Parameters<typeof createTrainingPreflightPanel>[0]);
+    return {
+      title: 'Training Preflight',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(input ? { input: { content: redactedJsonString(input), language: 'json' } } : {}),
     };
   }
   if (toolName === 'dataset_discovery') {

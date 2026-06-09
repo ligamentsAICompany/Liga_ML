@@ -147,13 +147,19 @@ export interface TrainingPreflightResult {
 export interface TrainingPreflightRequest {
   session_id: string;
   run_id?: string | null;
-  provider: CloudProviderId | string;
-  model_id: string;
+  provider?: CloudProviderId | string | null;
+  model_id?: string | null;
   hardware_id?: string | null;
-  output_policy: OutputPolicy;
+  output_policy?: OutputPolicy | null;
   recommendation?: Record<string, unknown> | null;
+  dataset_summary?: Record<string, unknown> | null;
+  target_namespace?: string | null;
+  target_repo_id?: string | null;
+  target_bucket?: string | null;
   include_fallbacks?: boolean;
   allow_unknown_override?: boolean;
+  force_refresh?: boolean;
+  timeout_seconds?: number | null;
   metadata?: Record<string, unknown>;
 }
 
