@@ -75,3 +75,13 @@ checkpoint-*/
 runs/
 wandb/
 frontend/tsconfig.tsbuildinfo
+
+# Local AI/browser automation artifacts
+.playwright-mcp/
+
+# Local PR/E2E review artifacts
+responses_*_report.md
+final_pr*_review_report.md
+pr_body_*.md
+artifacts/responses_vertex_e2e/
+responses-log-empty-state.png

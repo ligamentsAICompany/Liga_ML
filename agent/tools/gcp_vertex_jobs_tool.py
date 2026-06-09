@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from huggingface_hub import hf_hub_download
 
+from agent.core.hf_tokens import resolve_hf_token
 from agent.core.redact import SECRET_KEY_RE, redact_text
 from agent.core.session import Event
 from agent.training_templates.sft import SftTemplateConfig, build_sft_training_script
@@ -121,6 +122,18 @@ def _default_output_dir(bucket: str) -> str:
 
 def _env_list(env: dict[str, Any]) -> list[dict[str, str]]:
     return [{"name": str(k), "value": str(v)} for k, v in sorted(env.items())]
+
+
+def _requires_hf_runtime_token(output_policy: str) -> bool:
+    return output_policy in {"hf-hub", "cloud-and-hf-hub"}
+
+
+def _resolve_vertex_hf_token(session: Any = None) -> str | None:
+    return resolve_hf_token(
+        getattr(session, "hf_token", None) if session is not None else None,
+        os.environ.get("HUGGINGFACE_HUB_TOKEN"),
+        os.environ.get("HF_TOKEN"),
+    )
 
 
 def _optional_int(value: Any) -> int | None:
@@ -609,13 +622,16 @@ class GcpVertexJobsTool:
             or os.environ.get("HF_TOKEN_SECRET_RESOURCE")
         ):
             env.setdefault("HF_TOKEN_SECRET_RESOURCE", str(secret_resource))
-        elif (
-            self.session is not None
-            and getattr(self.session, "hf_token", None)
-            and str(args.get("allow_insecure_hf_token_env") or "").lower()
-            in {"1", "true", "yes"}
-        ):
-            env.setdefault("HF_TOKEN", self.session.hf_token)
+        if _requires_hf_runtime_token(output_policy):
+            hf_token = _resolve_vertex_hf_token(self.session)
+            if not hf_token:
+                return self._error(
+                    "Hugging Face token is required before launching Vertex AI "
+                    f"with output_policy={output_policy}. Configure HF_TOKEN or "
+                    "HUGGINGFACE_HUB_TOKEN on the server, then retry."
+                )
+            env.setdefault("HF_TOKEN", hf_token)
+            env.setdefault("HUGGINGFACE_HUB_TOKEN", hf_token)
 
         worker_pool_specs = [
             {

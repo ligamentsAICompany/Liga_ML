@@ -26,6 +26,7 @@ import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
 import UsageDashboardButton from '@/components/UsageDashboard/UsageDashboardButton';
 import AuditTimelineButton from '@/components/AuditTimeline/AuditTimelineButton';
+import ResponsesLogButton from '@/components/ResponsesLogButton';
 import { apiFetch } from '@/utils/api';
 import {
   LLM_ERROR_SELECT_MODEL_ACTION,
@@ -204,7 +205,10 @@ export default function AppLayout() {
   // -- Welcome screen: no sessions at all ---------------------------------
   if (!hasAnySessions) {
     return (
-      <Box sx={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}>
+      <Box sx={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', position: 'relative' }}>
+        <Box sx={{ position: 'absolute', top: 16, right: 16, zIndex: 10 }}>
+          <ResponsesLogButton />
+        </Box>
         <WelcomeScreen />
       </Box>
     );
@@ -303,6 +307,7 @@ export default function AppLayout() {
           </Box>
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <ResponsesLogButton />
             <UsageDashboardButton />
             <AuditTimelineButton />
             <YoloControl />

@@ -100,6 +100,40 @@ class RestoreStore(NoopSessionStore):
         self.updated_fields.append((session_id, fields))
         self.metadata.update(fields)
 
+    async def save_snapshot(
+        self, *, session_id: str, messages: list, **fields: Any
+    ) -> None:
+        self.metadata.update(fields)
+        self.metadata["session_id"] = session_id
+        self.metadata["message_count"] = len(messages)
+        self.messages = messages
+
+
+class TraceStore(RestoreStore):
+    def __init__(self, *, trace_messages: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self.trace_messages = trace_messages
+
+    async def load_events_after(self, session_id: str, after_seq: int = 0):
+        return [
+            {
+                "_id": f"{session_id}:1",
+                "session_id": session_id,
+                "seq": 1,
+                "event_type": "tool_state_change",
+                "created_at": datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+                "data": {
+                    "tool": "hf_jobs",
+                    "tool_call_id": "functions.hf_jobs:23",
+                    "state": "running",
+                    "jobUrl": "https://huggingface.co/jobs/acme/job-123",
+                },
+            }
+        ]
+
+    async def load_trace_messages(self, session_id: str):
+        return self.trace_messages
+
 
 class CloseableResource:
     def __init__(self) -> None:
@@ -189,6 +223,53 @@ async def test_submit_user_input_preserves_hf_training_metadata():
         "run_id": existing.session.current_run_id,
     }
     assert isinstance(submitted[0].data["run_id"], str)
+
+
+@pytest.mark.asyncio
+async def test_load_response_events_includes_persisted_tool_trace_messages():
+    manager = _manager_with_store(
+        TraceStore(
+            trace_messages=[
+                {
+                    "session_id": "persisted-session",
+                    "seq": 2,
+                    "role": "tool",
+                    "created_at": datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+                    "message": {
+                        "role": "tool",
+                        "name": "hf_jobs",
+                        "tool_call_id": "functions.hf_jobs:23",
+                        "content": (
+                            "Python job completed!\n\n"
+                            "**Job ID:** job-123\n"
+                            "**Final Status:** COMPLETED\n"
+                            "**View at:** https://huggingface.co/jobs/acme/job-123\n"
+                        ),
+                    },
+                }
+            ]
+        )
+    )
+
+    events = await manager.load_response_events("persisted-session")
+
+    assert [event["event_type"] for event in events] == [
+        "tool_state_change",
+        "tool_output",
+    ]
+    tool_output = events[1]
+    assert tool_output["created_at"] == datetime(2026, 1, 1, 0, 2, tzinfo=UTC)
+    assert tool_output["data"] == {
+        "tool": "hf_jobs",
+        "tool_call_id": "functions.hf_jobs:23",
+        "output": (
+            "Python job completed!\n\n"
+            "**Job ID:** job-123\n"
+            "**Final Status:** COMPLETED\n"
+            "**View at:** https://huggingface.co/jobs/acme/job-123\n"
+        ),
+        "success": True,
+    }
 
 
 def _install_fake_runtime(manager: SessionManager) -> asyncio.Event:
@@ -562,6 +643,39 @@ async def test_lazy_restore_preserves_aws_cloud_provider():
         assert (
             manager.get_session_info("aws-session")["cloud_provider"] == "aws-sagemaker"
         )
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_lazy_restore_clears_stale_processing_runtime_state():
+    store = RestoreStore(
+        metadata={
+            "session_id": "failed-vertex-session",
+            "user_id": "owner",
+            "model": "test-model",
+            "cloud_provider": "gcp-vertex",
+            "runtime_state": "processing",
+            "status": "active",
+            "created_at": datetime.now(UTC),
+        }
+    )
+    manager = _manager_with_store(store)
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+
+    try:
+        restored = await manager.ensure_session_loaded(
+            "failed-vertex-session", user_id="owner"
+        )
+
+        assert restored is not None
+        assert restored.is_processing is False
+        assert (
+            manager.get_session_info("failed-vertex-session")["is_processing"] is False
+        )
+        assert store.metadata["runtime_state"] == "idle"
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)

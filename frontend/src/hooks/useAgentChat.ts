@@ -713,9 +713,10 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             }),
           });
         } else if (pendingIds && pendingIds.size > 0) {
-          updateSession(sessionId, { activityStatus: { type: 'waiting-approval' } });
+          updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'waiting-approval' } });
           clearResearch(sessionId);
         } else {
+          updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
           clearResearch(sessionId);
         }
       } catch {
@@ -970,10 +971,13 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
 
           // If backend stopped processing, clean up
           if (fresh.info && !fresh.info.is_processing) {
-            updateSession(sessionId, { isProcessing: false });
+            updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
             stopReconnect();
           }
         }, 3000);
+      } else {
+        updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
+        stopReconnect();
       }
     };
 
@@ -1132,6 +1136,9 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         }
         if (info.auto_approval) {
           updateSessionYolo(sessionId, info.auto_approval);
+        }
+        if (!info.is_processing && !(pendingIds && pendingIds.size > 0)) {
+          updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
         }
       }
 
