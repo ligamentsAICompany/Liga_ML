@@ -6,6 +6,7 @@ import {
   PREFLIGHT_ACTION_COPY,
   buildManualPreflightRequest,
   createManualPreflightNotRunMarkdown,
+  loadPersistedTrainingPreflight,
   runManualTrainingPreflight,
   type ManualPreflightState,
 } from '../src/lib/training-preflight-action.js';
@@ -79,6 +80,20 @@ test('manual preflight request uses planner context and safe defaults', () => {
   assert.equal(request.timeout_seconds, 15);
 });
 
+test('manual refresh request sets force refresh true', () => {
+  const request = buildManualPreflightRequest({
+    sessionId: 's1',
+    runId: 'run1',
+    plannerOutput: { recommendation: { selected_provider: { provider_id: 'hf-jobs' } } },
+    forceRefresh: true,
+  });
+
+  assert.equal(request.session_id, 's1');
+  assert.equal(request.run_id, 'run1');
+  assert.equal(request.force_refresh, true);
+  assert.equal(request.include_fallbacks, true);
+});
+
 test('manual preflight request falls back to session-only when recommendation missing', () => {
   const request = buildManualPreflightRequest({ sessionId: 's1' });
 
@@ -141,6 +156,104 @@ test('manual preflight action exposes loading state and disables repeated clicks
   assert.match(states.at(-1)?.markdown ?? '', /Launch ready: yes/);
 });
 
+test('persisted preflight load uses GET only and renders unknown result', async () => {
+  const calls: string[] = [];
+  const states: ManualPreflightState[] = [];
+
+  await loadPersistedTrainingPreflight({
+    sessionId: 's1',
+    getLatest: async (sessionId) => {
+      calls.push(`GET session ${sessionId}`);
+      return preflightResult();
+    },
+    getRun: async () => {
+      throw new Error('unexpected run fetch');
+    },
+    onStateChange: (next) => states.push(next),
+  });
+
+  assert.deepEqual(calls, ['GET session s1']);
+  assert.equal(states[0].status, 'loading');
+  assert.equal(states.at(-1)?.status, 'success');
+  assert.equal(states.at(-1)?.result?.launch_ready, false);
+  assert.match(states.at(-1)?.markdown ?? '', /Stored preflight may be stale/);
+  assert.match(states.at(-1)?.markdown ?? '', /Updated at: 2026-06-09T08:00:00Z/);
+  assert.doesNotMatch(states.at(-1)?.markdown ?? '', /status: unknown \| Passed/i);
+});
+
+test('persisted run preflight load uses run GET when run id exists', async () => {
+  const calls: string[] = [];
+
+  await loadPersistedTrainingPreflight({
+    sessionId: 's1',
+    runId: 'run1',
+    getLatest: async () => {
+      throw new Error('unexpected session fetch');
+    },
+    getRun: async (sessionId, runId) => {
+      calls.push(`GET run ${sessionId}/${runId}`);
+      return preflightResult({ run_id: runId });
+    },
+    onStateChange: () => undefined,
+  });
+
+  assert.deepEqual(calls, ['GET run s1/run1']);
+});
+
+test('persisted preflight 404 null shows not-run state without scary error', async () => {
+  const states: ManualPreflightState[] = [];
+
+  await loadPersistedTrainingPreflight({
+    sessionId: 's1',
+    getLatest: async () => null,
+    getRun: async () => null,
+    onStateChange: (next) => states.push(next),
+  });
+
+  const finalState = states.at(-1);
+  assert.equal(finalState?.status, 'not_run');
+  assert.match(finalState?.markdown ?? '', /No preflight has been run yet/);
+  assert.doesNotMatch(finalState?.markdown ?? '', /Error|failed/i);
+});
+
+test('persisted passed preflight renders launch ready and timestamps', async () => {
+  const states: ManualPreflightState[] = [];
+
+  await loadPersistedTrainingPreflight({
+    sessionId: 's1',
+    getLatest: async () => preflightResult({ status: 'passed', launch_ready: true, safe_summary: 'Preflight passed.' }),
+    getRun: async () => null,
+    onStateChange: (next) => states.push(next),
+  });
+
+  const finalState = states.at(-1);
+  assert.equal(finalState?.status, 'success');
+  assert.equal(finalState?.result?.launch_ready, true);
+  assert.match(finalState?.markdown ?? '', /Launch ready: yes/);
+  assert.match(finalState?.markdown ?? '', /Created at: 2026-06-09T08:00:00Z/);
+  assert.match(finalState?.markdown ?? '', /Launch still requires explicit approval/);
+});
+
+test('persisted preflight load error is redacted and does not block planner', async () => {
+  const fakeToken = `hf_${'B'.repeat(35)}`;
+  const states: ManualPreflightState[] = [];
+
+  await loadPersistedTrainingPreflight({
+    sessionId: 's1',
+    getLatest: async () => {
+      throw new Error(`GET failed ${fakeToken}`);
+    },
+    getRun: async () => null,
+    onStateChange: (next) => states.push(next),
+  });
+
+  const finalState = states.at(-1);
+  assert.equal(finalState?.status, 'error');
+  assert.doesNotMatch(finalState?.error ?? '', /hf_[A-Za-z0-9]/);
+  assert.match(finalState?.error ?? '', /\[REDACTED\]/);
+  assert.match(finalState?.markdown ?? '', /Static recommendation remains visible/);
+});
+
 test('manual preflight action redacts safe retry error state', async () => {
   const fakeToken = `hf_${'A'.repeat(35)}`;
   const states: ManualPreflightState[] = [];
@@ -160,10 +273,32 @@ test('manual preflight action redacts safe retry error state', async () => {
   assert.match(finalState?.error ?? '', /\[REDACTED\]/);
 });
 
+test('manual refresh replaces stale displayed result', async () => {
+  const states: ManualPreflightState[] = [{ status: 'success', result: preflightResult(), markdown: 'stale' }];
+  const request = buildManualPreflightRequest({ sessionId: 's1', forceRefresh: true });
+
+  await runManualTrainingPreflight({
+    request,
+    run: async (actualRequest) => {
+      assert.equal(actualRequest.force_refresh, true);
+      return preflightResult({ status: 'passed', launch_ready: true, safe_summary: 'Fresh preflight passed.' });
+    },
+    onStateChange: (next) => states.push(next),
+  });
+
+  assert.equal(states.at(-1)?.status, 'success');
+  assert.equal(states.at(-1)?.result?.launch_ready, true);
+  assert.match(states.at(-1)?.markdown ?? '', /Fresh preflight passed/);
+  assert.doesNotMatch(states.at(-1)?.markdown ?? '', /^stale$/);
+});
+
 test('tool group exposes a manual preflight button without auto-run', () => {
   assert.match(toolCallGroupSource, /Run preflight check/);
+  assert.match(toolCallGroupSource, /Refresh preflight/);
+  assert.match(toolCallGroupSource, /loadPersistedTrainingPreflight/);
   assert.match(toolCallGroupSource, /handleRunPreflight/);
   assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}runTrainingPreflight/);
+  assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}force_refresh:\s*true/);
 });
 
 test('manual action copy avoids provider job launch wording', () => {

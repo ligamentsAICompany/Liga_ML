@@ -5,7 +5,7 @@ import { redactJsonLike, redactText } from './redaction.js';
 
 type PlannerRecord = Record<string, unknown>;
 
-export type ManualPreflightStatus = 'not_run' | 'checking' | 'success' | 'error';
+export type ManualPreflightStatus = 'not_run' | 'loading' | 'checking' | 'success' | 'error';
 
 export interface ManualPreflightState {
   status: ManualPreflightStatus;
@@ -21,6 +21,7 @@ export interface ManualPreflightRequestInput {
   runId?: string | null;
   plannerOutput?: unknown;
   plannerInput?: unknown;
+  forceRefresh?: boolean;
 }
 
 export const PREFLIGHT_ACTION_COPY = {
@@ -81,14 +82,16 @@ export function buildManualPreflightRequest(input: ManualPreflightRequestInput):
   const record = firstRecord(input.plannerOutput, input.plannerInput);
   const recommendation = getRecord(record, 'recommendation');
   const datasetSummary = getRecord(record, 'datasetSummary', 'dataset_summary');
+  const safeRecommendation = safeRecord(recommendation);
+  const safeDatasetSummary = safeRecord(datasetSummary);
 
   return {
     session_id: input.sessionId,
     ...(input.runId ? { run_id: input.runId } : {}),
-    ...(safeRecord(recommendation) ? { recommendation: safeRecord(recommendation) } : {}),
-    ...(safeRecord(datasetSummary) ? { dataset_summary: safeRecord(datasetSummary) } : {}),
+    ...(safeRecommendation ? { recommendation: safeRecommendation } : {}),
+    ...(safeDatasetSummary ? { dataset_summary: safeDatasetSummary } : {}),
     include_fallbacks: true,
-    force_refresh: false,
+    force_refresh: input.forceRefresh === true,
     timeout_seconds: 15,
   };
 }
@@ -97,12 +100,22 @@ export function createManualPreflightNotRunMarkdown(): string {
   return [
     '## Manual Preflight Check',
     '',
+    '- No preflight has been run yet.',
     `- ${PREFLIGHT_ACTION_COPY.staticNotVerified}`,
     `- ${PREFLIGHT_ACTION_COPY.notLaunch}`,
     `- ${PREFLIGHT_ACTION_COPY.noJobs}`,
     `- ${PREFLIGHT_ACTION_COPY.noResources}`,
     `- ${PREFLIGHT_ACTION_COPY.unknownNotPassed}`,
     `- ${PREFLIGHT_ACTION_COPY.approvalRequired}`,
+  ].join('\n');
+}
+
+export function createPersistedPreflightLoadingMarkdown(): string {
+  return [
+    '## Latest Preflight',
+    '',
+    '- Loading latest persisted preflight result.',
+    '- This is a read-only lookup. It does not run preflight.',
   ].join('\n');
 }
 
@@ -127,6 +140,82 @@ export function createManualPreflightErrorMarkdown(error: string): string {
     `- ${PREFLIGHT_ACTION_COPY.noJobs}`,
     `- ${PREFLIGHT_ACTION_COPY.noResources}`,
   ].join('\n');
+}
+
+export function createPersistedPreflightErrorMarkdown(error: string): string {
+  return [
+    '## Latest Preflight',
+    '',
+    `- Error: ${redactText(error)}`,
+    '- Static recommendation remains visible.',
+    '- You can retry with Run preflight check or Refresh preflight.',
+    `- ${PREFLIGHT_ACTION_COPY.notLaunch}`,
+    `- ${PREFLIGHT_ACTION_COPY.noJobs}`,
+    `- ${PREFLIGHT_ACTION_COPY.noResources}`,
+  ].join('\n');
+}
+
+export function createPersistedPreflightMarkdown(result: TrainingPreflightResult): string {
+  const panel = createTrainingPreflightPanel(result);
+  return [
+    panel.markdown,
+    '',
+    '### Persisted Result',
+    '- Stored preflight may be stale. Refresh manually before launch.',
+    `- Created at: ${redactText(result.created_at)}`,
+    `- Updated at: ${redactText(result.updated_at)}`,
+    `- ${PREFLIGHT_ACTION_COPY.approvalRequired}`,
+  ].join('\n');
+}
+
+export async function loadPersistedTrainingPreflight({
+  sessionId,
+  runId,
+  getLatest,
+  getRun,
+  onStateChange,
+}: {
+  sessionId: string;
+  runId?: string | null;
+  getLatest: (sessionId: string) => Promise<TrainingPreflightResult | null>;
+  getRun: (sessionId: string, runId: string) => Promise<TrainingPreflightResult | null>;
+  onStateChange: (state: ManualPreflightState) => void;
+}): Promise<void> {
+  onStateChange({
+    status: 'loading',
+    disabled: true,
+    markdown: createPersistedPreflightLoadingMarkdown(),
+  });
+
+  try {
+    const result = runId ? await getRun(sessionId, runId) : await getLatest(sessionId);
+    if (!result) {
+      onStateChange({
+        status: 'not_run',
+        disabled: false,
+        markdown: createManualPreflightNotRunMarkdown(),
+        lastUpdated: new Date().toISOString(),
+      });
+      return;
+    }
+
+    onStateChange({
+      status: 'success',
+      disabled: false,
+      result,
+      markdown: createPersistedPreflightMarkdown(result),
+      lastUpdated: new Date().toISOString(),
+    });
+  } catch (error) {
+    const message = redactText(error instanceof Error ? error.message : String(error));
+    onStateChange({
+      status: 'error',
+      disabled: false,
+      error: message,
+      markdown: createPersistedPreflightErrorMarkdown(message),
+      lastUpdated: new Date().toISOString(),
+    });
+  }
 }
 
 export async function runManualTrainingPreflight({

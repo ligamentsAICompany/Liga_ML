@@ -139,6 +139,14 @@ function cacheLines(result: TrainingPreflightResult): string[] {
   ].filter((item): item is string => !!item);
 }
 
+function timestampLines(result: TrainingPreflightResult): string[] {
+  return [
+    line('Created at', result.created_at),
+    line('Updated at', result.updated_at),
+    line('Run ID', result.run_id),
+  ].filter((item): item is string => !!item);
+}
+
 function parseInput(input: unknown): PreflightRecord {
   if (isRecord(input)) return input;
   if (typeof input !== 'string') return {};
@@ -215,6 +223,7 @@ export function createTrainingPreflightPanel(input: unknown): TrainingPreflightP
   ]);
 
   appendSection(lines, 'Primary Recommendation', recommendationLines(result));
+  appendSection(lines, 'Result Timestamps', timestampLines(result));
   appendSection(lines, 'Checks', primaryChecks.map(checkLine));
   appendSection(lines, 'Blocking Reasons', (result.blocking_reasons ?? []).map(cleanText));
   appendSection(lines, 'Warnings', (result.warning_reasons ?? []).map(cleanText));

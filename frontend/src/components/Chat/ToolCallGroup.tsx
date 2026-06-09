@@ -19,11 +19,12 @@ import {
   buildManualPreflightRequest,
   createManualPreflightErrorMarkdown,
   createManualPreflightNotRunMarkdown,
+  loadPersistedTrainingPreflight,
   PREFLIGHT_ACTION_COPY,
   runManualTrainingPreflight,
   type ManualPreflightState,
 } from '@/lib/training-preflight-action';
-import { runTrainingPreflight } from '@/lib/training-preflight-api';
+import { getLatestSessionPreflight, getRunPreflight, runTrainingPreflight } from '@/lib/training-preflight-api';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
@@ -931,8 +932,19 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
   const [lockedToolId, setLockedToolId] = useState<string | null>(null);
   const [preflightStates, setPreflightStates] = useState<Record<string, ManualPreflightState>>({});
 
+  const loadedPreflightKeysRef = useRef<Set<string>>(new Set());
+
+  function preflightRunId(tool: DynamicToolPart): string | undefined {
+    const input = tool.input as Record<string, unknown> | undefined;
+    return typeof input?.run_id === 'string'
+      ? input.run_id
+      : typeof input?.runId === 'string'
+        ? input.runId
+        : undefined;
+  }
+
   const handleRunPreflight = useCallback(
-    async (tool: DynamicToolPart) => {
+    async (tool: DynamicToolPart, options: { forceRefresh?: boolean } = {}) => {
       if (!activeSessionId) {
         const markdown = createManualPreflightErrorMarkdown('No active session is available for preflight.');
         setPreflightStates(prev => ({
@@ -950,16 +962,13 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       }
 
       const input = tool.input as Record<string, unknown> | undefined;
-      const runId = typeof input?.run_id === 'string'
-        ? input.run_id
-        : typeof input?.runId === 'string'
-          ? input.runId
-          : undefined;
+      const runId = preflightRunId(tool);
       const request = buildManualPreflightRequest({
         sessionId: activeSessionId,
         runId,
         plannerOutput: tool.output,
         plannerInput: input,
+        forceRefresh: options.forceRefresh === true,
       });
 
       await runManualTrainingPreflight({
@@ -976,6 +985,27 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     },
     [activeSessionId, setPanel, setRightPanelOpen],
   );
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    for (const tool of tools) {
+      if (tool.toolName !== 'training_planner') continue;
+      const runId = preflightRunId(tool);
+      const key = `${activeSessionId}:${tool.toolCallId}:${runId ?? 'session'}`;
+      if (loadedPreflightKeysRef.current.has(key)) continue;
+      loadedPreflightKeysRef.current.add(key);
+
+      void loadPersistedTrainingPreflight({
+        sessionId: activeSessionId,
+        runId,
+        getLatest: getLatestSessionPreflight,
+        getRun: getRunPreflight,
+        onStateChange: (next) => {
+          setPreflightStates(prev => ({ ...prev, [tool.toolCallId]: next }));
+        },
+      });
+    }
+  }, [activeSessionId, tools]);
 
   // Reset submission state when new (unseen) pending tools arrive — e.g. second approval round
   useEffect(() => {
@@ -1766,6 +1796,14 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                           Preflight is running. Repeat clicks are disabled.
                         </Typography>
                       )}
+                      {preflightState.status === 'loading' && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Loading latest persisted preflight. This read-only lookup does not run preflight.
+                        </Typography>
+                      )}
                       {preflightState.status === 'error' && preflightState.error && (
                         <Typography
                           variant="caption"
@@ -1782,13 +1820,21 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                           Latest preflight: {String(preflightState.result.status)} · launch_ready={String(preflightState.result.launch_ready)}
                         </Typography>
                       )}
+                      {preflightState.status === 'success' && preflightState.result && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.25 }}
+                        >
+                          Updated at: {String(preflightState.result.updated_at)} · Stored preflight may be stale.
+                        </Typography>
+                      )}
                     </Box>
                     <Button
                       size="small"
-                      disabled={preflightState.status === 'checking' || !activeSessionId}
+                      disabled={preflightState.status === 'checking' || preflightState.status === 'loading' || !activeSessionId}
                       onClick={(event) => {
                         event.stopPropagation();
-                        void handleRunPreflight(tool);
+                        void handleRunPreflight(tool, { forceRefresh: preflightState.status === 'success' });
                       }}
                       sx={{
                         textTransform: 'none',
@@ -1804,14 +1850,22 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                         '&.Mui-disabled': { color: 'var(--muted-text)', borderColor: 'var(--tool-border)', opacity: 0.55 },
                       }}
                     >
-                      {preflightState.status === 'checking' ? 'Running preflight...' : 'Run preflight check'}
+                      {preflightState.status === 'checking'
+                        ? 'Running preflight...'
+                        : preflightState.status === 'loading'
+                          ? 'Loading preflight...'
+                          : preflightState.status === 'success'
+                            ? 'Refresh preflight'
+                            : 'Run preflight check'}
                     </Button>
-                    {preflightState.status === 'not_run' && (
+                    {(preflightState.status === 'not_run' || preflightState.status === 'success') && (
                       <Button
                         size="small"
                         onClick={(event) => {
                           event.stopPropagation();
-                          const markdown = createManualPreflightNotRunMarkdown();
+                          const markdown = preflightState.status === 'success' && preflightState.markdown
+                            ? preflightState.markdown
+                            : createManualPreflightNotRunMarkdown();
                           setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
                           setRightPanelOpen(true);
                         }}
@@ -1824,7 +1878,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                           '&:hover': { color: 'var(--text)', bgcolor: 'rgba(255,255,255,0.04)' },
                         }}
                       >
-                        View safety note
+                        {preflightState.status === 'success' ? 'View latest preflight' : 'View safety note'}
                       </Button>
                     )}
                   </Stack>

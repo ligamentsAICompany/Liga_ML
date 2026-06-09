@@ -136,6 +136,8 @@ test('preflight panel renders reasons provider model hardware output policy and 
   assert.match(panel.markdown, /Model: Qwen\/Qwen2\.5-0\.5B-Instruct/);
   assert.match(panel.markdown, /Hardware: hf-jobs:t4-small/);
   assert.match(panel.markdown, /Output policy: cloud-and-hf-hub/);
+  assert.match(panel.markdown, /Created at: 2026-06-09T08:00:00Z/);
+  assert.match(panel.markdown, /Updated at: 2026-06-09T08:00:00Z/);
   assert.match(panel.markdown, /Blocking Reasons/);
   assert.match(panel.markdown, /Warnings/);
   assert.match(panel.markdown, /Unknowns/);
@@ -198,5 +200,5 @@ test('preflight panel redacts secrets and signed URLs', () => {
 
 test('tool panel source recognizes training preflight without auto-running it', () => {
   assert.match(toolCallGroupSource, /training_preflight/);
-  assert.doesNotMatch(toolCallGroupSource, /runTrainingPreflight\(/);
+  assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}runTrainingPreflight/);
 });
