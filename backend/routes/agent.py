@@ -54,6 +54,8 @@ from models import (
     SessionResponse,
     SessionYoloRequest,
     SubmitRequest,
+    TrainingPreflightRequest,
+    TrainingPreflightResultModel,
     TruncateRequest,
     UsageEntry,
     UsageStoreHealth,
@@ -88,6 +90,9 @@ from agent.core.post_training_evaluation import build_post_training_evaluation
 from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
+from agent.core.training_preflight import (
+    run_training_preflight as execute_training_preflight,
+)
 from agent.core.usage import usage_dashboard_enabled
 
 logger = logging.getLogger(__name__)
@@ -1008,6 +1013,128 @@ async def get_run_recommendations(
     if not recommendation:
         raise HTTPException(status_code=404, detail="Recommendation not found")
     return recommendation
+
+
+@router.post("/training-preflight", response_model=TrainingPreflightResultModel)
+async def run_training_preflight(
+    request: TrainingPreflightRequest,
+    http_request: Request = None,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    """Run training preflight without launching provider jobs."""
+
+    agent_session = await _check_session_access(
+        request.session_id,
+        user,
+        preload_sandbox=False,
+    )
+    recommendation = request.recommendation
+    if recommendation is None:
+        session_recommendation = getattr(
+            getattr(agent_session, "session", None),
+            "latest_training_recommendation",
+            None,
+        )
+        recommendation = (
+            sanitize_for_frontend(session_recommendation)
+            if isinstance(session_recommendation, dict)
+            else None
+        )
+    if recommendation is None:
+        recommendation = await session_manager.get_latest_training_recommendation(
+            request.session_id
+        )
+    dataset_discovery = await session_manager.get_latest_dataset_discovery(
+        request.session_id
+    )
+    hf_token = (
+        resolve_hf_request_token(http_request)
+        if http_request is not None
+        else (getattr(agent_session, "hf_token", None) or _user_hf_token(user))
+    )
+    gcp_project_id = (
+        request.metadata.get("gcp_project_id")
+        or request.metadata.get("project_id")
+        or request.metadata.get("google_cloud_project")
+    )
+    gcp_region = (
+        request.metadata.get("gcp_region")
+        or request.metadata.get("region")
+        or request.metadata.get("google_cloud_region")
+        or request.metadata.get("location")
+    )
+    aws_region = (
+        request.metadata.get("aws_region")
+        or request.metadata.get("region")
+        or request.metadata.get("aws_default_region")
+    )
+    aws_execution_role_arn = (
+        request.metadata.get("aws_execution_role_arn")
+        or request.metadata.get("execution_role_arn")
+        or request.metadata.get("sagemaker_role_arn")
+        or request.metadata.get("role_arn")
+    )
+    result = await execute_training_preflight(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        recommendation=recommendation,
+        dataset_summary=request.dataset_summary,
+        dataset_discovery=dataset_discovery,
+        target_namespace=request.target_namespace,
+        target_repo_id=request.target_repo_id,
+        target_bucket=request.target_bucket,
+        include_fallbacks=request.include_fallbacks,
+        force_refresh=request.force_refresh,
+        timeout_seconds=request.timeout_seconds,
+        metadata={
+            **request.metadata,
+            "agent_session_active": bool(getattr(agent_session, "is_active", False)),
+        },
+        allow_unknown_override=request.allow_unknown_override,
+        hf_token=hf_token,
+        gcp_project_id=str(gcp_project_id) if gcp_project_id else None,
+        gcp_region=str(gcp_region) if gcp_region else None,
+        aws_region=str(aws_region) if aws_region else None,
+        aws_execution_role_arn=str(aws_execution_role_arn)
+        if aws_execution_role_arn
+        else None,
+    )
+    saved = await session_manager.record_training_preflight(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        preflight=result.to_dict(),
+    )
+    return TrainingPreflightResultModel(**saved)
+
+
+@router.get(
+    "/session/{session_id}/preflight", response_model=TrainingPreflightResultModel
+)
+async def get_session_preflight(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    preflight = await session_manager.get_latest_training_preflight(session_id)
+    if not preflight:
+        raise HTTPException(status_code=404, detail="Training preflight not found")
+    return TrainingPreflightResultModel(**preflight)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/preflight",
+    response_model=TrainingPreflightResultModel,
+)
+async def get_run_preflight(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    preflight = await session_manager.get_run_training_preflight(session_id, run_id)
+    if not preflight:
+        raise HTTPException(status_code=404, detail="Training preflight not found")
+    return TrainingPreflightResultModel(**preflight)
 
 
 @router.post(

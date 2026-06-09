@@ -13,6 +13,7 @@ from agent.core.audit import (  # noqa: E402
     build_audit_event,
     event_from_run_event,
     sanitize_audit_metadata,
+    training_preflight_audit_events,
 )
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from routes import agent  # noqa: E402
@@ -301,6 +302,36 @@ def test_event_from_run_event_maps_dataset_discovery_lifecycle():
     assert events[0]["category"] == "dataset"
     assert events[1]["dataset_name"] == "Hardware Support QA"
     assert events[2]["severity"] == "warning"
+
+
+def test_training_preflight_audit_events_record_unknown_and_blocked():
+    events = training_preflight_audit_events(
+        {
+            "preflight_id": "pf1",
+            "session_id": "s1",
+            "run_id": "r1",
+            "provider": "hf-jobs",
+            "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+            "hardware_id": "hf-jobs:t4-small",
+            "output_policy": "cloud-and-hf-hub",
+            "status": "unknown",
+            "launch_ready": False,
+            "safe_summary": "HF_TOKEN=hf_" + "A" * 35,
+            "blocking_reasons": [],
+            "unknown_reasons": ["Live checks are not implemented."],
+            "warning_reasons": [],
+            "metadata": {"provider_jobs_launched": False, "resources_created": False},
+        },
+        include_started=True,
+    )
+
+    assert [event["event_type"] for event in events] == [
+        "training_preflight_started",
+        "training_preflight_unknown",
+        "training_preflight_launch_blocked",
+    ]
+    assert events[1]["severity"] == "warning"
+    assert "hf_" not in str(events)
 
 
 @pytest.mark.asyncio

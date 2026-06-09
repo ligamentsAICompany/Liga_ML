@@ -259,6 +259,11 @@ class SessionManager:
         )
 
     @staticmethod
+    def _serialize_training_preflight(session: Session) -> dict[str, Any] | None:
+        preflight = getattr(session, "latest_training_preflight", None)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
+
+    @staticmethod
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
@@ -457,6 +462,7 @@ class SessionManager:
                 "training_recommendation": provider_metadata.get(
                     "training_recommendation"
                 ),
+                "training_preflight": provider_metadata.get("training_preflight"),
             },
             "evaluation_id": run.get("evaluation_id"),
             "evaluation_status": run.get("evaluation_status"),
@@ -472,6 +478,7 @@ class SessionManager:
             "latest_audit_event": run.get("latest_audit_event"),
             "dataset_discovery": run.get("dataset_discovery"),
             "training_recommendation": run.get("training_recommendation"),
+            "training_preflight": run.get("training_preflight"),
         }
         return sanitize_for_frontend(payload)
 
@@ -639,6 +646,42 @@ class SessionManager:
             if isinstance(recommendation, dict):
                 return sanitize_for_frontend(recommendation)
         return None
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        clean = sanitize_for_frontend(preflight)
+        agent_session = self.sessions.get(session_id)
+        if agent_session and isinstance(clean, dict):
+            agent_session.session.latest_training_preflight = dict(clean)
+        return sanitize_for_frontend(
+            await self._store().record_training_preflight(
+                session_id=session_id,
+                preflight=clean if isinstance(clean, dict) else {},
+                run_id=run_id,
+            )
+        )
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            preflight = self._serialize_training_preflight(agent_session.session)
+            if preflight:
+                return preflight
+        preflight = await self._store().get_latest_training_preflight(session_id)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        preflight = await self._store().get_run_training_preflight(session_id, run_id)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
 
     async def list_usage_entries(self, **filters: Any) -> list[dict[str, Any]]:
         return await self._store().list_usage_entries(**filters)
@@ -928,6 +971,9 @@ class SessionManager:
                 latest_training_recommendation=(
                     self._serialize_training_recommendation(agent_session.session)
                 ),
+                latest_training_preflight=self._serialize_training_preflight(
+                    agent_session.session
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -1052,6 +1098,8 @@ class SessionManager:
             session.latest_training_recommendation = dict(
                 meta["latest_training_recommendation"]
             )
+        if isinstance(meta.get("latest_training_preflight"), dict):
+            session.latest_training_preflight = dict(meta["latest_training_preflight"])
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):

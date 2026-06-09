@@ -23,7 +23,9 @@ import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
 import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import { redactedJsonString } from '@/lib/redaction';
 import { shouldMarkModelUnavailable, normalizeLlmErrorType } from '@/lib/llm-error-recovery';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import type { ToolStateChangeEventData } from '@/types/events';
@@ -51,6 +53,14 @@ function createPreflightPanelData(toolName: string, output: unknown, args?: Reco
       title: 'Training Planner',
       output: { content: panel.markdown, language: 'markdown' },
       ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+    };
+  }
+  if (toolName === 'training_preflight') {
+    const panel = createTrainingPreflightPanel(output as Parameters<typeof createTrainingPreflightPanel>[0]);
+    return {
+      title: 'Training Preflight',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(args ? { input: { content: redactedJsonString(args), language: 'json' } } : {}),
     };
   }
   if (toolName === 'dataset_discovery') {

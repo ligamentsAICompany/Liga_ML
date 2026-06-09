@@ -33,6 +33,31 @@ CostConfidence = Literal["known", "estimated", "unknown"]
 TrainingGoal = Literal["smoke-test", "production", "agent-decide"]
 OutputPolicy = Literal["cloud-private", "hf-hub", "cloud-and-hf-hub"]
 DatasetSourceFormat = Literal["csv", "json", "jsonl", "pdf", "docx", "xlsx", "md"]
+TrainingPreflightStatus = Literal[
+    "not_run",
+    "checking",
+    "passed",
+    "warning",
+    "failed",
+    "unknown",
+    "skipped",
+]
+TrainingPreflightSeverity = Literal["info", "warning", "error", "blocking"]
+TrainingPreflightCheckCategory = Literal[
+    "credentials",
+    "identity",
+    "model_access",
+    "metadata",
+    "namespace",
+    "storage",
+    "api",
+    "hardware",
+    "quota",
+    "compatibility",
+    "output_policy",
+    "fallback",
+    "safety",
+]
 
 
 class OpType(str, Enum):
@@ -165,6 +190,104 @@ class DatasetDiscoveryResponse(BaseModel):
     selected_candidate: dict[str, Any] | None = None
     timestamp: str | None = None
     requires_user_selection: bool = True
+
+
+class TrainingPreflightCheckModel(BaseModel):
+    check_id: str
+    provider: str
+    category: TrainingPreflightCheckCategory | str
+    label: str
+    status: TrainingPreflightStatus | str
+    severity: TrainingPreflightSeverity | str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    error_code: str | None = None
+    docs_verification_required: bool = False
+
+
+class TrainingPreflightProviderResultModel(BaseModel):
+    provider: str
+    status: TrainingPreflightStatus | str
+    launch_ready: bool = False
+    checks: list[TrainingPreflightCheckModel] = Field(default_factory=list)
+    blocking_reasons: list[str] = Field(default_factory=list)
+    warning_reasons: list[str] = Field(default_factory=list)
+    unknown_reasons: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingPreflightFallbackResultModel(BaseModel):
+    fallback_id: str
+    provider: str
+    model_id: str | None = None
+    hardware_id: str | None = None
+    status: TrainingPreflightStatus | str = "not_run"
+    launch_ready: bool = False
+    checks: list[TrainingPreflightCheckModel] = Field(default_factory=list)
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingPreflightCacheInfoModel(BaseModel):
+    cache_key: str | None = None
+    hit: bool = False
+    ttl_seconds: int | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
+
+
+class TrainingPreflightResultModel(BaseModel):
+    preflight_id: str
+    session_id: str
+    run_id: str | None = None
+    created_at: str
+    updated_at: str
+    status: TrainingPreflightStatus | str
+    launch_ready: bool = False
+    provider: str
+    model_id: str
+    hardware_id: str | None = None
+    output_policy: OutputPolicy | str
+    primary: TrainingPreflightProviderResultModel
+    fallbacks: list[TrainingPreflightFallbackResultModel] = Field(default_factory=list)
+    verified_fallback: TrainingPreflightFallbackResultModel | None = None
+    verified_recommendation: dict[str, Any] | None = None
+    blocking_reasons: list[str] = Field(default_factory=list)
+    warning_reasons: list[str] = Field(default_factory=list)
+    unknown_reasons: list[str] = Field(default_factory=list)
+    safe_summary: str = ""
+    cache: TrainingPreflightCacheInfoModel = Field(
+        default_factory=TrainingPreflightCacheInfoModel
+    )
+    metadata: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "provider_jobs_launched": False,
+            "resources_created": False,
+            "live_checks_optional": True,
+        }
+    )
+
+
+class TrainingPreflightRequest(BaseModel):
+    session_id: str
+    run_id: str | None = None
+    provider: CloudProviderId | str | None = None
+    model_id: str | None = None
+    hardware_id: str | None = None
+    output_policy: OutputPolicy | None = None
+    recommendation: dict[str, Any] | None = None
+    dataset_summary: dict[str, Any] | None = None
+    target_namespace: str | None = None
+    target_repo_id: str | None = None
+    target_bucket: str | None = None
+    include_fallbacks: bool = False
+    force_refresh: bool = False
+    timeout_seconds: int | None = Field(default=None, ge=1, le=60)
+    allow_unknown_override: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionInfo(BaseModel):

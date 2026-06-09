@@ -69,6 +69,12 @@ Examples:
   warning.
 - Unknown quota is displayed as a warning rather than inferred.
 
+Phase 7b can perform static advisory fallback verification during manual
+training preflight when `include_fallbacks=true`. Verified fallbacks are exposed
+as preflight metadata only: they are not automatically launched, not substituted
+for the primary selection, and still require explicit approval before any
+provider job.
+
 ## Output Policy
 
 Sensitive or regulated domains default to `cloud-private`.
@@ -101,8 +107,34 @@ include:
 - `fallback_recommended`
 - `quota_warning_recorded`
 
+Phase 7b preflight results are persisted separately from static planner
+recommendations. They can be fetched with:
+
+- `GET /api/session/{session_id}/preflight`
+- `GET /api/session/{session_id}/runs/{run_id}/preflight`
+
+The frontend may load persisted preflight results with GET on session/run reopen,
+but new or refreshed checks require a manual user action.
+
+## Phase 7b Preflight Boundary
+
+Training preflight is the readiness layer after this static planner. It verifies
+local consistency and, for supported providers, safe read-only metadata:
+
+- Hugging Face token/model/namespace/repo metadata.
+- Google Vertex AI credentials/project/region/API/GCS metadata.
+- AWS SageMaker credentials/STS/region/API/S3/execution-role metadata.
+
+Preflight does not launch provider jobs, create repos or buckets, upload files,
+download model weights, mutate IAM, run training, or execute fallback paths.
+`unknown` means the system could not prove readiness through the allowed
+read-only checks; it is not treated as passed.
+
 ## Limitations
 
-Phase 7 does not implement live provider quota APIs, live model benchmark APIs,
-actual gated-model access probing, live hardware availability probing, automatic
-fallback execution, or per-user/team policy controls.
+The static planner still does not implement live provider quota APIs, live model
+benchmark APIs, live hardware availability probing, automatic fallback execution,
+or per-user/team policy controls. Phase 7b adds read-only preflight coverage for
+selected provider metadata, but quota/billing/write readiness may remain unknown
+where proving them safely would require a write, resource creation, or unverified
+provider API.

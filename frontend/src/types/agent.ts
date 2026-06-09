@@ -17,6 +17,22 @@ export interface MessageMeta {
 export type CloudProviderId = 'hf-jobs' | 'gcp-vertex' | 'aws-sagemaker';
 export type TrainingGoal = 'smoke-test' | 'production' | 'agent-decide';
 export type OutputPolicy = 'cloud-private' | 'hf-hub' | 'cloud-and-hf-hub';
+export type TrainingPreflightStatus = 'not_run' | 'checking' | 'passed' | 'warning' | 'failed' | 'unknown' | 'skipped';
+export type TrainingPreflightSeverity = 'info' | 'warning' | 'error' | 'blocking';
+export type TrainingPreflightCheckCategory =
+  | 'credentials'
+  | 'identity'
+  | 'model_access'
+  | 'metadata'
+  | 'namespace'
+  | 'storage'
+  | 'api'
+  | 'hardware'
+  | 'quota'
+  | 'compatibility'
+  | 'output_policy'
+  | 'fallback'
+  | 'safety';
 
 export type DatasetSourceFormat = 'csv' | 'json' | 'jsonl' | 'pdf' | 'docx' | 'xlsx' | 'md';
 
@@ -52,6 +68,100 @@ export interface DatasetDiscoveryInfo {
   selected_candidate?: Record<string, unknown> | null;
   timestamp?: string | null;
   requires_user_selection?: boolean;
+}
+
+export interface TrainingPreflightCheck {
+  check_id: string;
+  provider: string;
+  category: TrainingPreflightCheckCategory | string;
+  label: string;
+  status: TrainingPreflightStatus | string;
+  severity: TrainingPreflightSeverity | string;
+  message: string;
+  details: Record<string, unknown>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  error_code?: string | null;
+  docs_verification_required: boolean;
+}
+
+export interface TrainingPreflightProviderResult {
+  provider: string;
+  status: TrainingPreflightStatus | string;
+  launch_ready: boolean;
+  checks: TrainingPreflightCheck[];
+  blocking_reasons: string[];
+  warning_reasons: string[];
+  unknown_reasons: string[];
+  metadata: Record<string, unknown>;
+}
+
+export interface TrainingPreflightFallbackResult {
+  fallback_id: string;
+  provider: string;
+  model_id?: string | null;
+  hardware_id?: string | null;
+  status: TrainingPreflightStatus | string;
+  launch_ready: boolean;
+  checks: TrainingPreflightCheck[];
+  reason?: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface TrainingPreflightCacheInfo {
+  cache_key?: string | null;
+  hit: boolean;
+  ttl_seconds?: number | null;
+  created_at?: string | null;
+  expires_at?: string | null;
+}
+
+export interface TrainingPreflightResult {
+  preflight_id: string;
+  session_id: string;
+  run_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  status: TrainingPreflightStatus | string;
+  launch_ready: boolean;
+  provider: string;
+  model_id: string;
+  hardware_id?: string | null;
+  output_policy: OutputPolicy | string;
+  primary: TrainingPreflightProviderResult;
+  fallbacks: TrainingPreflightFallbackResult[];
+  verified_fallback?: TrainingPreflightFallbackResult | null;
+  verified_recommendation?: Record<string, unknown> | null;
+  blocking_reasons: string[];
+  warning_reasons: string[];
+  unknown_reasons: string[];
+  safe_summary: string;
+  cache: TrainingPreflightCacheInfo;
+  metadata: Record<string, unknown> & {
+    provider_jobs_launched?: false;
+    resources_created?: false;
+    live_checks_optional?: true;
+  };
+}
+
+export interface TrainingPreflightRequest {
+  session_id: string;
+  run_id?: string | null;
+  provider?: CloudProviderId | string | null;
+  model_id?: string | null;
+  hardware_id?: string | null;
+  output_policy?: OutputPolicy | null;
+  recommendation?: Record<string, unknown> | null;
+  dataset_summary?: Record<string, unknown> | null;
+  target_namespace?: string | null;
+  target_repo_id?: string | null;
+  target_bucket?: string | null;
+  include_fallbacks?: boolean;
+  allow_unknown_override?: boolean;
+  force_refresh?: boolean;
+  timeout_seconds?: number | null;
+  metadata?: Record<string, unknown>;
 }
 
 export interface BackgroundRunProviderMetadata {
