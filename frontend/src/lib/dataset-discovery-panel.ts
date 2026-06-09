@@ -1,12 +1,29 @@
 type DiscoveryRecord = Record<string, unknown>;
 
 interface CandidateRecord {
-  name: string;
+  datasetId: string | null;
+  title: string;
   source: string;
   score: number | null;
+  relevanceScore: number | null;
+  licenseScore: number | null;
+  safetyScore: number | null;
+  schemaScore: number | null;
   reason: string | null;
   url: string | null;
+  repoId: string | null;
   license: string | null;
+  licenseStatus: string | null;
+  privacyStatus: string | null;
+  schemaStatus: string | null;
+  rowCount: number | null;
+  columns: string[];
+  textColumns: string[];
+  labelColumns: string[];
+  warnings: string[];
+  excluded: boolean;
+  exclusionReason: string | null;
+  loadDatasetSnippet: string | null;
   size: string | null;
   schemaHint: string[];
   qualityNotes: string[];
@@ -35,13 +52,21 @@ const SOURCE_LABELS: Record<string, string> = {
   kaggle: 'Kaggle',
 };
 
+const REDACTED = '[REDACTED]';
+const SECRET_RE = /\b(?:hf_[A-Za-z0-9_=-]+|sk-[A-Za-z0-9_-]+|[A-Za-z0-9_-]*secret[A-Za-z0-9_-]*)\b/gi;
+const ENV_SECRET_RE = /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL)[A-Z0-9_]*)\s*=\s*[^ \n\t]+/gi;
+
+function redactText(value: string): string {
+  return value.replace(ENV_SECRET_RE, `$1=${REDACTED}`).replace(SECRET_RE, REDACTED);
+}
+
 function isRecord(value: unknown): value is DiscoveryRecord {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function valueLabel(value: unknown): string | null {
   if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return redactText(value);
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return null;
 }
@@ -80,20 +105,68 @@ function stringList(value: unknown): string[] {
   return value.map(valueLabel).filter((item): item is string => !!item);
 }
 
+function riskList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (isRecord(item)) {
+        return getString(item, ['message', 'reason', 'category']);
+      }
+      return valueLabel(item);
+    })
+    .filter((item): item is string => !!item);
+}
+
+function getNumber(record: DiscoveryRecord, names: string[]): number | null {
+  const value = getValue(record, names);
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function scoreFrom(record: DiscoveryRecord, names: string[]): number | null {
+  const direct = getNumber(record, names);
+  if (direct !== null) return Math.max(0, Math.min(direct, 1));
+  const quality = getValue(record, ['quality_score', 'qualityScore']);
+  if (isRecord(quality)) {
+    const nested = getNumber(quality, names);
+    if (nested !== null) return Math.max(0, Math.min(nested, 1));
+  }
+  return null;
+}
+
 function normalizeCandidate(value: unknown): CandidateRecord | null {
   if (!isRecord(value)) return null;
-  const score = getValue(value, ['score']);
+  const score = scoreFrom(value, ['overall_score', 'overallScore', 'score']);
+  const datasetId = getString(value, ['dataset_id', 'datasetId']);
+  const title = getString(value, ['title', 'name']) ?? datasetId ?? 'Unnamed dataset';
+  const rowCount = getNumber(value, ['row_count', 'rowCount']);
   return {
-    name: getString(value, ['name']) ?? 'Unnamed dataset',
+    datasetId,
+    title,
     source: normalizeSource(getValue(value, ['source'])),
-    score: typeof score === 'number' && Number.isFinite(score) ? Math.max(0, Math.min(score, 1)) : null,
-    reason: getString(value, ['reason']),
-    url: getString(value, ['url']),
+    score,
+    relevanceScore: scoreFrom(value, ['relevance_score', 'relevanceScore']),
+    licenseScore: scoreFrom(value, ['license_score', 'licenseScore']),
+    safetyScore: scoreFrom(value, ['safety_score', 'safetyScore']),
+    schemaScore: scoreFrom(value, ['schema_score', 'schemaScore']),
+    reason: getString(value, ['reason']) ?? stringList(getValue(value, ['reasons']))[0] ?? null,
+    url: getString(value, ['url', 'source_url', 'sourceUrl']),
+    repoId: getString(value, ['repo_id', 'repoId']),
     license: getString(value, ['license']),
+    licenseStatus: getString(value, ['license_status', 'licenseStatus']),
+    privacyStatus: getString(value, ['privacy_status', 'privacyStatus']),
+    schemaStatus: getString(value, ['schema_status', 'schemaStatus']),
+    rowCount,
+    columns: stringList(getValue(value, ['columns'])),
+    textColumns: stringList(getValue(value, ['text_columns', 'textColumns'])),
+    labelColumns: stringList(getValue(value, ['label_columns', 'labelColumns'])),
+    warnings: stringList(getValue(value, ['warnings'])),
+    excluded: getValue(value, ['excluded']) === true,
+    exclusionReason: getString(value, ['exclusion_reason', 'exclusionReason']),
+    loadDatasetSnippet: getString(value, ['load_dataset_snippet', 'loadDatasetSnippet']),
     size: getString(value, ['size']),
     schemaHint: stringList(getValue(value, ['schemaHint', 'schema_hint'])),
     qualityNotes: stringList(getValue(value, ['qualityNotes', 'quality_notes'])),
-    risks: stringList(getValue(value, ['risks'])),
+    risks: riskList(getValue(value, ['risks'])),
   };
 }
 
@@ -142,15 +215,53 @@ function appendSection(lines: string[], title: string, items: string[]): void {
 
 function candidateSummary(candidate: CandidateRecord): string {
   const score = candidate.score === null ? 'score not provided' : `score ${candidate.score.toFixed(2)}`;
-  const parts = [`${candidate.name} (${sourceLabel(candidate.source)}, ${score})`];
+  const badges = [
+    candidate.excluded ? 'Excluded' : null,
+    candidate.datasetId ? null : null,
+  ].filter(Boolean);
+  const parts = [`${candidate.title}${badges.length ? ` [${badges.join(', ')}]` : ''} (${sourceLabel(candidate.source)}, ${score})`];
+  if (candidate.datasetId) parts.push(`Dataset ID: ${candidate.datasetId}`);
   if (candidate.reason) parts.push(`Reason: ${candidate.reason}`);
   if (candidate.url) parts.push(`URL: ${candidate.url}`);
-  if (candidate.license) parts.push(`License: ${candidate.license}`);
+  if (candidate.repoId) parts.push(`Repo: ${candidate.repoId}`);
+  if (candidate.license) parts.push(`License: ${candidate.license}${candidate.licenseStatus ? ` (${candidate.licenseStatus})` : ''}`);
+  if (candidate.licenseStatus) parts.push(`License ${candidate.licenseStatus}`);
+  if (candidate.privacyStatus) parts.push(`Privacy: ${candidate.privacyStatus}`);
+  if (candidate.privacyStatus) parts.push(`Privacy ${candidate.privacyStatus}`);
+  if (candidate.schemaStatus) parts.push(`Schema: ${candidate.schemaStatus}`);
+  if (candidate.schemaStatus) parts.push(`Schema ${candidate.schemaStatus}`);
+  if (candidate.score !== null) {
+    const scoreParts = [
+      `Overall ${candidate.score.toFixed(2)}`,
+      candidate.relevanceScore !== null ? `Relevance ${candidate.relevanceScore.toFixed(2)}` : null,
+      candidate.licenseScore !== null ? `License ${candidate.licenseScore.toFixed(2)}` : null,
+      candidate.safetyScore !== null ? `Privacy ${candidate.safetyScore.toFixed(2)}` : null,
+      candidate.schemaScore !== null ? `Schema ${candidate.schemaScore.toFixed(2)}` : null,
+    ].filter(Boolean);
+    parts.push(`Scores: ${scoreParts.join(', ')}`);
+  }
+  if (candidate.rowCount !== null) parts.push(`Rows: ${candidate.rowCount.toLocaleString('en-US')}`);
+  if (candidate.columns.length) parts.push(`Columns: ${candidate.columns.join(', ')}`);
   if (candidate.size) parts.push(`Size: ${candidate.size}`);
   if (candidate.schemaHint.length) parts.push(`Schema: ${candidate.schemaHint.join(', ')}`);
   if (candidate.qualityNotes.length) parts.push(`Quality: ${candidate.qualityNotes.join(', ')}`);
+  if (candidate.warnings.length) parts.push(`Warnings: ${candidate.warnings.join(', ')}`);
+  if (candidate.exclusionReason) parts.push(`Excluded: ${candidate.exclusionReason}`);
+  if (candidate.loadDatasetSnippet) parts.push(`load_dataset: ${candidate.loadDatasetSnippet}`);
   if (candidate.risks.length) parts.push(`Risks: ${candidate.risks.join(', ')}`);
   return parts.join(' · ');
+}
+
+function intentLines(record: DiscoveryRecord): string[] {
+  const intent = getValue(record, ['intent']);
+  if (!isRecord(intent)) return [];
+  const lines = [
+    getString(intent, ['domain']) ? `Domain: ${getString(intent, ['domain'])}` : null,
+    getString(intent, ['task_type', 'taskType']) ? `Task type: ${getString(intent, ['task_type', 'taskType'])}` : null,
+    getString(intent, ['target_provider', 'targetProvider']) ? `Provider: ${getString(intent, ['target_provider', 'targetProvider'])}` : null,
+    getString(intent, ['data_modality', 'dataModality']) ? `Modality: ${getString(intent, ['data_modality', 'dataModality'])}` : null,
+  ].filter((line): line is string => !!line);
+  return lines;
 }
 
 export function createDatasetDiscoveryPanel(input: unknown): DatasetDiscoveryPanel {
@@ -169,7 +280,10 @@ export function createDatasetDiscoveryPanel(input: unknown): DatasetDiscoveryPan
     ? (getValue(record, ['candidates']) as unknown[])
       .map(normalizeCandidate)
       .filter((candidate): candidate is CandidateRecord => !!candidate)
-      .sort((left, right) => (right.score ?? -1) - (left.score ?? -1))
+      .sort((left, right) => {
+        if (left.excluded !== right.excluded) return left.excluded ? 1 : -1;
+        return (right.score ?? -1) - (left.score ?? -1);
+      })
     : [];
 
   const allowedSourceLines = allowedSources.map(sourceLabel);
@@ -179,11 +293,22 @@ export function createDatasetDiscoveryPanel(input: unknown): DatasetDiscoveryPan
       : sourceLabel(source)
   ));
   const candidateLines = candidates.length
-    ? candidates.map(candidateSummary)
+    ? candidates.map((candidate) => {
+      const selected = isRecord(getValue(record, ['selected_candidate', 'selectedCandidate']))
+        && getString(getValue(record, ['selected_candidate', 'selectedCandidate']) as DiscoveryRecord, ['dataset_id', 'datasetId']) === candidate.datasetId;
+      const recommendedRecord = getValue(record, ['recommended_candidate', 'recommendedCandidate']);
+      const recommended = isRecord(recommendedRecord)
+        ? getString(recommendedRecord, ['dataset_id', 'datasetId']) === candidate.datasetId
+        : !candidate.excluded && candidates.find((item) => !item.excluded) === candidate;
+      const prefix = `${recommended ? 'Recommended · ' : ''}${selected ? 'Selected · ' : ''}`;
+      return `${prefix}${candidateSummary(candidate)}`;
+    })
     : ['No candidate datasets supplied yet. Search allowed public sources, then inspect schema, license, privacy, and quality before training.'];
-  const riskLines = candidates.flatMap((candidate) => candidate.risks);
+  const riskLines = candidates.flatMap((candidate) => [...candidate.risks, ...candidate.warnings]);
+  const extractedIntentLines = intentLines(record);
   const summaryLines = [
     'No uploaded dataset is attached. Dataset discovery is required before training.',
+    ...extractedIntentLines,
     `Allowed sources: ${allowedSourceLines.join(', ')}`,
     `Excluded sources: ${excludedSourceLines.join(', ')}`,
     'User selection required before training.',
@@ -197,6 +322,7 @@ export function createDatasetDiscoveryPanel(input: unknown): DatasetDiscoveryPan
   ];
   appendSection(lines, 'Allowed Sources', allowedSourceLines);
   appendSection(lines, 'Excluded Sources', excludedSourceLines);
+  appendSection(lines, 'Extracted Intent', extractedIntentLines);
   appendSection(lines, 'Candidate Datasets', candidateLines);
   appendSection(lines, 'Risks', riskLines);
   lines.push('', nextStepText);

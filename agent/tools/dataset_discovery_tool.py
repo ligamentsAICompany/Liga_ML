@@ -7,7 +7,7 @@ from typing import Any
 from agent.core.dataset_discovery import (
     DEFAULT_ALLOWED_SOURCES,
     DEFAULT_EXCLUDED_SOURCES,
-    build_dataset_discovery_plan,
+    build_dataset_discovery_result,
     format_dataset_discovery_plan,
 )
 from agent.tools.types import ToolResult
@@ -44,9 +44,14 @@ class DatasetDiscoveryTool:
             }
 
         candidates = params.get("candidates")
-        plan = build_dataset_discovery_plan(
-            domain=str(params.get("domain") or "general"),
-            task_type=str(params.get("task_type") or "general"),
+        domain = params.get("domain")
+        task_type = params.get("task_type")
+        plan = build_dataset_discovery_result(
+            query=str(params.get("query") or params.get("user_goal") or ""),
+            domain=domain if isinstance(domain, str) and domain.strip() else None,
+            task_type=task_type
+            if isinstance(task_type, str) and task_type.strip()
+            else None,
             provider=str(params.get("provider") or "hf-jobs"),
             user_goal=params.get("user_goal")
             if isinstance(params.get("user_goal"), str)
@@ -61,6 +66,7 @@ class DatasetDiscoveryTool:
         )
         return {
             "formatted": format_dataset_discovery_plan(plan),
+            "structured": plan.to_dict(),
             "totalResults": len(plan.candidates) or 1,
             "resultsShared": len(plan.candidates) or 1,
             "isError": False,
@@ -102,6 +108,10 @@ DATASET_DISCOVERY_TOOL_SPEC = {
                 "type": "string",
                 "description": "Short description of the user's training goal.",
             },
+            "query": {
+                "type": "string",
+                "description": "Raw user dataset request for deterministic intent extraction.",
+            },
             "uploaded_dataset_available": {
                 "type": "boolean",
                 "description": "Whether an uploaded normalized dataset already exists in session context.",
@@ -129,11 +139,23 @@ DATASET_DISCOVERY_TOOL_SPEC = {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
+                        "dataset_id": {"type": "string"},
                         "source": {"type": "string"},
+                        "source_url": {"type": "string"},
+                        "repo_id": {"type": "string"},
+                        "config": {"type": "string"},
+                        "split": {"type": "string"},
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
                         "url": {"type": "string"},
                         "domain": {"type": "string"},
                         "task_type": {"type": "string"},
                         "license": {"type": "string"},
+                        "row_count": {"type": "integer"},
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
                         "size": {"type": "string"},
                         "schema_hint": {
                             "type": "array",
@@ -158,7 +180,20 @@ DATASET_DISCOVERY_TOOL_SPEC = {
 }
 
 
-async def dataset_discovery_handler(arguments: dict[str, Any]) -> tuple[str, bool]:
+async def dataset_discovery_handler(
+    arguments: dict[str, Any],
+    session: Any = None,
+    tool_call_id: str | None = None,
+) -> tuple[str, bool]:
     tool = DatasetDiscoveryTool()
     result = await tool.execute(arguments)
+    structured = result.get("structured")
+    if session is not None and isinstance(structured, dict):
+        outputs = getattr(session, "_structured_tool_outputs", None)
+        if not isinstance(outputs, dict):
+            outputs = {}
+            setattr(session, "_structured_tool_outputs", outputs)
+        if tool_call_id:
+            outputs[tool_call_id] = structured
+        setattr(session, "latest_dataset_discovery", structured)
     return result["formatted"], not result.get("isError", False)

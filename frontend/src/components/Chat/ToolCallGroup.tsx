@@ -14,8 +14,20 @@ import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
 import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
 import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
+import {
+  buildManualPreflightRequest,
+  createManualPreflightErrorMarkdown,
+  createManualPreflightNotRunMarkdown,
+  loadPersistedTrainingPreflight,
+  PREFLIGHT_ACTION_COPY,
+  runManualTrainingPreflight,
+  type ManualPreflightState,
+} from '@/lib/training-preflight-action';
+import { getLatestSessionPreflight, getRunPreflight, runTrainingPreflight } from '@/lib/training-preflight-api';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
+import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
 import type { OutputPolicy, TrainingGoal } from '@/types/agent';
 import type { UIMessage } from 'ai';
 
@@ -25,16 +37,8 @@ import type { UIMessage } from 'ai';
 type DynamicToolPart = Extract<UIMessage['parts'][number], { type: 'dynamic-tool' }>;
 
 type ToolPartState = DynamicToolPart['state'];
-const SECRET_KEY_PATTERN = /token|secret|password|credential|private_key/i;
-
 function maskSensitiveParameters(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(maskSensitiveParameters);
-  if (!value || typeof value !== 'object') return value;
-  const masked: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    masked[key] = SECRET_KEY_PATTERN.test(key) ? '[REDACTED]' : maskSensitiveParameters(entry);
-  }
-  return masked;
+  return redactJsonLike(value);
 }
 
 /** Check if a tool part was cancelled (output-error with cancellation message). */
@@ -511,6 +515,14 @@ function createPreflightPanel(
       ...(input ? { input: { content: JSON.stringify(input, null, 2), language: 'json' } } : {}),
     };
   }
+  if (toolName === 'training_preflight') {
+    const panel = createTrainingPreflightPanel(output as Parameters<typeof createTrainingPreflightPanel>[0]);
+    return {
+      title: 'Training Preflight',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(input ? { input: { content: redactedJsonString(input), language: 'json' } } : {}),
+    };
+  }
   if (toolName === 'dataset_discovery') {
     const panel = createDatasetDiscoveryPanel(output ?? input ?? {});
     return {
@@ -548,7 +560,7 @@ function InlineApproval({
 
   const handleScriptClick = useCallback(() => {
     if (toolName === 'hf_jobs' && args?.script) {
-      const scriptContent = getEditedScript(toolCallId) || String(args.script);
+      const scriptContent = redactText(getEditedScript(toolCallId) || String(args.script));
       setPanel(
         { title: scriptLabel, script: { content: scriptContent, language: 'python' }, parameters: { tool_call_id: toolCallId } },
         'script',
@@ -570,7 +582,7 @@ function InlineApproval({
       const awsPanel = createAwsSageMakerRunPanel(args);
       if (!awsPanel) return;
       setPanel(
-        { ...awsPanel.data, parameters: { ...args, tool_call_id: toolCallId } },
+        { ...awsPanel.data, parameters: redactJsonLike({ ...args, tool_call_id: toolCallId }) as Record<string, unknown> },
         awsPanel.view,
         awsPanel.editable,
       );
@@ -594,7 +606,31 @@ function InlineApproval({
           }}
         >
           <Typography variant="body2" sx={{ fontSize: '0.72rem' }}>
-            YOLO paused: {autoApproval.reason || 'manual approval required.'}
+            {autoApproval.reason ? `Budget warning: ${autoApproval.reason}` : 'Estimated cost is shown for manual approval.'}
+          </Typography>
+        </Alert>
+      )}
+
+      {autoApproval?.estimatedCostUsd !== undefined && autoApproval.estimatedCostUsd !== null && (
+        <Alert
+          severity="info"
+          sx={{
+            mb: 1.5,
+            py: 0.5,
+            bgcolor: 'rgba(59,130,246,0.08)',
+            border: '1px solid rgba(59,130,246,0.18)',
+            color: 'var(--text)',
+          }}
+        >
+          <Typography variant="body2" sx={{ fontSize: '0.72rem' }}>
+            Estimated cost, not final bill:{' '}
+            <Box component="span" sx={{ color: 'var(--accent-yellow)', fontWeight: 600 }}>
+              ${autoApproval.estimatedCostUsd.toFixed(2)}
+            </Box>
+            {autoApproval.remainingCapUsd !== undefined && autoApproval.remainingCapUsd !== null && (
+              <> · Budget cap remaining: ${autoApproval.remainingCapUsd.toFixed(2)}</>
+            )}
+            {' '}· Actual cost tracking unavailable until provider billing integration is added.
           </Typography>
         </Alert>
       )}
@@ -674,7 +710,7 @@ function InlineApproval({
                   wordBreak: 'break-all',
                 }}
               >
-                {String(args.script).trim()}
+                {redactText(String(args.script)).trim()}
               </Box>
               <Typography
                 variant="caption"
@@ -863,6 +899,7 @@ const EMPTY_AGENTS: Record<string, ResearchAgentState> = {};
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
   const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getJobRuntimeState, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
+  const activeSessionId = useAgentStore(s => s.activeSessionId);
   const researchAgents = useAgentStore(s => {
     const activeId = s.activeSessionId;
     return (activeId && s.sessionStates[activeId]?.researchAgents) || EMPTY_AGENTS;
@@ -893,6 +930,82 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
 
   // ── Panel lock state (for auto-follow vs user-selected) ───────────
   const [lockedToolId, setLockedToolId] = useState<string | null>(null);
+  const [preflightStates, setPreflightStates] = useState<Record<string, ManualPreflightState>>({});
+
+  const loadedPreflightKeysRef = useRef<Set<string>>(new Set());
+
+  function preflightRunId(tool: DynamicToolPart): string | undefined {
+    const input = tool.input as Record<string, unknown> | undefined;
+    return typeof input?.run_id === 'string'
+      ? input.run_id
+      : typeof input?.runId === 'string'
+        ? input.runId
+        : undefined;
+  }
+
+  const handleRunPreflight = useCallback(
+    async (tool: DynamicToolPart, options: { forceRefresh?: boolean } = {}) => {
+      if (!activeSessionId) {
+        const markdown = createManualPreflightErrorMarkdown('No active session is available for preflight.');
+        setPreflightStates(prev => ({
+          ...prev,
+          [tool.toolCallId]: {
+            status: 'error',
+            disabled: false,
+            error: 'No active session is available for preflight.',
+            markdown,
+          },
+        }));
+        setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+        setRightPanelOpen(true);
+        return;
+      }
+
+      const input = tool.input as Record<string, unknown> | undefined;
+      const runId = preflightRunId(tool);
+      const request = buildManualPreflightRequest({
+        sessionId: activeSessionId,
+        runId,
+        plannerOutput: tool.output,
+        plannerInput: input,
+        forceRefresh: options.forceRefresh === true,
+      });
+
+      await runManualTrainingPreflight({
+        request,
+        run: runTrainingPreflight,
+        onStateChange: (next) => {
+          setPreflightStates(prev => ({ ...prev, [tool.toolCallId]: next }));
+          if (next.markdown) {
+            setPanel({ title: 'Training Preflight', output: { content: next.markdown, language: 'markdown' } }, 'output');
+            setRightPanelOpen(true);
+          }
+        },
+      });
+    },
+    [activeSessionId, setPanel, setRightPanelOpen],
+  );
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    for (const tool of tools) {
+      if (tool.toolName !== 'training_planner') continue;
+      const runId = preflightRunId(tool);
+      const key = `${activeSessionId}:${tool.toolCallId}:${runId ?? 'session'}`;
+      if (loadedPreflightKeysRef.current.has(key)) continue;
+      loadedPreflightKeysRef.current.add(key);
+
+      void loadPersistedTrainingPreflight({
+        sessionId: activeSessionId,
+        runId,
+        getLatest: getLatestSessionPreflight,
+        getRun: getRunPreflight,
+        onStateChange: (next) => {
+          setPreflightStates(prev => ({ ...prev, [tool.toolCallId]: next }));
+        },
+      });
+    }
+  }, [activeSessionId, tools]);
 
   // Reset submission state when new (unseen) pending tools arrive — e.g. second approval round
   useEffect(() => {
@@ -1048,12 +1161,12 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       if (tool.toolName === 'hf_jobs' && args?.script) {
         const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
         const hasOutput = (tool.state === 'output-available' || tool.state === 'output-error') && jobOutput;
-        const scriptContent = getEditedScript(tool.toolCallId) || String(args.script);
+        const scriptContent = redactText(getEditedScript(tool.toolCallId) || String(args.script));
         setPanel(
           {
             title: displayName,
             script: { content: scriptContent, language: 'python' },
-            ...(hasOutput ? { output: { content: String(jobOutput), language: 'markdown' } } : {}),
+            ...(hasOutput ? { output: { content: redactText(String(jobOutput)), language: 'markdown' } } : {}),
             parameters: { tool_call_id: tool.toolCallId },
           },
           hasOutput ? 'output' : 'script',
@@ -1081,7 +1194,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 : vertexPanel.data.output
                   ? { output: vertexPanel.data.output }
                   : {}),
-              parameters: { ...args, tool_call_id: tool.toolCallId },
+              parameters: redactJsonLike({ ...args, tool_call_id: tool.toolCallId }) as Record<string, unknown>,
             },
             outputContent && tool.state === 'output-error' ? 'output' : vertexPanel.view,
             false,
@@ -1096,7 +1209,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
-              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+              input: { content: redactedJsonString(args), language: 'json' },
             },
             'output',
           );
@@ -1124,7 +1237,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                 : awsPanel.data.output
                   ? { output: awsPanel.data.output }
                   : {}),
-              parameters: { ...args, tool_call_id: tool.toolCallId },
+              parameters: redactJsonLike({ ...args, tool_call_id: tool.toolCallId }) as Record<string, unknown>,
             },
             outputContent && tool.state === 'output-error' ? 'output' : awsPanel.view,
             false,
@@ -1139,7 +1252,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
-              input: { content: JSON.stringify(args, null, 2), language: 'json' },
+              input: { content: redactedJsonString(args), language: 'json' },
             },
             'output',
           );
@@ -1156,14 +1269,14 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         return;
       }
 
-      const inputSection = args ? { content: JSON.stringify(args, null, 2), language: 'json' } : undefined;
+      const inputSection = args ? { content: redactedJsonString(args), language: 'json' } : undefined;
 
       const hasCompleted = tool.state === 'output-available' || tool.state === 'output-error' || tool.state === 'output-denied';
 
       if (outputText) {
         // Tool has output - show it (regardless of state)
         let language = 'text';
-        const content = String(outputText);
+        const content = redactText(String(outputText));
         if (content.trim().startsWith('{') || content.trim().startsWith('[')) language = 'json';
         else if (content.includes('```')) language = 'markdown';
 
@@ -1175,7 +1288,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       } else if (hasCompleted && args) {
         // Tool completed but has no output - show input as fallback
-        setPanel({ title: displayName, output: { content: JSON.stringify(args, null, 2), language: 'json' }, input: inputSection }, 'output');
+        setPanel({ title: displayName, output: { content: redactedJsonString(args), language: 'json' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       } else if (args) {
         const runningMessages = [
@@ -1247,8 +1360,8 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const urlMatch = output.match(/\*\*View at:\*\*\s*(https:\/\/[^\s\n]+)/);
     const statusMatch = output.match(/\*\*Final Status:\*\*\s*([^\n]+)/);
     return {
-      jobUrl: urlMatch?.[1],
-      jobStatus: statusMatch?.[1]?.trim(),
+      jobUrl: urlMatch?.[1] ? redactText(urlMatch[1]) : undefined,
+      jobStatus: statusMatch?.[1] ? redactText(statusMatch[1].trim()) : undefined,
     };
   }
 
@@ -1258,9 +1371,9 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const jobMatch = output.match(/\*\*Job:\*\*\s*([^\n]+)/);
     const outputDirMatch = output.match(/\*\*Output dir:\*\*\s*([^\n]+)/);
     return {
-      jobUrl: urlMatch?.[1],
-      jobName: jobMatch?.[1]?.trim(),
-      outputDir: outputDirMatch?.[1]?.trim(),
+      jobUrl: urlMatch?.[1] ? redactText(urlMatch[1]) : undefined,
+      jobName: jobMatch?.[1] ? redactText(jobMatch[1].trim()) : undefined,
+      outputDir: outputDirMatch?.[1] ? redactText(outputDirMatch[1].trim()) : undefined,
     };
   }
 
@@ -1272,11 +1385,11 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
     const outputMatch = output.match(/\*\*S3 output URI:\*\*\s*`?([^`\n]+)`?/);
     const artifactMatch = output.match(/\*\*S3 model artifact:\*\*\s*`?([^`\n]+)`?/);
     return {
-      jobUrl: consoleMatch?.[1],
-      jobName: jobMatch?.[1]?.trim(),
-      s3OutputUri: outputMatch?.[1]?.trim(),
-      s3ModelArtifact: artifactMatch?.[1]?.trim(),
-      cloudWatchLogsUrl: logsMatch?.[1],
+      jobUrl: consoleMatch?.[1] ? redactText(consoleMatch[1]) : undefined,
+      jobName: jobMatch?.[1] ? redactText(jobMatch[1].trim()) : undefined,
+      s3OutputUri: outputMatch?.[1] ? redactText(outputMatch[1].trim()) : undefined,
+      s3ModelArtifact: artifactMatch?.[1] ? redactText(artifactMatch[1].trim()) : undefined,
+      cloudWatchLogsUrl: logsMatch?.[1] ? redactText(logsMatch[1]) : undefined,
     };
   }
 
@@ -1358,6 +1471,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             !!tool.input ||
             (!isProcessing && (state === 'input-available' || state === 'input-streaming'));
           const localDecision = decisions[tool.toolCallId];
+          const preflightState = preflightStates[tool.toolCallId] ?? { status: 'not_run' as const };
 
           const cancelled = isCancelledTool(tool);
           const currentlyHasError = state === 'output-error';
@@ -1644,6 +1758,132 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                   <OpenInNewIcon sx={{ fontSize: 14, color: 'var(--muted-text)', opacity: 0.6 }} />
                 )}
               </Stack>
+
+              {tool.toolName === 'training_planner' && (
+                <Box
+                  sx={{
+                    px: 1.5,
+                    pb: 1.25,
+                    pt: 0.25,
+                    borderTop: '1px solid rgba(255,255,255,0.03)',
+                    bgcolor: 'rgba(255,255,255,0.015)',
+                  }}
+                >
+                  <Stack
+                    direction={{ xs: 'column', sm: 'row' }}
+                    spacing={1}
+                    alignItems={{ xs: 'stretch', sm: 'center' }}
+                  >
+                    <Box sx={{ flex: 1, minWidth: 0 }}>
+                      <Typography
+                        variant="body2"
+                        sx={{ color: 'var(--text)', fontSize: '0.73rem', fontWeight: 600 }}
+                      >
+                        {PREFLIGHT_ACTION_COPY.staticNotVerified}
+                      </Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.25 }}
+                      >
+                        {PREFLIGHT_ACTION_COPY.notLaunch} {PREFLIGHT_ACTION_COPY.noJobs} {PREFLIGHT_ACTION_COPY.noResources}{' '}
+                        {PREFLIGHT_ACTION_COPY.unknownNotPassed} {PREFLIGHT_ACTION_COPY.approvalRequired}
+                      </Typography>
+                      {preflightState.status === 'checking' && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Preflight is running. Repeat clicks are disabled.
+                        </Typography>
+                      )}
+                      {preflightState.status === 'loading' && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Loading latest persisted preflight. This read-only lookup does not run preflight.
+                        </Typography>
+                      )}
+                      {preflightState.status === 'error' && preflightState.error && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--accent-red)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          {preflightState.error}
+                        </Typography>
+                      )}
+                      {preflightState.status === 'success' && preflightState.result && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: preflightState.result.launch_ready ? 'var(--accent-green)' : 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.5 }}
+                        >
+                          Latest preflight: {String(preflightState.result.status)} · launch_ready={String(preflightState.result.launch_ready)}
+                        </Typography>
+                      )}
+                      {preflightState.status === 'success' && preflightState.result && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--muted-text)', fontSize: '0.67rem', mt: 0.25 }}
+                        >
+                          Updated at: {String(preflightState.result.updated_at)} · Stored preflight may be stale.
+                        </Typography>
+                      )}
+                    </Box>
+                    <Button
+                      size="small"
+                      disabled={preflightState.status === 'checking' || preflightState.status === 'loading' || !activeSessionId}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleRunPreflight(tool, { forceRefresh: preflightState.status === 'success' });
+                      }}
+                      sx={{
+                        textTransform: 'none',
+                        color: 'var(--accent-yellow)',
+                        border: '1px solid rgba(255,193,59,0.35)',
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        px: 1.5,
+                        py: 0.6,
+                        borderRadius: '8px',
+                        whiteSpace: 'nowrap',
+                        '&:hover': { bgcolor: 'rgba(255,193,59,0.08)', borderColor: 'var(--accent-yellow)' },
+                        '&.Mui-disabled': { color: 'var(--muted-text)', borderColor: 'var(--tool-border)', opacity: 0.55 },
+                      }}
+                    >
+                      {preflightState.status === 'checking'
+                        ? 'Running preflight...'
+                        : preflightState.status === 'loading'
+                          ? 'Loading preflight...'
+                          : preflightState.status === 'success'
+                            ? 'Refresh preflight'
+                            : 'Run preflight check'}
+                    </Button>
+                    {(preflightState.status === 'not_run' || preflightState.status === 'success') && (
+                      <Button
+                        size="small"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          const markdown = preflightState.status === 'success' && preflightState.markdown
+                            ? preflightState.markdown
+                            : createManualPreflightNotRunMarkdown();
+                          setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+                          setRightPanelOpen(true);
+                        }}
+                        sx={{
+                          textTransform: 'none',
+                          color: 'var(--muted-text)',
+                          fontSize: '0.7rem',
+                          px: 1,
+                          whiteSpace: 'nowrap',
+                          '&:hover': { color: 'var(--text)', bgcolor: 'rgba(255,255,255,0.04)' },
+                        }}
+                      >
+                        {preflightState.status === 'success' ? 'View latest preflight' : 'View safety note'}
+                      </Button>
+                    )}
+                  </Stack>
+                </Box>
+              )}
 
               {/* Research sub-agent rolling steps (visible only while running) */}
               {tool.toolName === 'research' && !cancelled && state !== 'output-available' && state !== 'output-error' && state !== 'output-denied' && researchAgents[tool.toolCallId] && (

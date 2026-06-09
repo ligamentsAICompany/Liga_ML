@@ -131,6 +131,23 @@ def test_sft_template_writes_result_file_inside_uploaded_final_artifacts():
     assert 'print(f"LIGA_RESULT_FILE={RESULT_FILE_NAME}"' in script
 
 
+def test_sft_template_does_not_print_or_write_secret_values():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="example/dataset",
+            model_name="example/model",
+            hub_model_id="example/output-model",
+        )
+    )
+
+    assert "print(os.environ" not in script
+    assert "json.dump(os.environ" not in script
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in script
+    assert "HF_TOKEN_SECRET_RESOURCE could not be read" in script
+    assert 'f"{type(exc).__name__}: {exc}"' not in script
+    assert '"hf_token":' not in script.lower()
+
+
 def test_sft_template_formats_normalized_and_common_dataset_rows():
     script = build_sft_training_script(
         SftTemplateConfig(

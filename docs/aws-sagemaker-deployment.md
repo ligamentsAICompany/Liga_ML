@@ -35,6 +35,14 @@ workload identity/federation strategy. Do not commit `.env`, AWS config files,
 access keys, local datasets, `.playwright-mcp`, caches, or generated artifacts.
 Do not bake AWS credentials into the Docker image.
 
+For durable browser refresh/reconnect during planning and job monitoring, enable
+Phase 1 background runs with `BACKGROUND_RUNS_ENABLED=true`,
+`RUN_WORKER_MODE=in_process`, and a durable `MONGODB_URI`. The run ledger stores
+non-secret SageMaker job metadata such as job name, console URL, CloudWatch Logs
+URL, output policy, and artifact path. It does not persist AWS credentials or HF
+tokens. Configure `SESSION_TOKEN_ENCRYPTION_KEY` before any future encrypted
+token handoff is enabled. See `docs/background-runs.md`.
+
 ## IAM Roles
 
 The app runtime identity needs permission to inspect readiness locally and submit controlled jobs:

@@ -102,3 +102,39 @@ def test_training_planner_schema_is_read_only_recommend_only():
     operation = TRAINING_PLANNER_TOOL_SPEC["parameters"]["properties"]["operation"]
     assert operation["enum"] == ["recommend"]
     assert TRAINING_PLANNER_TOOL_SPEC["parameters"]["required"] == ["operation"]
+
+
+@pytest.mark.asyncio
+async def test_training_planner_handler_publishes_structured_recommendation():
+    class DummySession:
+        pass
+
+    session = DummySession()
+    output, ok = await training_planner_handler(
+        {
+            "operation": "recommend",
+            "provider": "aws-sagemaker",
+            "domain": "medical",
+            "training_goal": "production",
+            "dataset_summary": {"rows": 1_500},
+            "provider_readiness": {"aws-sagemaker": {"quota": {"ml.g5.xlarge": 0}}},
+        },
+        session=session,
+        tool_call_id="call_1",
+    )
+
+    assert ok is True
+    assert "Primary Recommendation" in output
+    structured = session._structured_tool_outputs["call_1"]
+    assert structured["recommended_model"].startswith("Qwen/")
+    assert (
+        structured["recommendation"]["selected_provider"]["provider_id"]
+        == "aws-sagemaker"
+    )
+    assert structured["recommendation"]["selected_hardware"]["hardware_id"].endswith(
+        "ml.g4dn.xlarge"
+    )
+    assert (
+        structured["recommendation"]["recommended_evaluation_profile"]
+        == "safety_privacy_review"
+    )

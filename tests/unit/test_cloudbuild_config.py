@@ -63,9 +63,24 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
         "AWS_DEFAULT_MAX_RUN_SECONDS",
         "AWS_OUTPUT_POLICY",
         "ML_INTERN_KPIS_DISABLED",
+        "BACKGROUND_RUNS_ENABLED",
+        "RUN_WORKER_MODE",
+        "USAGE_DASHBOARD_ENABLED",
+        "AUDIT_TIMELINE_ENABLED",
+        "AUDIT_EVENT_RETENTION_DAYS",
+        "DEFAULT_DAILY_BUDGET_USD",
+        "DEFAULT_MONTHLY_BUDGET_USD",
+        "HF_DAILY_BUDGET_USD",
+        "GCLOUD_DAILY_BUDGET_USD",
+        "AWS_DAILY_BUDGET_USD",
     ]:
         assert f"{name}=" in env_vars
 
+    assert "BACKGROUND_RUNS_ENABLED=true" in env_vars
+    assert "RUN_WORKER_MODE=in_process" in env_vars
+    assert "USAGE_DASHBOARD_ENABLED=true" in env_vars
+    assert "AUDIT_TIMELINE_ENABLED=${_AUDIT_TIMELINE_ENABLED}" in env_vars
+    assert "AUDIT_EVENT_RETENTION_DAYS=${_AUDIT_EVENT_RETENTION_DAYS}" in env_vars
     assert "GOOGLE_APPLICATION_CREDENTIALS" not in deploy_args
 
 
@@ -82,6 +97,14 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert substitutions["_AWS_SECRET_ACCESS_KEY_SECRET"] == "aws-secret-access-key"
     assert substitutions["_AWS_SESSION_TOKEN_SECRET"] == ""
     assert "_MONGODB_URI_SECRET" in substitutions
+    assert "_SESSION_TOKEN_ENCRYPTION_KEY_SECRET" in substitutions
+    assert "_DEFAULT_DAILY_BUDGET_USD" in substitutions
+    assert "_DEFAULT_MONTHLY_BUDGET_USD" in substitutions
+    assert "_HF_DAILY_BUDGET_USD" in substitutions
+    assert "_GCLOUD_DAILY_BUDGET_USD" in substitutions
+    assert "_AWS_DAILY_BUDGET_USD" in substitutions
+    assert substitutions["_AUDIT_TIMELINE_ENABLED"] == "true"
+    assert substitutions["_AUDIT_EVENT_RETENTION_DAYS"] == "30"
 
     secrets_arg = _step_text(_deploy_step(config))
     assert "HF_TOKEN=${_HF_TOKEN_SECRET}:latest" in secrets_arg
@@ -97,6 +120,11 @@ def test_cloudbuild_uses_secret_manager_without_raw_secret_values() -> None:
     assert "AWS_SESSION_TOKEN=${_AWS_SESSION_TOKEN_SECRET}:latest" in secrets_arg
     assert 'if [ -n "${_MONGODB_URI_SECRET}" ]; then' in secrets_arg
     assert "MONGODB_URI=${_MONGODB_URI_SECRET}:latest" in secrets_arg
+    assert 'if [ -n "${_SESSION_TOKEN_ENCRYPTION_KEY_SECRET}" ]; then' in secrets_arg
+    assert (
+        "SESSION_TOKEN_ENCRYPTION_KEY=${_SESSION_TOKEN_ENCRYPTION_KEY_SECRET}:latest"
+        in secrets_arg
+    )
 
     forbidden = ["hf_", "github_pat_", "ghp_", "sk-"]
     assert all(marker not in rendered for marker in forbidden)

@@ -34,6 +34,16 @@ HF_TOKEN=<your-hugging-face-token>
 GITHUB_TOKEN=<github-personal-access-token>
 ML_INTERN_DEFAULT_MODEL_ID=moonshotai/Kimi-K2.6
 ML_INTERN_KPIS_DISABLED=1
+BACKGROUND_RUNS_ENABLED=false
+RUN_WORKER_MODE=disabled
+USAGE_DASHBOARD_ENABLED=true
+AUDIT_TIMELINE_ENABLED=true
+AUDIT_EVENT_RETENTION_DAYS=30
+DEFAULT_DAILY_BUDGET_USD=
+DEFAULT_MONTHLY_BUDGET_USD=
+HF_DAILY_BUDGET_USD=
+GCLOUD_DAILY_BUDGET_USD=
+AWS_DAILY_BUDGET_USD=
 
 # Optional: durable web sessions for hosted/Cloud Run deployments
 MONGODB_URI=<mongodb-connection-string>
@@ -58,6 +68,32 @@ AWS_OUTPUT_POLICY=aws-private
 ```
 
 If no `HF_TOKEN` is set, the CLI will prompt you to paste one on first launch. To get a GITHUB_TOKEN follow the tutorial [here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token).
+
+The hosted UI includes a Usage/Billing dashboard for HF Jobs, Vertex AI,
+SageMaker AI, and agent model usage. It uses approval estimates, conservative
+provider pricing metadata, and run events; it does not require live billing APIs
+or add payment subscriptions. See [`docs/usage-dashboard.md`](docs/usage-dashboard.md).
+
+The hosted UI also includes an internal Audit Timeline for session, dataset,
+approval, provider job, result, usage, and error history. It uses the same
+durable run/usage records, redacts secret-like metadata, and does not export to
+external observability vendors. See [`docs/audit-timeline.md`](docs/audit-timeline.md).
+
+When no uploaded dataset is attached, Liga ML can produce a no-upload Dataset
+Discovery recommendation before training approval. It extracts dataset intent,
+ranks safe public candidates, explains license/privacy/schema risks, persists
+the latest result in session/run state, and keeps Kaggle excluded as future work.
+See [`docs/dataset-discovery.md`](docs/dataset-discovery.md).
+
+The training planner uses a static model/provider/hardware catalog to recommend
+safe defaults, cost-aware hardware, output policies, warnings, and fallbacks
+before any approval-gated cloud job. See
+[`docs/model-provider-selection.md`](docs/model-provider-selection.md).
+
+Production/client deployments use a shared redaction policy for backend
+persistence and frontend rendering, private-by-default sandboxes, and safe
+security health diagnostics. See
+[`docs/security-hardening.md`](docs/security-hardening.md).
 
 ### Usage
 
@@ -278,7 +314,20 @@ Cloud Run should use at least 2 GiB memory, 2 CPU, a 3600 second timeout,
 concurrency around 20, port `8080`, Secret Manager for `OPENAI_API_KEY`,
 `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `GITHUB_TOKEN`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN`, plus normal env vars
-for non-secret provider configuration. Do not use
+for non-secret provider configuration. Local development keeps
+`BACKGROUND_RUNS_ENABLED=false` and `RUN_WORKER_MODE=disabled` for the old chat
+flow. Cloud Run production sets `BACKGROUND_RUNS_ENABLED=true` and
+`RUN_WORKER_MODE=in_process` to use the Phase 1 durable session/event replay
+path when MongoDB is configured. `RUN_WORKER_MODE=external_worker` is reserved
+and not implemented yet. Set `SESSION_TOKEN_ENCRYPTION_KEY` before any future
+encrypted token handoff is enabled; Phase 1 does not persist provider tokens in
+the run ledger. See `docs/background-runs.md` for the run APIs and replay model.
+Post-training evaluation is static and cost-free by default:
+`POST_TRAINING_EVAL_ENABLED=true`, `POST_TRAINING_EVAL_MODE=static`, and
+`POST_TRAINING_EVAL_USE_PAID_JUDGE=false`. It reviews completed training metadata
+and metrics without loading models or calling live endpoints; see
+[`docs/post-training-evaluation.md`](docs/post-training-evaluation.md).
+Do not use
 `GOOGLE_APPLICATION_CREDENTIALS` for Cloud Run production; attach an appropriate
 service account instead. Never commit `.env`, credential files, local datasets,
 `.playwright-mcp`, caches, or generated artifacts.

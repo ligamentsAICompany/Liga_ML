@@ -4,6 +4,10 @@
 
 export type EventType =
   | 'ready'
+  | 'run_created'
+  | 'run_started'
+  | 'run_complete'
+  | 'run_failed'
   | 'processing'
   | 'assistant_message'
   | 'assistant_chunk'
@@ -50,6 +54,7 @@ export interface ToolOutputEventData {
   tool: string;
   output: string;
   success: boolean;
+  structured?: Record<string, unknown> | null;
 }
 
 export interface ToolLogEventData {

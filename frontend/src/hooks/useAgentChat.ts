@@ -23,7 +23,9 @@ import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
 import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
+import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import { redactedJsonString } from '@/lib/redaction';
 import { shouldMarkModelUnavailable, normalizeLlmErrorType } from '@/lib/llm-error-recovery';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import type { ToolStateChangeEventData } from '@/types/events';
@@ -51,6 +53,14 @@ function createPreflightPanelData(toolName: string, output: unknown, args?: Reco
       title: 'Training Planner',
       output: { content: panel.markdown, language: 'markdown' },
       ...(args ? { input: { content: JSON.stringify(args, null, 2), language: 'json' } } : {}),
+    };
+  }
+  if (toolName === 'training_preflight') {
+    const panel = createTrainingPreflightPanel(output as Parameters<typeof createTrainingPreflightPanel>[0]);
+    return {
+      title: 'Training Preflight',
+      output: { content: panel.markdown, language: 'markdown' },
+      ...(args ? { input: { content: redactedJsonString(args), language: 'json' } } : {}),
     };
   }
   if (toolName === 'dataset_discovery') {
@@ -273,7 +283,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         for (const tool of tools) {
           store.setToolBudgetBlock(
             tool.tool_call_id,
-            tool.auto_approval_blocked
+            tool.auto_approval_blocked || tool.estimated_cost_usd !== undefined || tool.remaining_cap_usd !== undefined
               ? {
                   reason: tool.block_reason ?? null,
                   estimatedCostUsd: tool.estimated_cost_usd ?? null,
@@ -778,8 +788,17 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       try {
         const lastEventKey = `hf-agent-last-event:${sessionId}`;
         const lastSeq = localStorage.getItem(lastEventKey);
+        const runsRes = await apiFetch(`/api/session/${sessionId}/runs`, { signal });
+        const runs = runsRes.ok ? await runsRes.json().catch(() => []) : [];
+        const run = Array.isArray(runs)
+          ? runs.find((item) => item?.run_id && !['succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(item.status))) ||
+            runs.find((item) => item?.run_id)
+          : null;
         const qs = lastSeq ? `?after=${encodeURIComponent(lastSeq)}` : '';
-        const res = await apiFetch(`/api/events/${sessionId}${qs}`, {
+        const runQs = lastSeq ? `?since=${encodeURIComponent(lastSeq)}` : '';
+        const res = await apiFetch(run?.run_id
+          ? `/api/session/${sessionId}/runs/${run.run_id}/stream${runQs}`
+          : `/api/events/${sessionId}${qs}`, {
           headers: { 'Accept': 'text/event-stream' },
           signal,
         });

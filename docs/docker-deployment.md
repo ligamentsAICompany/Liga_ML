@@ -42,6 +42,8 @@ curl http://localhost:8080/
 `/api/health` is a local liveness check. `/api/health/providers` reports
 non-secret readiness for Hugging Face Jobs, Google Cloud Vertex AI, and AWS
 SageMaker AI without launching training jobs.
+`/api/health.security` reports only booleans for redaction, sandbox privacy, and
+token-encryption readiness; it never returns credential values.
 
 ## Required Environment Variables
 
@@ -61,6 +63,16 @@ OPENAI_API_KEY=
 GITHUB_TOKEN=
 ML_INTERN_DEFAULT_MODEL_ID=
 ML_INTERN_KPIS_DISABLED=
+BACKGROUND_RUNS_ENABLED=false
+RUN_WORKER_MODE=disabled
+USAGE_DASHBOARD_ENABLED=true
+AUDIT_TIMELINE_ENABLED=true
+AUDIT_EVENT_RETENTION_DAYS=30
+DEFAULT_DAILY_BUDGET_USD=
+DEFAULT_MONTHLY_BUDGET_USD=
+HF_DAILY_BUDGET_USD=
+GCLOUD_DAILY_BUDGET_USD=
+AWS_DAILY_BUDGET_USD=
 HF_TOKEN=
 HUGGINGFACE_HUB_TOKEN=
 ```
@@ -84,6 +96,8 @@ Session persistence:
 
 ```text
 MONGODB_URI=
+MONGODB_DB=liga_ml
+SESSION_TOKEN_ENCRYPTION_KEY=
 SESSION_STORE_PATH=/tmp/liga-ml-sessions
 ```
 
@@ -91,6 +105,26 @@ Use `MONGODB_URI` for durable hosted-session persistence across restarts. In
 production, `/api/health` and `/api/health/providers` report
 `session_store.durable=false` with a warning when MongoDB is not configured. The
 `SESSION_STORE_PATH` default is an ephemeral local path for Docker runtime files.
+Local/dev should keep `BACKGROUND_RUNS_ENABLED=false` and
+`RUN_WORKER_MODE=disabled` for the old chat flow. Cloud Run production can set
+`BACKGROUND_RUNS_ENABLED=true` with `RUN_WORKER_MODE=in_process` to persist
+`run_events`, support SSE replay/reconnect, and continue background-safe
+monitoring inside the same service when MongoDB is durable. `external_worker` is
+reserved for a future separate worker and is reported as not implemented. Phase 1
+does not persist provider tokens; configure `SESSION_TOKEN_ENCRYPTION_KEY` before
+any later encrypted token handoff is enabled. See `docs/background-runs.md`.
+
+The Usage/Billing dashboard is controlled by `USAGE_DASHBOARD_ENABLED` and the
+optional budget env vars above. These are not secrets. Missing budgets display
+`No budget configured`; estimates never require AWS Cost Explorer, GCP Cloud
+Billing, or Hugging Face billing APIs. See `docs/usage-dashboard.md`.
+
+The internal Audit Timeline is controlled by `AUDIT_TIMELINE_ENABLED` and
+`AUDIT_EVENT_RETENTION_DAYS`. It stores sanitized session, approval, provider
+job, usage, dataset, result, and error history in MongoDB when durable
+persistence is configured; otherwise it uses in-memory local fallback. It does
+not configure Sentry, Datadog, OpenTelemetry exporters, or billing APIs. See
+`docs/audit-timeline.md`.
 
 AWS SageMaker AI:
 
@@ -126,6 +160,11 @@ If the app needs a Hugging Face token inside Vertex jobs, use
 `HF_TOKEN_SECRET_RESOURCE` or Secret Manager-backed environment injection rather
 than writing the token into the repository or image.
 
+Sandbox Spaces are private by default and block default injection of provider
+credentials such as HF/OpenAI tokens, AWS keys, Google credential paths, and
+MongoDB URIs. See `docs/security-hardening.md` for the full redaction and
+sandbox contract.
+
 ## Cloud Run Notes
 
 The container listens on `0.0.0.0` and respects `$PORT`, defaulting to `8080`.
@@ -139,6 +178,10 @@ instances `1`, and port `8080`. Grant the Cloud Run service account the required
 Vertex AI, GCS, Artifact Registry, Cloud Logging, and Secret Manager permissions
 documented in `docs/google-cloud-deployment.md`, plus AWS runtime credentials
 documented in `docs/aws-sagemaker-deployment.md`.
+The default `cloudbuild.yaml` deployment enables Phase 1 background runs with
+`BACKGROUND_RUNS_ENABLED=true` and `RUN_WORKER_MODE=in_process`; durable replay
+still requires the `MONGODB_URI` Secret Manager mapping. It also enables the
+Usage dashboard and Audit Timeline with read-only internal stores.
 
 After deploy, verify:
 
@@ -149,8 +192,9 @@ curl "$SERVICE_URL/"
 ```
 
 Confirm the UI exposes Hugging Face Jobs, Google Cloud Vertex AI, AWS SageMaker
-AI, uploaded data controls, goal/storage controls, and provider panels without
-submitting or approving any paid training job.
+AI, uploaded data controls, goal/storage controls, provider panels, and the
+Usage/Billing dashboard plus Audit Timeline without submitting or approving any
+paid training job.
 
 ## Troubleshooting
 

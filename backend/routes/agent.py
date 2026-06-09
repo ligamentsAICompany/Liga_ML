@@ -37,16 +37,31 @@ from dataset_uploads import (
     push_dataset_upload_to_hub,
 )
 from models import (
+    AuditEvent,
+    AuditStoreHealth,
+    AuditSummary,
+    AuditTimelineResponse,
     ApprovalRequest,
     DatasetUploadResponse,
+    DatasetDiscoveryResponse,
     HealthResponse,
     LLMHealthResponse,
+    EvaluationSummary,
+    PostTrainingEvaluation,
+    RunEventInfo,
+    RunSummary,
+    SecurityHealth,
     SessionInfo,
     SessionNotificationsRequest,
     SessionResponse,
     SessionYoloRequest,
     SubmitRequest,
+    TrainingPreflightRequest,
+    TrainingPreflightResultModel,
     TruncateRequest,
+    UsageEntry,
+    UsageStoreHealth,
+    UsageSummary,
 )
 from responses_log import (
     build_responses_log,
@@ -64,12 +79,29 @@ from session_manager import (
 import user_quotas
 
 from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
+from agent.core.audit import (
+    audit_store_status,
+    audit_timeline_enabled,
+    build_audit_event,
+)
+from agent.core.background_runs import background_run_status, background_runs_in_process
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
 from agent.core.llm_params import _resolve_llm_params
+from agent.core.model_provider_selection import (
+    hardware_catalog,
+    model_catalog,
+    provider_catalog,
+)
+from agent.core.post_training_evaluation import build_post_training_evaluation
+from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event
 from agent.core.session_persistence import session_store_status
+from agent.core.training_preflight import (
+    run_training_preflight as execute_training_preflight,
+)
+from agent.core.usage import usage_dashboard_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +300,18 @@ def _user_hf_token(user: dict[str, Any] | None) -> str | None:
     return user.get(INTERNAL_HF_TOKEN_KEY)
 
 
+def security_health() -> SecurityHealth:
+    token_encryption_configured = bool(os.environ.get("SESSION_TOKEN_ENCRYPTION_KEY"))
+    return SecurityHealth(
+        redaction_enabled=True,
+        sandbox_private_default=True,
+        secret_persistence_allowed=False,
+        token_encryption_configured=token_encryption_configured,
+        encrypted_handoff_enabled=token_encryption_configured
+        and background_runs_in_process(),
+    )
+
+
 def _reject_oversize_dataset_upload(request: Request) -> None:
     raw_content_length = request.headers.get("content-length")
     if raw_content_length is None:
@@ -358,12 +402,216 @@ async def _check_session_access(
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
     store = session_manager.persistence_store
+    store_status = session_store_status(store)
     return HealthResponse(
         status="ok",
         active_sessions=session_manager.active_session_count,
         max_sessions=MAX_SESSIONS,
-        session_store=session_store_status(store),
+        session_store=store_status,
+        background_runs=background_run_status(store_status),
+        usage_store=usage_store_status(),
+        audit_store=audit_store_health(),
+        security=security_health(),
         cloud_run_revision=os.environ.get("K_REVISION"),
+    )
+
+
+def usage_store_status() -> UsageStoreHealth:
+    """Return non-secret usage ledger durability for health/API payloads."""
+    store_status = session_store_status(session_manager.persistence_store)
+    warning = (
+        None
+        if store_status["durable"]
+        else ("MONGODB_URI is not configured; usage entries are in-memory only.")
+    )
+    return UsageStoreHealth(
+        enabled=usage_dashboard_enabled(),
+        durable=bool(store_status["durable"]),
+        store=str(store_status["type"]),
+        warning=warning,
+    )
+
+
+def audit_store_health() -> AuditStoreHealth:
+    """Return non-secret audit timeline durability for health/API payloads."""
+    return AuditStoreHealth(
+        **audit_store_status(session_store_status(session_manager.persistence_store))
+    )
+
+
+def _safe_limit(limit: int = 100) -> int:
+    return max(1, min(int(limit or 100), 500))
+
+
+def _serialize_usage_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return sanitize_for_frontend(
+        {
+            key: (iso(value) if key.endswith("_at") else value)
+            for key, value in entry.items()
+            if key not in {"_id", "schema_version"}
+        }
+    )
+
+
+def _serialize_audit_event(event: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return sanitize_for_frontend(
+        {
+            key: (
+                iso(value)
+                if key in {"timestamp", "created_at", "updated_at"}
+                else value
+            )
+            for key, value in event.items()
+            if key
+            not in {
+                "_id",
+                "schema_version",
+                "idempotency_key",
+                "created_at",
+                "updated_at",
+            }
+        }
+    )
+
+
+def _audit_filters(
+    *,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 100,
+) -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "run_id": run_id,
+        "provider": provider,
+        "category": category,
+        "severity": severity,
+        "status": status,
+        "since": since,
+        "until": until,
+        "limit": _safe_limit(limit),
+    }
+
+
+def _audit_timeline_response(events: list[dict[str, Any]]) -> AuditTimelineResponse:
+    return AuditTimelineResponse(
+        enabled=audit_timeline_enabled(),
+        audit_store=audit_store_health(),
+        events=[AuditEvent(**_serialize_audit_event(event)) for event in events],
+    )
+
+
+def _audit_summary_response(raw: dict[str, Any]) -> AuditSummary:
+    events = [
+        AuditEvent(**_serialize_audit_event(event)) for event in raw.get("events", [])
+    ]
+    by_session: dict[str, list[AuditEvent]] = {}
+    by_run: dict[str, list[AuditEvent]] = {}
+    for event in events:
+        by_session.setdefault(event.session_id, []).append(event)
+        if event.run_id:
+            by_run.setdefault(event.run_id, []).append(event)
+    return AuditSummary(
+        enabled=audit_timeline_enabled(),
+        total_events=raw.get("total_events", 0),
+        counts_by_category=raw.get("counts_by_category", {}),
+        counts_by_severity=raw.get("counts_by_severity", {}),
+        counts_by_provider=raw.get("counts_by_provider", {}),
+        latest_warnings_errors=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("latest_warnings_errors", [])
+        ],
+        provider_job_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("provider_job_timeline", [])
+        ],
+        approval_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("approval_timeline", [])
+        ],
+        dataset_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("dataset_timeline", [])
+        ],
+        usage_cost_timeline=[
+            AuditEvent(**_serialize_audit_event(event))
+            for event in raw.get("usage_cost_timeline", [])
+        ],
+        timeline_by_session=by_session,
+        timeline_by_run=by_run,
+        audit_store=audit_store_health(),
+    )
+
+
+def _serialize_evaluation(evaluation: dict[str, Any]) -> dict[str, Any]:
+    def iso(value: Any) -> str | None:
+        return (
+            value.isoformat()
+            if hasattr(value, "isoformat")
+            else (str(value) if value else None)
+        )
+
+    return sanitize_for_frontend(
+        {
+            key: (iso(value) if key.endswith("_at") else value)
+            for key, value in evaluation.items()
+            if key not in {"_id", "schema_version"}
+        }
+    )
+
+
+def _evaluation_summary_response(raw: dict[str, Any]) -> EvaluationSummary:
+    evaluations = [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in raw.get("evaluations", [])
+    ]
+    latest = raw.get("latest_evaluation")
+    return EvaluationSummary(
+        total_evaluations=raw.get("total_evaluations", 0),
+        counts_by_status=raw.get("counts_by_status", {}),
+        average_overall_score=raw.get("average_overall_score"),
+        latest_evaluation=PostTrainingEvaluation(**_serialize_evaluation(latest))
+        if isinstance(latest, dict)
+        else None,
+        evaluations=evaluations,
+    )
+
+
+def _usage_summary_payload(
+    raw: dict[str, Any], provider_readiness: dict[str, Any] | None = None
+) -> UsageSummary:
+    entries = [_serialize_usage_entry(item) for item in raw.get("entries", [])]
+    return UsageSummary(
+        total_estimated_cost_usd=raw.get("total_estimated_cost_usd", 0.0),
+        total_known_cost_usd=raw.get("total_known_cost_usd", 0.0),
+        cost_by_provider=raw.get("cost_by_provider", {}),
+        cost_by_session=raw.get("cost_by_session", {}),
+        cost_by_run=raw.get("cost_by_run", {}),
+        recent_usage_entries=[UsageEntry(**entry) for entry in entries],
+        quota_warnings=raw.get("quota_warnings", []),
+        budget_warnings=raw.get("budget_warnings", []),
+        provider_readiness=provider_readiness or {},
+        usage_store=usage_store_status(),
     )
 
 
@@ -439,7 +687,631 @@ async def provider_health() -> dict[str, Any]:
         "gcp_vertex": build_gcp_vertex_readiness_snapshot(),
         "aws_sagemaker": build_aws_sagemaker_readiness_snapshot(),
         "session_store": session_store_status(session_manager.persistence_store),
+        "audit_store": audit_store_health().model_dump(),
+        "security": security_health().model_dump(),
     }
+
+
+@router.get("/model-catalog")
+async def get_model_catalog(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Return the static planner model catalog."""
+    _ = user
+    return {
+        "models": [model.to_dict() for model in model_catalog()],
+        "live_access_probed": False,
+    }
+
+
+@router.get("/provider-catalog")
+async def get_provider_catalog(
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return the static planner provider catalog."""
+    _ = user
+    return {
+        "providers": [provider.to_dict() for provider in provider_catalog()],
+        "readiness": await provider_health(),
+        "live_quota_api_used": False,
+    }
+
+
+@router.get("/hardware-catalog")
+async def get_hardware_catalog(
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return the static planner hardware catalog."""
+    _ = user
+    return {
+        "hardware": [hardware.to_dict() for hardware in hardware_catalog()],
+        "live_availability_probed": False,
+    }
+
+
+@router.get("/usage", response_model=list[UsageEntry])
+async def list_usage(
+    provider: str | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    """List non-secret usage ledger entries."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
+
+
+@router.get("/usage/summary", response_model=UsageSummary)
+async def usage_summary(
+    provider: str | None = None,
+    session_id: str | None = None,
+    run_id: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> UsageSummary:
+    """Summarize estimated/known usage without live billing API calls."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    raw = await session_manager.usage_summary(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return _usage_summary_payload(raw, provider_readiness=await provider_health())
+
+
+@router.get("/usage/providers")
+async def usage_providers(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Provider readiness and usage-store durability for the dashboard."""
+    _ = user
+    summary = await session_manager.usage_summary(limit=500)
+    return {
+        "enabled": usage_dashboard_enabled(),
+        "usage_store": usage_store_status().model_dump(),
+        "provider_readiness": await provider_health(),
+        "cost_by_provider": summary.get("cost_by_provider", {}),
+        "no_live_billing_api_configured": True,
+        "notes": [
+            "Estimated cost, not final bill",
+            "Actual provider billing may differ",
+            "Quota status may be unknown unless provider reports it",
+        ],
+    }
+
+
+@router.get("/audit", response_model=AuditTimelineResponse)
+async def list_audit(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    """List sanitized audit events for the internal timeline."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
+
+
+@router.get("/audit/summary", response_model=AuditSummary)
+async def audit_summary(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditSummary:
+    """Summarize sanitized audit events by category, severity, and provider."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_summary_response({"events": [], "total_events": 0})
+    raw = await session_manager.audit_summary(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_summary_response(raw)
+
+
+@router.get("/audit/providers")
+async def audit_providers(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Provider readiness and audit-store durability for the timeline UI."""
+    _ = user
+    raw = (
+        await session_manager.audit_summary(limit=500)
+        if audit_timeline_enabled()
+        else {"counts_by_provider": {}}
+    )
+    return {
+        "enabled": audit_timeline_enabled(),
+        "audit_store": audit_store_health().model_dump(),
+        "provider_readiness": await provider_health(),
+        "counts_by_provider": raw.get("counts_by_provider", {}),
+        "notes": [
+            "Internal audit timeline only",
+            "No external observability exporter configured",
+            "Sensitive metadata is redacted before persistence",
+        ],
+    }
+
+
+@router.get("/evaluations", response_model=list[PostTrainingEvaluation])
+async def list_evaluations(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[PostTrainingEvaluation]:
+    """List safe static post-training evaluations."""
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluations = await session_manager.list_evaluations(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in evaluations
+    ]
+
+
+@router.get("/evaluations/summary", response_model=EvaluationSummary)
+async def evaluations_summary(
+    session_id: str | None = None,
+    run_id: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> EvaluationSummary:
+    if session_id:
+        await _check_session_access(session_id, user, preload_sandbox=False)
+    raw = await session_manager.evaluation_summary(
+        session_id=session_id,
+        run_id=run_id,
+        provider=provider,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return _evaluation_summary_response(raw)
+
+
+@router.get(
+    "/session/{session_id}/evaluations", response_model=list[PostTrainingEvaluation]
+)
+async def list_session_evaluations(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> list[PostTrainingEvaluation]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluations = await session_manager.list_evaluations(
+        session_id=session_id, limit=500
+    )
+    return [
+        PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+        for evaluation in evaluations
+    ]
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/evaluation",
+    response_model=PostTrainingEvaluation,
+)
+async def get_run_evaluation(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> PostTrainingEvaluation:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    evaluation = await session_manager.get_evaluation_for_run(session_id, run_id)
+    if not evaluation:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+    return PostTrainingEvaluation(**_serialize_evaluation(evaluation))
+
+
+@router.get("/session/{session_id}/runs/{run_id}/evaluation/report")
+async def get_run_evaluation_report(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    evaluation = await get_run_evaluation(session_id, run_id, user)
+    return {
+        "evaluation_id": evaluation.evaluation_id,
+        "status": evaluation.status,
+        "report_markdown": evaluation.report_markdown or "",
+    }
+
+
+@router.get(
+    "/session/{session_id}/dataset-discovery",
+    response_model=DatasetDiscoveryResponse,
+)
+async def get_session_dataset_discovery(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> DatasetDiscoveryResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    discovery = await session_manager.get_latest_dataset_discovery(session_id)
+    if not discovery:
+        raise HTTPException(status_code=404, detail="Dataset discovery not found")
+    return DatasetDiscoveryResponse(**discovery)
+
+
+@router.get("/session/{session_id}/recommendations")
+async def get_session_recommendations(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    recommendation = await session_manager.get_latest_training_recommendation(
+        session_id
+    )
+    if not recommendation:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return recommendation
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/dataset-discovery",
+    response_model=DatasetDiscoveryResponse,
+)
+async def get_run_dataset_discovery(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> DatasetDiscoveryResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    discovery = await session_manager.get_run_dataset_discovery(session_id, run_id)
+    if not discovery:
+        raise HTTPException(status_code=404, detail="Dataset discovery not found")
+    return DatasetDiscoveryResponse(**discovery)
+
+
+@router.get("/session/{session_id}/runs/{run_id}/recommendations")
+async def get_run_recommendations(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    recommendation = await session_manager.get_run_training_recommendation(
+        session_id, run_id
+    )
+    if not recommendation:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return recommendation
+
+
+@router.post("/training-preflight", response_model=TrainingPreflightResultModel)
+async def run_training_preflight(
+    request: TrainingPreflightRequest,
+    http_request: Request = None,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    """Run training preflight without launching provider jobs."""
+
+    agent_session = await _check_session_access(
+        request.session_id,
+        user,
+        preload_sandbox=False,
+    )
+    recommendation = request.recommendation
+    if recommendation is None:
+        session_recommendation = getattr(
+            getattr(agent_session, "session", None),
+            "latest_training_recommendation",
+            None,
+        )
+        recommendation = (
+            sanitize_for_frontend(session_recommendation)
+            if isinstance(session_recommendation, dict)
+            else None
+        )
+    if recommendation is None:
+        recommendation = await session_manager.get_latest_training_recommendation(
+            request.session_id
+        )
+    dataset_discovery = await session_manager.get_latest_dataset_discovery(
+        request.session_id
+    )
+    hf_token = (
+        resolve_hf_request_token(http_request)
+        if http_request is not None
+        else (getattr(agent_session, "hf_token", None) or _user_hf_token(user))
+    )
+    gcp_project_id = (
+        request.metadata.get("gcp_project_id")
+        or request.metadata.get("project_id")
+        or request.metadata.get("google_cloud_project")
+    )
+    gcp_region = (
+        request.metadata.get("gcp_region")
+        or request.metadata.get("region")
+        or request.metadata.get("google_cloud_region")
+        or request.metadata.get("location")
+    )
+    aws_region = (
+        request.metadata.get("aws_region")
+        or request.metadata.get("region")
+        or request.metadata.get("aws_default_region")
+    )
+    aws_execution_role_arn = (
+        request.metadata.get("aws_execution_role_arn")
+        or request.metadata.get("execution_role_arn")
+        or request.metadata.get("sagemaker_role_arn")
+        or request.metadata.get("role_arn")
+    )
+    result = await execute_training_preflight(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        recommendation=recommendation,
+        dataset_summary=request.dataset_summary,
+        dataset_discovery=dataset_discovery,
+        target_namespace=request.target_namespace,
+        target_repo_id=request.target_repo_id,
+        target_bucket=request.target_bucket,
+        include_fallbacks=request.include_fallbacks,
+        force_refresh=request.force_refresh,
+        timeout_seconds=request.timeout_seconds,
+        metadata={
+            **request.metadata,
+            "agent_session_active": bool(getattr(agent_session, "is_active", False)),
+        },
+        allow_unknown_override=request.allow_unknown_override,
+        hf_token=hf_token,
+        gcp_project_id=str(gcp_project_id) if gcp_project_id else None,
+        gcp_region=str(gcp_region) if gcp_region else None,
+        aws_region=str(aws_region) if aws_region else None,
+        aws_execution_role_arn=str(aws_execution_role_arn)
+        if aws_execution_role_arn
+        else None,
+    )
+    saved = await session_manager.record_training_preflight(
+        session_id=request.session_id,
+        run_id=request.run_id,
+        preflight=result.to_dict(),
+    )
+    return TrainingPreflightResultModel(**saved)
+
+
+@router.get(
+    "/session/{session_id}/preflight", response_model=TrainingPreflightResultModel
+)
+async def get_session_preflight(
+    session_id: str,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    preflight = await session_manager.get_latest_training_preflight(session_id)
+    if not preflight:
+        raise HTTPException(status_code=404, detail="Training preflight not found")
+    return TrainingPreflightResultModel(**preflight)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/preflight",
+    response_model=TrainingPreflightResultModel,
+)
+async def get_run_preflight(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> TrainingPreflightResultModel:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    preflight = await session_manager.get_run_training_preflight(session_id, run_id)
+    if not preflight:
+        raise HTTPException(status_code=404, detail="Training preflight not found")
+    return TrainingPreflightResultModel(**preflight)
+
+
+@router.post(
+    "/session/{session_id}/runs/{run_id}/evaluation",
+    response_model=PostTrainingEvaluation,
+)
+async def trigger_run_evaluation(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> PostTrainingEvaluation:
+    """Idempotently create a static evaluation without paid inference."""
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    existing = await session_manager.get_evaluation_for_run(session_id, run_id)
+    if existing:
+        return PostTrainingEvaluation(**_serialize_evaluation(existing))
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    provider_metadata = (
+        run.get("provider_metadata")
+        if isinstance(run.get("provider_metadata"), dict)
+        else {}
+    )
+    artifact_ref = (
+        provider_metadata.get("artifact_path")
+        or run.get("provider_artifact_path")
+        or run.get("result_summary")
+    )
+    evaluation = build_post_training_evaluation(
+        {
+            "session_id": session_id,
+            "run_id": run_id,
+            "provider": run.get("provider"),
+            "job_id": run.get("active_provider_job_id"),
+            "model_ref": run.get("result_summary"),
+            "artifact_ref": artifact_ref,
+            "dataset_ref": provider_metadata.get("dataset_name"),
+            "training_status": run.get("status"),
+            "metadata": {
+                "manual_trigger": True,
+                "mode": "static",
+                "provider_metadata": provider_metadata,
+                "dataset_discovery": run.get("dataset_discovery"),
+            },
+        }
+    )
+    saved = await session_manager.upsert_evaluation(evaluation)
+    return PostTrainingEvaluation(**_serialize_evaluation(saved))
+
+
+@router.get("/session/{session_id}/audit", response_model=AuditTimelineResponse)
+async def list_session_audit(
+    session_id: str,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/audit", response_model=AuditTimelineResponse
+)
+async def list_run_audit(
+    session_id: str,
+    run_id: str,
+    provider: str | None = None,
+    category: str | None = None,
+    severity: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    since: str | None = None,
+    until: str | None = None,
+    user: dict = Depends(get_current_user),
+) -> AuditTimelineResponse:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not audit_timeline_enabled():
+        return _audit_timeline_response([])
+    events = await session_manager.list_audit_events(
+        **_audit_filters(
+            session_id=session_id,
+            run_id=run_id,
+            provider=provider,
+            category=category,
+            severity=severity,
+            status=status,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    return _audit_timeline_response(events)
+
+
+@router.get("/session/{session_id}/usage", response_model=list[UsageEntry])
+async def list_session_usage(
+    session_id: str,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/usage", response_model=list[UsageEntry]
+)
+async def list_run_usage(
+    session_id: str,
+    run_id: str,
+    provider: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+    user: dict = Depends(get_current_user),
+) -> list[UsageEntry]:
+    await _check_session_access(session_id, user, preload_sandbox=False)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    entries = await session_manager.list_usage_entries(
+        provider=provider,
+        session_id=session_id,
+        run_id=run_id,
+        status=status,
+        limit=_safe_limit(limit),
+    )
+    return [UsageEntry(**_serialize_usage_entry(entry)) for entry in entries]
 
 
 def _active_response_sessions(user_id: str) -> list[dict[str, Any]]:
@@ -949,6 +1821,7 @@ async def get_session(
     """Get session information. Only accessible by the session owner."""
     await _check_session_access(session_id, user)
     info = session_manager.get_session_info(session_id)
+    info["runs"] = await session_manager.list_runs(session_id)
     return SessionInfo(**info)
 
 
@@ -1044,6 +1917,7 @@ async def upload_session_dataset(
 ) -> DatasetUploadResponse:
     """Upload a CSV/JSON dataset file to a private Hub dataset for this session."""
     file: UploadFile | None = None
+    filename_for_audit: str | None = None
     try:
         _reject_oversize_dataset_upload(request)
         agent_session = await _check_session_access(session_id, user, request)
@@ -1077,6 +1951,22 @@ async def upload_session_dataset(
             max_part_size=MAX_DATASET_UPLOAD_BYTES,
         )
         file = _dataset_upload_file_from_form(form)
+        filename_for_audit = file.filename
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_started",
+                category="dataset",
+                status="started",
+                actor="user",
+                title="Dataset upload started",
+                message=f"Dataset upload started for {filename_for_audit}.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+            )
+        )
         hf_username = user.get("username") or agent_session.hf_username
         uploaded = await push_dataset_upload_to_hub(
             upload=file,
@@ -1099,8 +1989,48 @@ async def upload_session_dataset(
             uploaded.repo_id,
             session_id,
         )
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_succeeded",
+                category="dataset",
+                status="succeeded",
+                actor="system",
+                title="Dataset uploaded",
+                message=f"Dataset {uploaded.filename} uploaded and normalized.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=uploaded.upload_id,
+                dataset_name=uploaded.filename,
+                artifact_url=uploaded.hub_url,
+                safe_metadata={
+                    "repo_id": uploaded.repo_id,
+                    "normalized_row_count": uploaded.normalized_row_count,
+                    "source_format": uploaded.source_format,
+                    "size_bytes": uploaded.size_bytes,
+                },
+            )
+        )
         return DatasetUploadResponse(**uploaded.response_payload())
-    except HTTPException:
+    except HTTPException as e:
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="warning" if e.status_code < 500 else "error",
+                status="failed",
+                actor="system",
+                title="Dataset upload failed",
+                message=str(e.detail),
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=str(e.status_code),
+                error_summary=str(e.detail)[:500],
+            )
+        )
         raise
     except HfHubHTTPError as e:
         logger.warning(
@@ -1109,9 +2039,45 @@ async def upload_session_dataset(
             getattr(e.response, "status_code", None),
             getattr(e, "request_id", None),
         )
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="error",
+                status="failed",
+                actor="provider",
+                title="Dataset upload failed",
+                message="Hugging Face Hub rejected the dataset upload.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=str(getattr(e.response, "status_code", "") or "hub_error"),
+                error_summary=str(e)[:500],
+            )
+        )
         raise _dataset_upload_hub_http_exception(e)
-    except Exception:
+    except Exception as e:
         logger.exception("Dataset upload failed for session %s", session_id)
+        await session_manager.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="dataset_upload_failed",
+                category="dataset",
+                severity="error",
+                status="failed",
+                actor="system",
+                title="Dataset upload failed",
+                message="Dataset upload failed before it could be attached.",
+                provider="hf-jobs",
+                entity_type="dataset_upload",
+                entity_id=filename_for_audit,
+                dataset_name=filename_for_audit,
+                error_code=type(e).__name__,
+                error_summary=str(e)[:500],
+            )
+        )
         raise HTTPException(
             status_code=502,
             detail="Dataset upload failed. Please try again.",
@@ -1180,7 +2146,64 @@ async def get_jobs_access_info(
 async def list_sessions(user: dict = Depends(get_current_user)) -> list[SessionInfo]:
     """List sessions belonging to the authenticated user."""
     sessions = await session_manager.list_sessions(user_id=user["user_id"])
+    for session in sessions:
+        session["runs"] = await session_manager.list_runs(session["session_id"])
     return [SessionInfo(**s) for s in sessions]
+
+
+@router.post("/session/{session_id}/runs", response_model=RunSummary)
+async def create_session_run(
+    session_id: str,
+    body: dict[str, Any] | None = None,
+    user: dict = Depends(get_current_user),
+) -> RunSummary:
+    """Create a durable run record without launching provider work."""
+    await _check_session_access(session_id, user)
+    payload = body or {}
+    run = await session_manager.create_run(
+        session_id,
+        provider=str(payload.get("provider") or "none"),
+        request_id=str(payload.get("request_id") or uuid.uuid4()),
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return RunSummary(**run)
+
+
+@router.get("/session/{session_id}/runs", response_model=list[RunSummary])
+async def list_session_runs(
+    session_id: str, user: dict = Depends(get_current_user)
+) -> list[RunSummary]:
+    await _check_session_access(session_id, user)
+    return [RunSummary(**run) for run in await session_manager.list_runs(session_id)]
+
+
+@router.get("/session/{session_id}/runs/{run_id}", response_model=RunSummary)
+async def get_session_run(
+    session_id: str, run_id: str, user: dict = Depends(get_current_user)
+) -> RunSummary:
+    await _check_session_access(session_id, user)
+    run = await session_manager.get_run(session_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunSummary(**run)
+
+
+@router.get(
+    "/session/{session_id}/runs/{run_id}/events",
+    response_model=list[RunEventInfo],
+)
+async def get_session_run_events(
+    session_id: str,
+    run_id: str,
+    since: int = 0,
+    user: dict = Depends(get_current_user),
+) -> list[RunEventInfo]:
+    await _check_session_access(session_id, user)
+    events = await session_manager.load_run_events_after(session_id, run_id, since)
+    if events is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return [RunEventInfo(**event) for event in events]
 
 
 @router.post("/session/{session_id}/sandbox/teardown")
@@ -1246,6 +2269,7 @@ async def submit_input(
         body.cloud_provider,
         body.training_goal,
         body.output_policy,
+        request_id=str(payload.get("request_id") or uuid.uuid4()),
     )
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
@@ -1337,6 +2361,7 @@ async def chat_sse(
             agent_session.session.config.model_name,
         )
         if approvals:
+            latest_run = await session_manager.latest_attachable_run(session_id)
             formatted = [
                 {
                     "tool_call_id": a["tool_call_id"],
@@ -1348,10 +2373,19 @@ async def chat_sse(
                 }
                 for a in approvals
             ]
-            success = await session_manager.submit_approval(session_id, formatted)
+            success = await session_manager.submit_approval(
+                session_id,
+                formatted,
+                run_id=latest_run["run_id"] if latest_run else None,
+            )
         elif text is not None:
             success = await session_manager.submit_user_input(
-                session_id, text, cloud_provider, training_goal, output_policy
+                session_id,
+                text,
+                cloud_provider,
+                training_goal,
+                output_policy,
+                request_id=request_id,
             )
         else:
             broadcaster.unsubscribe(sub_id)
@@ -1454,7 +2488,7 @@ def _format_sse(msg: dict[str, Any]) -> str:
 def _event_doc_to_msg(doc: dict[str, Any]) -> dict[str, Any]:
     return {
         "event_type": doc.get("event_type"),
-        "data": doc.get("data") or {},
+        "data": doc.get("data") or doc.get("payload") or {},
         "seq": doc.get("seq"),
     }
 
@@ -1570,6 +2604,36 @@ def _sse_response(
     )
 
 
+@router.get("/session/{session_id}/runs/{run_id}/stream")
+async def stream_session_run(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    since: int = 0,
+    user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """Replay persisted run events, then attach to the live session broadcaster."""
+    agent_session = await _check_session_access(session_id, user, request)
+    replay_events = await session_manager.load_run_events_after(
+        session_id, run_id, since
+    )
+    if replay_events is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    broadcaster = agent_session.broadcaster
+    sub_id, event_queue = broadcaster.subscribe()
+    return _sse_response(
+        broadcaster,
+        event_queue,
+        sub_id,
+        request=request,
+        session_id=session_id,
+        request_id=f"run-reconnect-{uuid.uuid4()}",
+        stream_started_at=time.monotonic(),
+        replay_events=replay_events,
+        after_seq=since,
+    )
+
+
 @router.get("/events/{session_id}")
 async def subscribe_events(
     session_id: str,
@@ -1586,9 +2650,11 @@ async def subscribe_events(
         raise HTTPException(status_code=404, detail="Session not found or inactive")
 
     after_seq = _last_event_seq(request)
-    replay_events = await session_manager._store().load_events_after(
-        session_id, after_seq
-    )
+    replay_events = []
+    if background_runs_in_process():
+        replay_events = await session_manager._store().load_events_after(
+            session_id, after_seq
+        )
     broadcaster = agent_session.broadcaster
     sub_id, event_queue = broadcaster.subscribe()
     return _sse_response(
@@ -1614,6 +2680,23 @@ async def interrupt_session(
     if not success:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return {"status": "interrupted", "session_id": session_id}
+
+
+@router.post("/session/{session_id}/runs/{run_id}/interrupt")
+async def interrupt_session_run(
+    session_id: str,
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Interrupt a running durable run and mark its event log."""
+    agent_session = await _check_session_access(session_id, user)
+    if not await session_manager.get_run(session_id, run_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    agent_session.session.current_run_id = run_id
+    success = await session_manager.interrupt(session_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    return {"status": "interrupted", "session_id": session_id, "run_id": run_id}
 
 
 @router.get("/session/{session_id}/messages")

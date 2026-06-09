@@ -77,6 +77,30 @@ function lastEventKey(sessionId: string): string {
   return `hf-agent-last-event:${sessionId}`;
 }
 
+type RunSummary = {
+  run_id: string;
+  status: string;
+  last_event_seq?: number;
+};
+
+const TERMINAL_RUN_STATUSES = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+
+async function latestAttachableRun(sessionId: string): Promise<RunSummary | null> {
+  try {
+    const response = await apiFetch(`/api/session/${sessionId}/runs`);
+    if (!response.ok) return null;
+    const runs = await response.json();
+    if (!Array.isArray(runs)) return null;
+    return (
+      runs.find((run) => run?.run_id && !TERMINAL_RUN_STATUSES.has(String(run.status))) ||
+      runs.find((run) => run?.run_id) ||
+      null
+    ) as RunSummary | null;
+  } catch {
+    return null;
+  }
+}
+
 async function recoverStreamState(
   sessionId: string,
   sideChannel: SideChannelCallbacks,
@@ -247,6 +271,8 @@ function createEventToChunkStream(
       switch (event.event_type) {
         // -- Side-channel only events ----------------------------------------
         case 'ready':
+        case 'run_created':
+        case 'run_started':
           sideChannel.onReady();
           break;
 
@@ -557,6 +583,7 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
           outputPolicy: session?.outputPolicy,
         }),
       };
+      localStorage.removeItem(lastEventKey(sessionId));
     }
 
     // POST to SSE endpoint
@@ -606,14 +633,19 @@ export class SSEChatTransport implements ChatTransport<UIMessage> {
       const infoRes = await apiFetch(`/api/session/${this.sessionId}`);
       if (!infoRes.ok) return null;
       const info = await infoRes.json();
-      if (!info.is_processing) return null;
+      const run = await latestAttachableRun(this.sessionId);
+      if (!info.is_processing && !run) return null;
 
       // Session is mid-turn — subscribe to its event broadcast.
       const lastSeq = localStorage.getItem(lastEventKey(this.sessionId));
       const qs = lastSeq ? `?after=${encodeURIComponent(lastSeq)}` : '';
-      const response = await apiFetch(`/api/events/${this.sessionId}${qs}`, {
+      const response = run
+        ? await apiFetch(`/api/session/${this.sessionId}/runs/${run.run_id}/stream${lastSeq ? `?since=${encodeURIComponent(lastSeq)}` : ''}`, {
+            headers: { 'Accept': 'text/event-stream' },
+          })
+        : await apiFetch(`/api/events/${this.sessionId}${qs}`, {
         headers: { 'Accept': 'text/event-stream' },
-      });
+          });
       if (!response.ok || !response.body) return null;
 
       this.sideChannel.onProcessing();

@@ -226,6 +226,16 @@ def _format_plan_items_for_guard(items: list[dict[str, str]], limit: int = 4) ->
     return "; ".join(formatted)
 
 
+def _structured_tool_output(
+    session: "Session", tool_call_id: str | None
+) -> dict | None:
+    outputs = getattr(session, "_structured_tool_outputs", None)
+    if not isinstance(outputs, dict) or not tool_call_id:
+        return None
+    value = outputs.pop(tool_call_id, None)
+    return value if isinstance(value, dict) else None
+
+
 def _no_tool_incomplete_plan_prompt(items: list[dict[str, str]]) -> str:
     summary = _format_plan_items_for_guard(items)
     return (
@@ -2553,6 +2563,9 @@ class Handlers:
                                     "tool_call_id": tc.id,
                                     "output": output,
                                     "success": success,
+                                    "structured": _structured_tool_output(
+                                        session, tc.id
+                                    ),
                                 },
                             )
                         )
@@ -2592,11 +2605,27 @@ class Handlers:
                             "tool_call_id": tc.id,
                         }
                         approval_record = _approval_record(tc, tool_name, tool_args)
+                        approval_record.update(
+                            {
+                                "estimated_cost_usd": decision.estimated_cost_usd,
+                                "remaining_cap_usd": decision.remaining_cap_usd,
+                                "billable": decision.billable,
+                            }
+                        )
                         approval_records.append(approval_record)
                         tool_payload.update(approval_record)
                         metadata = _approval_metadata(session, tool_name, tool_args)
                         if metadata:
                             tool_payload["metadata"] = metadata
+                        if decision.estimated_cost_usd is not None:
+                            tool_payload["estimated_cost_usd"] = (
+                                decision.estimated_cost_usd
+                            )
+                        if decision.remaining_cap_usd is not None:
+                            tool_payload["remaining_cap_usd"] = (
+                                decision.remaining_cap_usd
+                            )
+                        tool_payload["billable"] = decision.billable
                         if decision.auto_approval_blocked:
                             tool_payload.update(
                                 {
@@ -2968,6 +2997,7 @@ class Handlers:
                             "tool_call_id": tc.id,
                             "output": output,
                             "success": success,
+                            "structured": _structured_tool_output(session, tc.id),
                         },
                     )
                 )

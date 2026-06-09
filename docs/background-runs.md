@@ -1,0 +1,116 @@
+# Durable Background Runs
+
+Phase 1 adds a durable run ledger around the existing chat loop so a browser can
+disconnect, refresh, and replay run events without losing approval/provider state.
+It does not introduce a separate paid worker or launch provider jobs on its own.
+
+## Runtime Model
+
+- `BACKGROUND_RUNS_ENABLED=true` and `RUN_WORKER_MODE=in_process` enable the
+  Phase 1 path.
+- Each user turn creates a run record with status, provider, active tool,
+  approval id, provider job id, result/error summaries, and timestamps.
+- Events are appended as the existing agent emits SSE events. Reconnect streams
+  replay persisted events from `since=<seq>` and then attach to the live
+  in-process session broadcaster.
+- If MongoDB is configured, runs and events are stored in MongoDB collections
+  `runs` and `run_events`. Without MongoDB, local development uses an in-memory
+  run store and `/api/health` reports durable background runs disabled.
+- Phase 2 derives usage entries from the same replayable events. MongoDB stores
+  them in `usage_entries`; the local fallback is in-memory and reported as
+  `usage_store.durable=false`.
+- Phase 3 derives audit timeline events from the same run and usage signals.
+  MongoDB stores them in `audit_events`; the local fallback is in-memory and
+  reported as `audit_store.durable=false`.
+- Phase 5 derives static post-training evaluations from the same replayable
+  final result markers. MongoDB stores them in `evaluations`; the local fallback
+  is in-memory and run summaries include `evaluation_status`,
+  `evaluation_score`, and `evaluation_id`.
+- Phase 6 persists structured no-upload dataset discovery results from
+  `dataset_discovery` tool output into run/session state. Run summaries can
+  include `dataset_discovery`, and provider metadata carries the same sanitized
+  recommendation payload for replay.
+
+## APIs
+
+- `POST /api/session/{session_id}/runs`
+- `GET /api/session/{session_id}/runs`
+- `GET /api/session/{session_id}/runs/{run_id}`
+- `GET /api/session/{session_id}/runs/{run_id}/events?since=<seq>`
+- `GET /api/session/{session_id}/runs/{run_id}/stream?since=<seq>`
+- `POST /api/session/{session_id}/runs/{run_id}/interrupt`
+- `GET /api/session/{session_id}/usage`
+- `GET /api/session/{session_id}/runs/{run_id}/usage`
+- `GET /api/audit`
+- `GET /api/audit/summary`
+- `GET /api/session/{session_id}/audit`
+- `GET /api/session/{session_id}/runs/{run_id}/audit`
+- `GET /api/session/{session_id}/evaluations`
+- `GET /api/session/{session_id}/runs/{run_id}/evaluation`
+- `POST /api/session/{session_id}/runs/{run_id}/evaluation`
+- `GET /api/session/{session_id}/dataset-discovery`
+- `GET /api/session/{session_id}/runs/{run_id}/dataset-discovery`
+
+`POST /api/chat/{session_id}` remains backward compatible. It creates a run for
+new user messages when Phase 1 is enabled and attaches approval continuations to
+the latest non-terminal run.
+
+## Security
+
+Provider approval gates are unchanged. HF Jobs, Vertex AI, and SageMaker paid job
+launches still require explicit approval unless an existing safe auto-approval
+policy applies.
+
+Provider credentials and OAuth tokens are not persisted by the run ledger. If a
+future external worker needs encrypted token handoff, production must configure
+`SESSION_TOKEN_ENCRYPTION_KEY`; without it, token handoff must fail closed rather
+than storing plaintext credentials.
+
+Never commit `.env`, cloud credentials, private datasets, `.playwright-mcp`,
+caches, frontend build output, or generated artifacts.
+
+## Health
+
+`/api/health` includes:
+
+- `background_runs.enabled`
+- `background_runs.durable`
+- `background_runs.store`
+- `background_runs.token_handoff_configured`
+- `usage_store.enabled`
+- `usage_store.durable`
+- `usage_store.store`
+- `audit_store.enabled`
+- `audit_store.durable`
+- `audit_store.type`
+- `security.redaction_enabled`
+- `security.sandbox_private_default`
+- `security.secret_persistence_allowed`
+- `security.token_encryption_configured`
+- `security.encrypted_handoff_enabled`
+- `session_store.type`
+- `session_store.durable`
+
+See `docs/usage-dashboard.md` for budget env vars, estimated-vs-actual cost
+wording, and quota warning behavior. Phase 2 does not call live billing APIs or
+block runs beyond the existing approval policy.
+
+See `docs/audit-timeline.md` for timeline categories, retention settings,
+redaction behavior, and frontend usage.
+
+See `docs/security-hardening.md` for Phase 4 redaction, sandbox privacy, and
+token handoff rules.
+
+See `docs/post-training-evaluation.md` for Phase 5 static evaluation, scoring,
+audit events, and limitations.
+
+See `docs/dataset-discovery.md` for Phase 6 no-upload discovery ranking,
+Kaggle exclusion, persistence, and API response shape.
+
+## Limitations
+
+Phase 1 keeps execution inside the API process. Runs survive browser disconnects
+and can replay events from MongoDB, but a backend process restart can only
+restore persisted session/run state; it does not resume an interrupted Python
+call stack. A later phase can add an external worker that leases queued runs and
+uses encrypted token handoff.

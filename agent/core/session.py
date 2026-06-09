@@ -15,6 +15,8 @@ from litellm import Message
 
 from agent.config import Config
 from agent.context_manager.manager import ContextManager
+from agent.core.background_runs import background_runs_in_process
+from agent.core.redact import sanitize_for_frontend, sanitize_for_persistence
 from agent.messaging.gateway import NotificationGateway
 from agent.messaging.models import NotificationRequest
 
@@ -127,6 +129,7 @@ class Session:
         self.current_plan: list[dict[str, str]] = []
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
+        self.current_run_id: str | None = None
         self.sandbox = None
         self.sandbox_hardware: Optional[str] = None
         self.sandbox_preload_task: Optional[asyncio.Task] = None
@@ -140,6 +143,7 @@ class Session:
         self.auto_approval_cost_cap_usd: float | None = None
         self.auto_approval_estimated_spend_usd: float = 0.0
         self.uploaded_datasets: list[dict[str, Any]] = []
+        self.latest_training_preflight: dict[str, Any] | None = None
 
         # Session trajectory logging
         self.logged_events: list[dict] = []
@@ -165,18 +169,28 @@ class Session:
 
     async def send_event(self, event: Event) -> None:
         """Send event back to client and log to trajectory"""
+        frontend_data = (
+            sanitize_for_frontend(event.data) if event.data is not None else None
+        )
+        persistence_data = (
+            sanitize_for_persistence(event.data) if event.data is not None else None
+        )
+        event.data = frontend_data
         # Log event to trajectory
         self.logged_events.append(
             {
                 "timestamp": datetime.now().isoformat(),
                 "event_type": event.event_type,
-                "data": event.data,
+                "data": persistence_data,
             }
         )
-        if self.persistence_store is not None:
+        if self.persistence_store is not None and background_runs_in_process():
             try:
                 event.seq = await self.persistence_store.append_event(
-                    self.session_id, event.event_type, event.data
+                    self.session_id,
+                    event.event_type,
+                    persistence_data,
+                    run_id=self.current_run_id,
                 )
             except Exception as e:
                 logger.debug("Event persistence failed for %s: %s", self.session_id, e)
@@ -531,11 +545,9 @@ class Session:
             # tokens on disk — a log aggregator, crash dump, or filesystem
             # snapshot between heartbeats would otherwise leak them.
             try:
-                from agent.core.redact import scrub
-
                 for key in ("messages", "events", "tools"):
                     if key in trajectory:
-                        trajectory[key] = scrub(trajectory[key])
+                        trajectory[key] = sanitize_for_persistence(trajectory[key])
             except Exception as _e:
                 logger.debug("Redact-on-save failed (non-fatal): %s", _e)
 

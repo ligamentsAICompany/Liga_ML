@@ -418,6 +418,51 @@ def test_ensure_sandbox_overrides_private_argument(monkeypatch):
     assert persisted[-1]["sandbox_hardware"] == "cpu-basic"
     assert persisted[-1]["sandbox_owner"] == "alice"
     assert persisted[-1]["sandbox_status"] == "active"
+    assert "HF_TOKEN" not in captured_kwargs["secrets"]
+    assert "HUGGINGFACE_HUB_TOKEN" not in captured_kwargs["secrets"]
+    assert "SANDBOX_API_TOKEN" not in str(persisted)
+
+
+def test_sandbox_client_blocks_dangerous_default_secret_injection(monkeypatch):
+    added_secrets: dict[str, str] = {}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            self.token = token
+
+        def duplicate_repo(self, **kwargs):
+            assert kwargs["private"] is True
+
+        def add_space_secret(self, space_id, key, value):
+            added_secrets[key] = value
+
+        def get_space_runtime(self, space_id):
+            return SimpleNamespace(stage="RUNNING", hardware="cpu-basic")
+
+    monkeypatch.setattr(sandbox_client, "HfApi", FakeApi)
+    monkeypatch.setattr(
+        Sandbox,
+        "_setup_server",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    monkeypatch.setattr(Sandbox, "_wait_for_api", lambda self, *args, **kwargs: None)
+
+    sandbox = Sandbox.create(
+        owner="alice",
+        token="hf_" + "A" * 35,
+        secrets={
+            "HF_TOKEN": "hf_" + "B" * 35,
+            "OPENAI_API_KEY": "sk-" + "c" * 45,
+            "TRACKIO_PROJECT": "safe-project",
+        },
+        log=lambda msg: None,
+    )
+
+    assert sandbox.space_id.startswith("alice/sandbox-")
+    assert "SANDBOX_API_TOKEN" in added_secrets
+    assert added_secrets["TRACKIO_PROJECT"] == "safe-project"
+    assert "HF_TOKEN" not in added_secrets
+    assert "OPENAI_API_KEY" not in added_secrets
 
 
 def test_cancelled_sandbox_creation_logs_delete_through_tool_log(monkeypatch):
@@ -567,6 +612,30 @@ def test_sandbox_operation_waits_for_cpu_preload():
     assert ok is True
     assert out == "preloaded-ok"
     assert calls == [("bash", {"command": "echo ok"})]
+
+
+def test_sandbox_operation_redacts_secret_output():
+    class FakeSandbox:
+        def call_tool(self, name, args):
+            return SimpleNamespace(
+                success=True,
+                output="OPENAI_API_KEY=sk-" + "a" * 45,
+                error="",
+            )
+
+    async def run():
+        session = SimpleNamespace(
+            sandbox=FakeSandbox(),
+            sandbox_preload_task=None,
+            sandbox_preload_error=None,
+        )
+        handler = sandbox_tool._make_tool_handler("bash")
+        return await handler({"command": "env"}, session=session)
+
+    out, ok = asyncio.run(run())
+
+    assert ok is True
+    assert out == "OPENAI_API_KEY=[REDACTED]"
 
 
 def test_default_sandbox_create_waits_for_cpu_preload():

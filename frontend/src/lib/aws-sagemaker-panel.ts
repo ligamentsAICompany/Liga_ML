@@ -1,4 +1,5 @@
 import { parseLigaTrainingResult, type TrainingResult } from '../utils/trainingResult.js';
+import { buildEvaluationMarkdown } from './post-training-evaluation.js';
 
 interface PanelData {
   title: string;
@@ -148,6 +149,13 @@ export function buildAwsTrainingResultMarkdown(result: TrainingResult): string {
         '```',
       );
     }
+  }
+
+  if (result.postTrainingEvaluation !== undefined) {
+    sections.push(
+      '',
+      buildEvaluationMarkdown(result.postTrainingEvaluation),
+    );
   }
 
   return sections.join('\n');

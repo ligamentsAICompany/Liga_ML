@@ -24,6 +24,8 @@ import SessionChat from '@/components/SessionChat';
 import CodePanel from '@/components/CodePanel/CodePanel';
 import WelcomeScreen from '@/components/WelcomeScreen/WelcomeScreen';
 import YoloControl from '@/components/YoloControl';
+import UsageDashboardButton from '@/components/UsageDashboard/UsageDashboardButton';
+import AuditTimelineButton from '@/components/AuditTimeline/AuditTimelineButton';
 import ResponsesLogButton from '@/components/ResponsesLogButton';
 import { apiFetch } from '@/utils/api';
 import {
@@ -306,6 +308,8 @@ export default function AppLayout() {
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
             <ResponsesLogButton />
+            <UsageDashboardButton />
+            <AuditTimelineButton />
             <YoloControl />
 
             {user?.picture ? (

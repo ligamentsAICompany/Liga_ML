@@ -1,4 +1,5 @@
 import { parseLigaTrainingResult, type TrainingResult } from '../utils/trainingResult.js';
+import { buildEvaluationMarkdown } from './post-training-evaluation.js';
 import { outputPolicyLabel, storageDestinationLabel, trainingGoalLabel } from './gcloud-preflight.js';
 import type { OutputPolicy, TrainingGoal } from '../types/agent.js';
 
@@ -181,6 +182,13 @@ export function buildTrainingResultMarkdown(result: TrainingResult): string {
         '```',
       );
     }
+  }
+
+  if (result.postTrainingEvaluation !== undefined) {
+    sections.push(
+      '',
+      buildEvaluationMarkdown(result.postTrainingEvaluation),
+    );
   }
 
   return sections.join('\n');

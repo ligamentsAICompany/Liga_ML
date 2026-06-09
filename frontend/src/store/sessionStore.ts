@@ -2,6 +2,8 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import type {
   CloudProviderId,
+  BackgroundRunSummary,
+  DatasetDiscoveryInfo,
   OutputPolicy,
   SessionMeta,
   TrainingGoal,
@@ -53,6 +55,8 @@ interface SessionStore {
     training_goal?: TrainingGoal | null;
     output_policy?: OutputPolicy | null;
     uploaded_datasets?: UploadedDatasetInfo[];
+    latest_dataset_discovery?: DatasetDiscoveryInfo | null;
+    runs?: BackgroundRunSummary[];
   }>) => void;
   updateSessionYolo: (id: string, policy: {
     enabled: boolean;
@@ -88,6 +92,7 @@ export const useSessionStore = create<SessionStore>()(
           autoApprovalEstimatedSpendUsd: 0,
           autoApprovalRemainingUsd: null,
           uploadedDatasets: [],
+          runs: [],
           unavailableModels: {},
         };
         set((state) => ({
@@ -147,6 +152,8 @@ export const useSessionStore = create<SessionStore>()(
                 needsAttention: Boolean(server.pending_approval?.length) || existing.needsAttention,
                 expired: false,
                 uploadedDatasets: server.uploaded_datasets ?? existing.uploadedDatasets ?? [],
+                latestDatasetDiscovery: server.latest_dataset_discovery ?? existing.latestDatasetDiscovery ?? null,
+                runs: server.runs ?? existing.runs ?? [],
                 unavailableModels: existing.unavailableModels ?? {},
                 ...(auto
                   ? {
@@ -178,6 +185,8 @@ export const useSessionStore = create<SessionStore>()(
               autoApprovalEstimatedSpendUsd: server.auto_approval?.estimated_spend_usd ?? 0,
               autoApprovalRemainingUsd: server.auto_approval?.remaining_usd ?? null,
               uploadedDatasets: server.uploaded_datasets ?? [],
+              latestDatasetDiscovery: server.latest_dataset_discovery ?? null,
+              runs: server.runs ?? [],
               unavailableModels: {},
             };
             merged.push(newSession);

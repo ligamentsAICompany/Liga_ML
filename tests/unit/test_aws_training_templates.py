@@ -144,6 +144,17 @@ def test_aws_sft_template_output_policy_token_behavior_is_runtime_checked():
     assert "push_to_hub=OUTPUT_POLICY in PUBLISH_TO_HUB_POLICIES" in private_script
 
 
+def test_aws_sft_template_does_not_print_or_write_secret_values():
+    script = _script("cloud-and-hf-hub")
+
+    assert "print(os.environ" not in script
+    assert "json.dump(os.environ" not in script
+    assert "AWS_SECRET_ACCESS_KEY" not in script
+    assert "AWS_SESSION_TOKEN" not in script
+    assert '"hf_token":' not in script.lower()
+    assert "tokens are never printed" in script
+
+
 def test_aws_sft_template_cloud_private_is_s3_only():
     script = _script("cloud-private")
 

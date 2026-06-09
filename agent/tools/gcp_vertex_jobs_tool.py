@@ -22,6 +22,7 @@ from typing import Any, Callable
 from huggingface_hub import hf_hub_download
 
 from agent.core.hf_tokens import resolve_hf_token
+from agent.core.redact import SECRET_KEY_RE, redact_text
 from agent.core.session import Event
 from agent.training_templates.sft import SftTemplateConfig, build_sft_training_script
 from agent.training_templates.validation import validate_sft_template_request
@@ -297,8 +298,7 @@ def _extract_root_error_lines(text: str, *, limit: int = 8) -> list[str]:
 
 
 def _sanitize_failure_text(text: str) -> str:
-    # Avoid accidentally reflecting raw tokens from exception/log payloads.
-    return re.sub(r"hf_[A-Za-z0-9]{20,}", "[REDACTED_HF_TOKEN]", text)
+    return redact_text(text)
 
 
 class GcpVertexJobsTool:
@@ -601,7 +601,11 @@ class GcpVertexJobsTool:
             machine_spec["accelerator_type"] = accelerator_type
             machine_spec["accelerator_count"] = int(args.get("accelerator_count") or 1)
 
-        env = {str(k): str(v) for k, v in (args.get("env") or {}).items()}
+        env = {
+            str(k): str(v)
+            for k, v in (args.get("env") or {}).items()
+            if not SECRET_KEY_RE.search(str(k))
+        }
         env.setdefault("TRACKIO_MODE", trackio_mode)
         if args.get("trackio_project"):
             env.setdefault("TRACKIO_PROJECT", str(args["trackio_project"]))
@@ -997,7 +1001,7 @@ class GcpVertexJobsTool:
     @staticmethod
     def _error(message: str) -> ToolResult:
         return {
-            "formatted": message,
+            "formatted": redact_text(message),
             "totalResults": 0,
             "resultsShared": 0,
             "isError": True,

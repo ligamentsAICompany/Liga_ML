@@ -8,12 +8,38 @@ unless ``MONGODB_URI`` is configured and reachable.
 from __future__ import annotations
 
 import logging
-import os
 import math
+import os
 import re
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
+from agent.core.background_runs import (
+    provider_metadata_from_event,
+    run_status_from_event,
+    safe_event_summary,
+)
+from agent.core.audit import (
+    audit_timeline_enabled,
+    build_audit_event,
+    event_from_run_event,
+    summarize_audit_events,
+    training_preflight_audit_events,
+)
+from agent.core.post_training_evaluation import (
+    build_post_training_evaluation,
+    evaluation_context_from_liga_output,
+    summarize_evaluations,
+)
+from agent.core.usage import (
+    summarize_usage,
+    usage_from_training_recommendation,
+    usage_from_approval_tool,
+    usage_from_run_terminal,
+    usage_from_tool_state,
+)
+from agent.core.redact import sanitize_for_persistence
 from bson import BSON
 from pymongo import AsyncMongoClient, DeleteMany, ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError, InvalidDocument, PyMongoError
@@ -37,6 +63,22 @@ NO_DURABLE_STORE_WARNING = (
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
+    return None
 
 
 def _doc_id(session_id: str, idx: int) -> str:
@@ -176,9 +218,10 @@ def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
     Mongo's hard document limit is 16 MB.  We stay below that and store an
     explicit marker rather than failing the whole snapshot for one huge tool log.
     """
+    safe_message = sanitize_for_persistence(message)
     try:
-        if len(BSON.encode({"message": message})) <= MAX_BSON_BYTES:
-            return message
+        if len(BSON.encode({"message": safe_message})) <= MAX_BSON_BYTES:
+            return safe_message
     except (InvalidDocument, OverflowError):
         pass
     return {
@@ -191,10 +234,41 @@ def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _dataset_discovery_from_event(
+    event_type: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    if event_type != "tool_output" or payload.get("tool") != "dataset_discovery":
+        return None
+    structured = payload.get("structured")
+    if isinstance(structured, dict):
+        return sanitize_for_persistence(structured)
+    return None
+
+
+def _training_recommendation_from_event(
+    event_type: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    if event_type != "tool_output" or payload.get("tool") != "training_planner":
+        return None
+    structured = payload.get("structured")
+    if isinstance(structured, dict):
+        return sanitize_for_persistence(structured)
+    return None
+
+
 class NoopSessionStore:
     """Async no-op store used when Mongo is not configured."""
 
     enabled = False
+
+    def __init__(self) -> None:
+        self._runs: dict[str, dict[str, Any]] = {}
+        self._run_events: dict[str, list[dict[str, Any]]] = {}
+        self._usage_entries: dict[str, dict[str, Any]] = {}
+        self._audit_events: dict[str, dict[str, Any]] = {}
+        self._evaluations: dict[str, dict[str, Any]] = {}
+        self._session_preflights: dict[str, dict[str, Any]] = {}
+        self._run_preflights: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -220,7 +294,20 @@ class NoopSessionStore:
     async def update_session_fields(self, *_: Any, **__: Any) -> None:
         return None
 
-    async def append_event(self, *_: Any, **__: Any) -> int | None:
+    async def append_event(
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict[str, Any] | None,
+        run_id: str | None = None,
+    ) -> int | None:
+        if run_id:
+            return await self.append_run_event(
+                run_id=run_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=sanitize_for_persistence(data or {}),
+            )
         return None
 
     async def load_events_after(self, *_: Any, **__: Any) -> list[dict[str, Any]]:
@@ -243,6 +330,586 @@ class NoopSessionStore:
 
     async def mark_pro_seen(self, *_: Any, **__: Any) -> dict[str, Any] | None:
         return None
+
+    async def create_run(
+        self,
+        *,
+        session_id: str,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        now = _now()
+        run_id = str(uuid.uuid4())
+        run = {
+            "_id": run_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": status,
+            "provider": provider or "none",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "last_event_seq": 0,
+            "active_tool": None,
+            "active_provider_job_id": None,
+            "approval_id": None,
+            "error_summary": None,
+            "result_summary": None,
+            "request_id": request_id,
+            "provider_metadata": {},
+        }
+        self._runs[run_id] = run
+        self._run_events[run_id] = []
+        await self.append_run_event(
+            run_id=run_id,
+            session_id=session_id,
+            event_type="run_created",
+            payload={"request_id": request_id, "provider": provider},
+        )
+        return dict(run)
+
+    async def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
+        run = self._runs.get(run_id)
+        if not run:
+            return None
+        fields = sanitize_for_persistence(
+            {k: v for k, v in fields.items() if v is not None}
+        )
+        if fields:
+            run.update(fields)
+        run["updated_at"] = _now()
+        return dict(run)
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        run = self._runs.get(run_id)
+        return dict(run) if run else None
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+        include_started_audit: bool = True,
+    ) -> dict[str, Any]:
+        clean = sanitize_for_persistence(preflight)
+        if not isinstance(clean, dict):
+            clean = {}
+        clean["session_id"] = session_id
+        if run_id:
+            clean["run_id"] = run_id
+        self._session_preflights[session_id] = dict(clean)
+        if run_id:
+            self._run_preflights[run_id] = dict(clean)
+            run = self._runs.get(run_id)
+            if run:
+                provider_metadata = dict(run.get("provider_metadata") or {})
+                provider_metadata["training_preflight"] = dict(clean)
+                run["training_preflight"] = dict(clean)
+                run["provider_metadata"] = provider_metadata
+                run["updated_at"] = _now()
+        for event in training_preflight_audit_events(
+            clean, include_started=include_started_audit
+        ):
+            await self.record_audit_event(event)
+        return dict(clean)
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        preflight = self._session_preflights.get(session_id)
+        return dict(preflight) if preflight else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        preflight = self._run_preflights.get(run_id)
+        if preflight and preflight.get("session_id") == session_id:
+            return dict(preflight)
+        run = self._runs.get(run_id)
+        if run and run.get("session_id") == session_id:
+            value = run.get("training_preflight")
+            if isinstance(value, dict):
+                return dict(value)
+        return None
+
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        clean = sanitize_for_persistence(
+            {key: value for key, value in evaluation.items() if value is not None}
+        )
+        evaluation_id = str(clean.get("evaluation_id") or clean.get("_id") or "")
+        if not evaluation_id:
+            evaluation_id = str(uuid.uuid4())
+            clean["evaluation_id"] = evaluation_id
+        clean["_id"] = evaluation_id
+        clean.setdefault("created_at", now)
+        clean["updated_at"] = now
+        current = dict(self._evaluations.get(evaluation_id) or {})
+        current.update(clean)
+        self._evaluations[evaluation_id] = current
+        run_id = str(current.get("run_id") or "")
+        if run_id in self._runs:
+            scores = (
+                current.get("scores") if isinstance(current.get("scores"), dict) else {}
+            )
+            self._runs[run_id].update(
+                {
+                    "evaluation_status": current.get("status"),
+                    "evaluation_score": scores.get("overall_score"),
+                    "evaluation_id": evaluation_id,
+                    "updated_at": now,
+                }
+            )
+        await self._record_evaluation_audit_events(current)
+        return dict(current)
+
+    async def list_evaluations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        evaluations = list(self._evaluations.values())
+        if session_id:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("session_id") == session_id
+            ]
+        if run_id:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("run_id") == run_id
+            ]
+        if provider:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("provider") == provider
+            ]
+        if status:
+            evaluations = [
+                evaluation
+                for evaluation in evaluations
+                if evaluation.get("status") == status
+            ]
+        evaluations = sorted(
+            (dict(evaluation) for evaluation in evaluations),
+            key=lambda item: (
+                _parse_dt(item.get("updated_at"))
+                or _parse_dt(item.get("completed_at"))
+                or _now()
+            ),
+            reverse=True,
+        )
+        return evaluations[: max(1, min(int(limit or 100), 500))]
+
+    async def get_evaluation_for_run(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        evaluations = await self.list_evaluations(
+            session_id=session_id, run_id=run_id, limit=1
+        )
+        return evaluations[0] if evaluations else None
+
+    async def evaluation_summary(self, **filters: Any) -> dict[str, Any]:
+        evaluations = await self.list_evaluations(**filters)
+        return {**summarize_evaluations(evaluations), "evaluations": evaluations}
+
+    async def _record_evaluation_audit_events(self, evaluation: dict[str, Any]) -> None:
+        session_id = str(evaluation.get("session_id") or "")
+        run_id = str(evaluation.get("run_id") or "")
+        if not session_id or not run_id:
+            return
+        status = str(evaluation.get("status") or "unknown")
+        provider = str(evaluation.get("provider") or "unknown")
+        evaluation_id = str(evaluation.get("evaluation_id") or "")
+        lifecycle = [
+            ("evaluation_planned", "planned", "Evaluation planned"),
+            ("evaluation_started", "running", "Evaluation started"),
+        ]
+        if status == "succeeded":
+            lifecycle.append(
+                ("evaluation_completed", "succeeded", "Evaluation completed")
+            )
+        elif status == "skipped":
+            lifecycle.append(("evaluation_skipped", "skipped", "Evaluation skipped"))
+        elif status == "failed":
+            lifecycle.append(("evaluation_failed", "failed", "Evaluation failed"))
+        else:
+            lifecycle.append(
+                ("evaluation_unavailable", status, "Evaluation unavailable")
+            )
+        for event_type, event_status, title in lifecycle:
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type=event_type,
+                    category="result",
+                    severity="error" if event_status == "failed" else "info",
+                    status=event_status,
+                    actor="system",
+                    title=title,
+                    message=str(evaluation.get("recommendation") or title),
+                    provider=provider,
+                    entity_type="evaluation",
+                    entity_id=evaluation_id,
+                    artifact_url=evaluation.get("artifact_ref"),
+                    model_name=evaluation.get("model_ref"),
+                    safe_metadata={
+                        "evaluation_id": evaluation_id,
+                        "scores": evaluation.get("scores"),
+                    },
+                )
+            )
+
+    async def upsert_usage_entry(
+        self, usage_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        now = _now()
+        current = dict(self._usage_entries.get(usage_id) or {})
+        if not current:
+            current = {
+                "_id": usage_id,
+                "usage_id": usage_id,
+                "created_at": fields.get("created_at") or now,
+            }
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in fields.items() if value is not None}
+        )
+        current.update(cleaned)
+        current["updated_at"] = now
+        self._usage_entries[usage_id] = current
+        return dict(current)
+
+    async def list_usage_entries(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        entries = list(self._usage_entries.values())
+        if provider:
+            entries = [entry for entry in entries if entry.get("provider") == provider]
+        if session_id:
+            entries = [
+                entry for entry in entries if entry.get("session_id") == session_id
+            ]
+        if run_id:
+            entries = [entry for entry in entries if entry.get("run_id") == run_id]
+        if status:
+            entries = [entry for entry in entries if entry.get("status") == status]
+        entries = sorted(
+            (dict(entry) for entry in entries),
+            key=lambda item: item.get("updated_at") or item.get("created_at") or _now(),
+            reverse=True,
+        )
+        return entries[: max(1, min(int(limit or 100), 500))]
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        entries = await self.list_usage_entries(**filters)
+        return {**summarize_usage(entries), "entries": entries}
+
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not audit_timeline_enabled():
+            return None
+        if not hasattr(self, "_audit_events"):
+            self._audit_events = {}
+        audit_id = str(event.get("audit_id") or event.get("_id") or "")
+        if not audit_id:
+            return None
+        current = self._audit_events.get(audit_id)
+        if current:
+            return dict(current)
+        event = sanitize_for_persistence(
+            {key: value for key, value in event.items() if value is not None}
+        )
+        event.setdefault("_id", audit_id)
+        event.setdefault("audit_id", audit_id)
+        self._audit_events[audit_id] = dict(event)
+        logger.info(
+            "audit_event audit_id=%s session_id=%s run_id=%s category=%s "
+            "event_type=%s provider=%s severity=%s status=%s",
+            event.get("audit_id"),
+            event.get("session_id"),
+            event.get("run_id"),
+            event.get("category"),
+            event.get("event_type"),
+            event.get("provider"),
+            event.get("severity"),
+            event.get("status"),
+        )
+        return dict(event)
+
+    async def list_audit_events(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        category: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not hasattr(self, "_audit_events"):
+            self._audit_events = {}
+        events = list(self._audit_events.values())
+        if session_id:
+            events = [
+                event for event in events if event.get("session_id") == session_id
+            ]
+        if run_id:
+            events = [event for event in events if event.get("run_id") == run_id]
+        if provider:
+            events = [event for event in events if event.get("provider") == provider]
+        if category:
+            events = [event for event in events if event.get("category") == category]
+        if severity:
+            events = [event for event in events if event.get("severity") == severity]
+        if status:
+            events = [event for event in events if event.get("status") == status]
+        since_dt = _parse_dt(since)
+        until_dt = _parse_dt(until)
+        if since_dt:
+            events = [
+                event
+                for event in events
+                if (_parse_dt(event.get("timestamp")) or _now()) >= since_dt
+            ]
+        if until_dt:
+            events = [
+                event
+                for event in events
+                if (_parse_dt(event.get("timestamp")) or _now()) <= until_dt
+            ]
+        events = sorted(
+            (dict(event) for event in events),
+            key=lambda item: _parse_dt(item.get("timestamp")) or _now(),
+        )
+        return events[: max(1, min(int(limit or 100), 500))]
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        events = await self.list_audit_events(**filters)
+        return {**summarize_audit_events(events), "events": events}
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        runs = [
+            dict(run)
+            for run in self._runs.values()
+            if run.get("session_id") == session_id
+        ]
+        return sorted(
+            runs, key=lambda item: item.get("created_at") or _now(), reverse=True
+        )
+
+    async def append_run_event(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int | None:
+        if run_id not in self._runs:
+            return None
+        events = self._run_events.setdefault(run_id, [])
+        seq = len(events) + 1
+        safe_payload = sanitize_for_persistence(payload or {})
+        doc = {
+            "_id": _doc_id(run_id, seq),
+            "run_id": run_id,
+            "session_id": session_id,
+            "seq": seq,
+            "timestamp": _now(),
+            "event_type": event_type,
+            "payload": safe_payload,
+            "safe_summary": safe_event_summary(event_type, safe_payload),
+        }
+        events.append(doc)
+        await self._apply_run_event_update(run_id, event_type, safe_payload, seq)
+        await self._record_audit_from_run_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type=event_type,
+            payload=safe_payload,
+        )
+        return seq
+
+    async def load_run_events_after(
+        self, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]]:
+        return [
+            dict(event)
+            for event in self._run_events.get(run_id, [])
+            if int(event.get("seq") or 0) > int(after_seq or 0)
+        ]
+
+    async def _apply_run_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any], seq: int
+    ) -> None:
+        run = self._runs.get(run_id)
+        if not run:
+            return
+        now = _now()
+        update: dict[str, Any] = {
+            "last_event_seq": seq,
+            "updated_at": now,
+        }
+        if status := run_status_from_event(event_type, payload):
+            update["status"] = status
+            if status == "running" and run.get("started_at") is None:
+                update["started_at"] = now
+            if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+                update["completed_at"] = now
+        provider_fields = provider_metadata_from_event(event_type, payload)
+        provider_metadata = dict(run.get("provider_metadata") or {})
+        if discovery := _dataset_discovery_from_event(event_type, payload):
+            update["dataset_discovery"] = discovery
+            provider_metadata["dataset_discovery"] = discovery
+            update["provider_metadata"] = provider_metadata
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            update["training_recommendation"] = recommendation
+            provider_metadata["training_recommendation"] = recommendation
+            update["provider_metadata"] = provider_metadata
+        if provider_fields:
+            if provider := provider_fields.pop("provider", None):
+                update["provider"] = provider
+                provider_metadata["provider"] = provider
+            for key, value in provider_fields.items():
+                update[key] = value
+                provider_metadata[key] = value
+            provider_metadata["last_checked_at"] = now.isoformat()
+            update["provider_metadata"] = provider_metadata
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            first = tools[0] if isinstance(tools, list) and tools else {}
+            if isinstance(first, dict):
+                update["approval_id"] = first.get("approval_id") or first.get(
+                    "tool_call_id"
+                )
+                update["active_tool"] = first.get("tool")
+        if event_type in {"error", "stream_error"}:
+            update["error_summary"] = str(payload.get("error") or "")[:500]
+        if event_type in {"assistant_message", "turn_complete"}:
+            summary = safe_event_summary(event_type, payload)
+            if summary:
+                update["result_summary"] = summary
+        run.update(update)
+        await self._apply_usage_event_update(run_id, event_type, payload, update)
+        await self._apply_evaluation_event_update(run_id, event_type, payload)
+
+    async def _apply_evaluation_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        if event_type not in {"tool_output", "assistant_message", "turn_complete"}:
+            return
+        run = self._runs.get(run_id)
+        if not run:
+            return
+        text = ""
+        for key in ("output", "content", "final_response", "formatted"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value
+                break
+        context = evaluation_context_from_liga_output(
+            session_id=str(run.get("session_id") or ""),
+            run_id=run_id,
+            output=text,
+            fallback_provider=str(run.get("provider") or ""),
+        )
+        if not context:
+            return
+        evaluation = build_post_training_evaluation(context)
+        await self.upsert_evaluation(evaluation)
+
+    async def _apply_usage_event_update(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        run_update: dict[str, Any],
+    ) -> None:
+        run = self._runs.get(run_id)
+        session_id = str(
+            (run or {}).get("session_id") or payload.get("session_id") or ""
+        )
+        if not session_id:
+            return
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            if isinstance(tools, list):
+                for tool_payload in tools:
+                    if isinstance(tool_payload, dict):
+                        usage_id, entry = usage_from_approval_tool(
+                            session_id=session_id,
+                            run_id=run_id,
+                            tool_payload=tool_payload,
+                            event_payload=payload,
+                        )
+                        await self.upsert_usage_entry(usage_id, entry)
+            return
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            usage_update = usage_from_training_recommendation(
+                session_id=session_id,
+                run_id=run_id,
+                recommendation=recommendation,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
+            return
+        existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
+        if event_type == "tool_state_change":
+            usage_update = usage_from_tool_state(
+                session_id=session_id,
+                run_id=run_id,
+                payload=payload,
+                existing=existing,
+            )
+            if usage_update:
+                usage_id, fields = usage_update
+                await self.upsert_usage_entry(usage_id, fields)
+            return
+        status = run_update.get("status")
+        if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+            fields = usage_from_run_terminal(
+                run_id=run_id,
+                status=str(status),
+                error_summary=run_update.get("error_summary"),
+            )
+            for entry in existing:
+                await self.upsert_usage_entry(str(entry["usage_id"]), fields)
+
+    async def _record_audit_from_run_event(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        for event in event_from_run_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type=event_type,
+            payload=payload,
+        ):
+            await self.record_audit_event(event)
 
     async def upsert_response_rows(self, *_: Any, **__: Any) -> None:
         return None
@@ -276,6 +943,7 @@ class MongoSessionStore(NoopSessionStore):
     enabled = True
 
     def __init__(self, uri: str, db_name: str) -> None:
+        super().__init__()
         self.uri = uri
         self.db_name = db_name
         self.enabled = False
@@ -323,6 +991,26 @@ class MongoSessionStore(NoopSessionStore):
             [("session_id", 1), ("seq", 1)], unique=True
         )
         await self.db.session_trace_messages.create_index([("created_at", -1)])
+        await self.db.runs.create_index([("session_id", 1), ("updated_at", -1)])
+        await self.db.runs.create_index([("status", 1), ("updated_at", -1)])
+        await self.db.run_events.create_index([("run_id", 1), ("seq", 1)], unique=True)
+        await self.db.usage_entries.create_index([("usage_id", 1)], unique=True)
+        await self.db.usage_entries.create_index(
+            [("session_id", 1), ("updated_at", -1)]
+        )
+        await self.db.usage_entries.create_index([("run_id", 1), ("updated_at", -1)])
+        await self.db.usage_entries.create_index([("provider", 1), ("updated_at", -1)])
+        await self.db.audit_events.create_index([("audit_id", 1)], unique=True)
+        await self.db.audit_events.create_index([("session_id", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("run_id", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("provider", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("category", 1), ("timestamp", -1)])
+        await self.db.audit_events.create_index([("severity", 1), ("timestamp", -1)])
+        await self.db.evaluations.create_index([("evaluation_id", 1)], unique=True)
+        await self.db.evaluations.create_index([("session_id", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("run_id", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("provider", 1), ("updated_at", -1)])
+        await self.db.evaluations.create_index([("status", 1), ("updated_at", -1)])
         await self.db.pro_users.create_index([("first_seen_pro_at", -1)])
         await self.db.response_rows.create_index(
             [("user_id", 1), ("actual_sequence_number", -1)]
@@ -357,6 +1045,9 @@ class MongoSessionStore(NoopSessionStore):
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
+        latest_dataset_discovery: dict[str, Any] | None = None,
+        latest_training_recommendation: dict[str, Any] | None = None,
+        latest_training_preflight: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -382,7 +1073,9 @@ class MongoSessionStore(NoopSessionStore):
                     "last_active_at": now,
                     "message_count": message_count,
                     "turn_count": turn_count,
-                    "pending_approval": pending_approval or [],
+                    "pending_approval": sanitize_for_persistence(
+                        pending_approval or []
+                    ),
                     "claude_counted": claude_counted,
                     "notification_destinations": notification_destinations or [],
                     "auto_approval_enabled": auto_approval_enabled,
@@ -391,7 +1084,18 @@ class MongoSessionStore(NoopSessionStore):
                     "cloud_provider": cloud_provider,
                     "training_goal": training_goal,
                     "output_policy": output_policy,
-                    "uploaded_datasets": uploaded_datasets or [],
+                    "uploaded_datasets": sanitize_for_persistence(
+                        uploaded_datasets or []
+                    ),
+                    "latest_dataset_discovery": sanitize_for_persistence(
+                        latest_dataset_discovery or {}
+                    ),
+                    "latest_training_recommendation": sanitize_for_persistence(
+                        latest_training_recommendation or {}
+                    ),
+                    "latest_training_preflight": sanitize_for_persistence(
+                        latest_training_preflight or {}
+                    ),
                 },
             },
             upsert=True,
@@ -419,6 +1123,9 @@ class MongoSessionStore(NoopSessionStore):
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
         uploaded_datasets: list[dict[str, Any]] | None = None,
+        latest_dataset_discovery: dict[str, Any] | None = None,
+        latest_training_recommendation: dict[str, Any] | None = None,
+        latest_training_preflight: dict[str, Any] | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -443,6 +1150,9 @@ class MongoSessionStore(NoopSessionStore):
             training_goal=training_goal,
             output_policy=output_policy,
             uploaded_datasets=uploaded_datasets,
+            latest_dataset_discovery=latest_dataset_discovery,
+            latest_training_recommendation=latest_training_recommendation,
+            latest_training_preflight=latest_training_preflight,
         )
         ops: list[Any] = []
         for idx, raw in enumerate(messages):
@@ -516,6 +1226,7 @@ class MongoSessionStore(NoopSessionStore):
     async def update_session_fields(self, session_id: str, **fields: Any) -> None:
         if not self._ready() or not fields:
             return
+        fields = sanitize_for_persistence(fields)
         fields["updated_at"] = _now()
         await self.db.sessions.update_one({"_id": session_id}, {"$set": fields})
 
@@ -529,22 +1240,34 @@ class MongoSessionStore(NoopSessionStore):
         return int(doc["seq"])
 
     async def append_event(
-        self, session_id: str, event_type: str, data: dict[str, Any] | None
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict[str, Any] | None,
+        run_id: str | None = None,
     ) -> int | None:
         if not self._ready():
             return None
         try:
             seq = await self._next_seq(f"event:{session_id}")
+            safe_data = sanitize_for_persistence(data or {})
             await self.db.session_events.insert_one(
                 {
                     "_id": _doc_id(session_id, seq),
                     "session_id": session_id,
                     "seq": seq,
                     "event_type": event_type,
-                    "data": data or {},
+                    "data": safe_data,
                     "created_at": _now(),
                 }
             )
+            if run_id:
+                return await self.append_run_event(
+                    run_id=run_id,
+                    session_id=session_id,
+                    event_type=event_type,
+                    payload=safe_data,
+                )
             return seq
         except PyMongoError as e:
             logger.debug("Failed to append event for %s: %s", session_id, e)
@@ -557,6 +1280,579 @@ class MongoSessionStore(NoopSessionStore):
             return []
         cursor = self.db.session_events.find(
             {"session_id": session_id, "seq": {"$gt": int(after_seq or 0)}}
+        ).sort("seq", 1)
+        return [row async for row in cursor]
+
+    async def create_run(
+        self,
+        *,
+        session_id: str,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().create_run(
+                session_id=session_id,
+                provider=provider,
+                request_id=request_id,
+                status=status,
+            )
+        now = _now()
+        run_id = str(uuid.uuid4())
+        run = {
+            "_id": run_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "status": status,
+            "provider": provider or "none",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": None,
+            "completed_at": None,
+            "last_event_seq": 0,
+            "active_tool": None,
+            "active_provider_job_id": None,
+            "approval_id": None,
+            "error_summary": None,
+            "result_summary": None,
+            "request_id": request_id,
+            "provider_metadata": {},
+            "schema_version": SCHEMA_VERSION,
+        }
+        await self.db.runs.insert_one(run)
+        await self.append_run_event(
+            run_id=run_id,
+            session_id=session_id,
+            event_type="run_created",
+            payload={"request_id": request_id, "provider": provider},
+        )
+        return run
+
+    async def update_run(self, run_id: str, **fields: Any) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().update_run(run_id, **fields)
+        fields = sanitize_for_persistence(
+            {k: v for k, v in fields.items() if v is not None}
+        )
+        fields["updated_at"] = _now()
+        doc = await self.db.runs.find_one_and_update(
+            {"_id": run_id},
+            {"$set": fields},
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc
+
+    async def get_run(self, run_id: str) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_run(run_id)
+        return await self.db.runs.find_one({"_id": run_id})
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+        include_started_audit: bool = True,
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().record_training_preflight(
+                session_id=session_id,
+                preflight=preflight,
+                run_id=run_id,
+                include_started_audit=include_started_audit,
+            )
+        clean = sanitize_for_persistence(preflight)
+        if not isinstance(clean, dict):
+            clean = {}
+        clean["session_id"] = session_id
+        if run_id:
+            clean["run_id"] = run_id
+        now = _now()
+        await self.db.sessions.update_one(
+            {"_id": session_id},
+            {"$set": {"latest_training_preflight": clean, "updated_at": now}},
+            upsert=False,
+        )
+        if run_id:
+            existing_run = await self.get_run(run_id)
+            provider_metadata = dict(
+                (existing_run or {}).get("provider_metadata") or {}
+            )
+            provider_metadata["training_preflight"] = clean
+            await self.update_run(
+                run_id,
+                training_preflight=clean,
+                provider_metadata=provider_metadata,
+            )
+        for event in training_preflight_audit_events(
+            clean, include_started=include_started_audit
+        ):
+            await self.record_audit_event(event)
+        return dict(clean)
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_latest_training_preflight(session_id)
+        session = await self.db.sessions.find_one({"_id": session_id})
+        preflight = (
+            session.get("latest_training_preflight")
+            if isinstance(session, dict)
+            else None
+        )
+        return dict(preflight) if isinstance(preflight, dict) and preflight else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().get_run_training_preflight(session_id, run_id)
+        run = await self.get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        preflight = run.get("training_preflight")
+        if isinstance(preflight, dict) and preflight:
+            return dict(preflight)
+        provider_metadata = run.get("provider_metadata")
+        if isinstance(provider_metadata, dict) and isinstance(
+            provider_metadata.get("training_preflight"), dict
+        ):
+            return dict(provider_metadata["training_preflight"])
+        return None
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_runs(session_id)
+        cursor = self.db.runs.find({"session_id": session_id}).sort("updated_at", -1)
+        return [row async for row in cursor]
+
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        if not self._ready():
+            return await super().upsert_evaluation(evaluation)
+        now = _now()
+        clean = sanitize_for_persistence(
+            {key: value for key, value in evaluation.items() if value is not None}
+        )
+        evaluation_id = str(
+            clean.get("evaluation_id") or clean.get("_id") or uuid.uuid4()
+        )
+        clean["_id"] = evaluation_id
+        clean["evaluation_id"] = evaluation_id
+        clean["updated_at"] = now
+        doc = await self.db.evaluations.find_one_and_update(
+            {"evaluation_id": evaluation_id},
+            {
+                "$setOnInsert": {
+                    "_id": evaluation_id,
+                    "evaluation_id": evaluation_id,
+                    "created_at": clean.get("created_at") or now,
+                    "schema_version": SCHEMA_VERSION,
+                },
+                "$set": clean,
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        current = doc or clean
+        run_id = str(current.get("run_id") or "")
+        if run_id:
+            scores = (
+                current.get("scores") if isinstance(current.get("scores"), dict) else {}
+            )
+            await self.update_run(
+                run_id,
+                evaluation_status=current.get("status"),
+                evaluation_score=scores.get("overall_score"),
+                evaluation_id=evaluation_id,
+            )
+        await self._record_evaluation_audit_events(current)
+        return current
+
+    async def list_evaluations(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_evaluations(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                status=status,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if provider:
+            query["provider"] = provider
+        if status:
+            query["status"] = status
+        cursor = (
+            self.db.evaluations.find(query)
+            .sort("updated_at", -1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
+    async def upsert_usage_entry(
+        self, usage_id: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not self._ready():
+            return await super().upsert_usage_entry(usage_id, fields)
+        now = _now()
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in fields.items() if value is not None}
+        )
+        cleaned["usage_id"] = usage_id
+        cleaned["updated_at"] = now
+        doc = await self.db.usage_entries.find_one_and_update(
+            {"usage_id": usage_id},
+            {
+                "$setOnInsert": {
+                    "_id": usage_id,
+                    "usage_id": usage_id,
+                    "created_at": cleaned.get("created_at") or now,
+                    "schema_version": SCHEMA_VERSION,
+                },
+                "$set": cleaned,
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return doc or cleaned
+
+    async def list_usage_entries(
+        self,
+        *,
+        provider: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_usage_entries(
+                provider=provider,
+                session_id=session_id,
+                run_id=run_id,
+                status=status,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if provider:
+            query["provider"] = provider
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if status:
+            query["status"] = status
+        cursor = (
+            self.db.usage_entries.find(query)
+            .sort("updated_at", -1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        entries = await self.list_usage_entries(**filters)
+        return {**summarize_usage(entries), "entries": entries}
+
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        if not self._ready():
+            return await super().record_audit_event(event)
+        if not audit_timeline_enabled():
+            return None
+        audit_id = str(event.get("audit_id") or event.get("_id") or "")
+        if not audit_id:
+            return None
+        cleaned = sanitize_for_persistence(
+            {key: value for key, value in event.items() if value is not None}
+        )
+        cleaned["_id"] = audit_id
+        cleaned["audit_id"] = audit_id
+        try:
+            result = await self.db.audit_events.find_one_and_update(
+                {"audit_id": audit_id},
+                {
+                    "$setOnInsert": {
+                        **cleaned,
+                        "created_at": _now(),
+                        "schema_version": SCHEMA_VERSION,
+                    }
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
+            )
+            logger.info(
+                "audit_event audit_id=%s session_id=%s run_id=%s category=%s "
+                "event_type=%s provider=%s severity=%s status=%s",
+                cleaned.get("audit_id"),
+                cleaned.get("session_id"),
+                cleaned.get("run_id"),
+                cleaned.get("category"),
+                cleaned.get("event_type"),
+                cleaned.get("provider"),
+                cleaned.get("severity"),
+                cleaned.get("status"),
+            )
+            return result or cleaned
+        except DuplicateKeyError:
+            return await self.db.audit_events.find_one({"audit_id": audit_id})
+        except PyMongoError as e:
+            logger.debug("Failed to record audit event %s: %s", audit_id, e)
+            return None
+
+    async def list_audit_events(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        category: str | None = None,
+        severity: str | None = None,
+        status: str | None = None,
+        since: datetime | str | None = None,
+        until: datetime | str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().list_audit_events(
+                session_id=session_id,
+                run_id=run_id,
+                provider=provider,
+                category=category,
+                severity=severity,
+                status=status,
+                since=since,
+                until=until,
+                limit=limit,
+            )
+        query: dict[str, Any] = {}
+        if session_id:
+            query["session_id"] = session_id
+        if run_id:
+            query["run_id"] = run_id
+        if provider:
+            query["provider"] = provider
+        if category:
+            query["category"] = category
+        if severity:
+            query["severity"] = severity
+        if status:
+            query["status"] = status
+        timestamp_query: dict[str, Any] = {}
+        if since_dt := _parse_dt(since):
+            timestamp_query["$gte"] = since_dt
+        if until_dt := _parse_dt(until):
+            timestamp_query["$lte"] = until_dt
+        if timestamp_query:
+            query["timestamp"] = timestamp_query
+        cursor = (
+            self.db.audit_events.find(query)
+            .sort("timestamp", 1)
+            .limit(max(1, min(int(limit or 100), 500)))
+        )
+        return [row async for row in cursor]
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        events = await self.list_audit_events(**filters)
+        return {**summarize_audit_events(events), "events": events}
+
+    async def append_run_event(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> int | None:
+        if not self._ready():
+            return await super().append_run_event(
+                run_id=run_id,
+                session_id=session_id,
+                event_type=event_type,
+                payload=payload,
+            )
+        try:
+            seq = await self._next_seq(f"run_event:{run_id}")
+            safe_payload = sanitize_for_persistence(payload or {})
+            doc = {
+                "_id": _doc_id(run_id, seq),
+                "run_id": run_id,
+                "session_id": session_id,
+                "seq": seq,
+                "timestamp": _now(),
+                "event_type": event_type,
+                "payload": safe_payload,
+                "safe_summary": safe_event_summary(event_type, safe_payload),
+                "schema_version": SCHEMA_VERSION,
+            }
+            await self.db.run_events.insert_one(doc)
+            await self._apply_persisted_run_event_update(
+                run_id, event_type, safe_payload, seq
+            )
+            await self._record_audit_from_run_event(
+                session_id=session_id,
+                run_id=run_id,
+                event_type=event_type,
+                payload=safe_payload,
+            )
+            return seq
+        except PyMongoError as e:
+            logger.debug("Failed to append run event for %s: %s", run_id, e)
+            return None
+
+    async def _apply_persisted_run_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any], seq: int
+    ) -> None:
+        now = _now()
+        update: dict[str, Any] = {"last_event_seq": seq, "updated_at": now}
+        run = await self.get_run(run_id)
+        if status := run_status_from_event(event_type, payload):
+            update["status"] = status
+            if status == "running" and not (run or {}).get("started_at"):
+                update["started_at"] = now
+            if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+                update["completed_at"] = now
+        provider_fields = provider_metadata_from_event(event_type, payload)
+        provider_metadata = dict((run or {}).get("provider_metadata") or {})
+        if discovery := _dataset_discovery_from_event(event_type, payload):
+            update["dataset_discovery"] = discovery
+            provider_metadata["dataset_discovery"] = discovery
+            update["provider_metadata"] = provider_metadata
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            update["training_recommendation"] = recommendation
+            provider_metadata["training_recommendation"] = recommendation
+            update["provider_metadata"] = provider_metadata
+        if provider_fields:
+            if provider := provider_fields.pop("provider", None):
+                update["provider"] = provider
+                provider_metadata["provider"] = provider
+            for key, value in provider_fields.items():
+                update[key] = value
+                provider_metadata[key] = value
+            provider_metadata["last_checked_at"] = now.isoformat()
+            update["provider_metadata"] = provider_metadata
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            first = tools[0] if isinstance(tools, list) and tools else {}
+            if isinstance(first, dict):
+                update["approval_id"] = first.get("approval_id") or first.get(
+                    "tool_call_id"
+                )
+                update["active_tool"] = first.get("tool")
+        if event_type in {"error", "stream_error"}:
+            update["error_summary"] = str(payload.get("error") or "")[:500]
+        if event_type in {"assistant_message", "turn_complete"}:
+            summary = safe_event_summary(event_type, payload)
+            if summary:
+                update["result_summary"] = summary
+        await self.update_run(run_id, **update)
+        await self._apply_persisted_usage_event_update(
+            run_id, event_type, payload, update
+        )
+        await self._apply_persisted_evaluation_event_update(run_id, event_type, payload)
+
+    async def _apply_persisted_evaluation_event_update(
+        self, run_id: str, event_type: str, payload: dict[str, Any]
+    ) -> None:
+        if event_type not in {"tool_output", "assistant_message", "turn_complete"}:
+            return
+        run = await self.get_run(run_id)
+        if not run:
+            return
+        text = ""
+        for key in ("output", "content", "final_response", "formatted"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                text = value
+                break
+        context = evaluation_context_from_liga_output(
+            session_id=str(run.get("session_id") or ""),
+            run_id=run_id,
+            output=text,
+            fallback_provider=str(run.get("provider") or ""),
+        )
+        if not context:
+            return
+        await self.upsert_evaluation(build_post_training_evaluation(context))
+
+    async def _apply_persisted_usage_event_update(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        run_update: dict[str, Any],
+    ) -> None:
+        run = await self.get_run(run_id)
+        session_id = str(
+            (run or {}).get("session_id") or payload.get("session_id") or ""
+        )
+        if not session_id:
+            return
+        if event_type == "approval_required":
+            tools = payload.get("tools") if isinstance(payload, dict) else None
+            if isinstance(tools, list):
+                for tool_payload in tools:
+                    if isinstance(tool_payload, dict):
+                        usage_id, entry = usage_from_approval_tool(
+                            session_id=session_id,
+                            run_id=run_id,
+                            tool_payload=tool_payload,
+                            event_payload=payload,
+                        )
+                        await self.upsert_usage_entry(usage_id, entry)
+            return
+        if recommendation := _training_recommendation_from_event(event_type, payload):
+            usage_update = usage_from_training_recommendation(
+                session_id=session_id,
+                run_id=run_id,
+                recommendation=recommendation,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
+            return
+        existing = await self.list_usage_entries(session_id=session_id, run_id=run_id)
+        if event_type == "tool_state_change":
+            usage_update = usage_from_tool_state(
+                session_id=session_id,
+                run_id=run_id,
+                payload=payload,
+                existing=existing,
+            )
+            if usage_update:
+                usage_id, fields = usage_update
+                await self.upsert_usage_entry(usage_id, fields)
+            return
+        status = run_update.get("status")
+        if status in {"succeeded", "failed", "cancelled", "interrupted"}:
+            fields = usage_from_run_terminal(
+                run_id=run_id,
+                status=str(status),
+                error_summary=run_update.get("error_summary"),
+            )
+            for entry in existing:
+                await self.upsert_usage_entry(str(entry["usage_id"]), fields)
+
+    async def load_run_events_after(
+        self, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]]:
+        if not self._ready():
+            return await super().load_run_events_after(run_id, after_seq)
+        cursor = self.db.run_events.find(
+            {"run_id": run_id, "seq": {"$gt": int(after_seq or 0)}}
         ).sort("seq", 1)
         return [row async for row in cursor]
 
@@ -1015,7 +2311,7 @@ def get_session_store() -> NoopSessionStore | MongoSessionStore:
     global _store
     if _store is None:
         uri = os.environ.get("MONGODB_URI")
-        db_name = os.environ.get("MONGODB_DB", "ml-intern")
+        db_name = os.environ.get("MONGODB_DB", "liga_ml")
         _store = MongoSessionStore(uri, db_name) if uri else NoopSessionStore()
     return _store
 

@@ -12,6 +12,9 @@ from typing import Any, Optional
 
 from agent.config import load_config
 from agent.core.agent_loop import process_submission
+from agent.core.audit import build_audit_event
+from agent.core.background_runs import RUN_TERMINAL_STATUSES, background_runs_in_process
+from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event, OpType, Session
 from agent.core.session_persistence import get_session_store
 from agent.core.tools import ToolRouter
@@ -40,6 +43,14 @@ class Submission:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _iso_or_none(value: Any) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if value is None:
+        return None
+    return str(value)
 
 
 class EventBroadcaster:
@@ -234,6 +245,25 @@ class SessionManager:
         return [dict(upload) for upload in uploads if isinstance(upload, dict)]
 
     @staticmethod
+    def _serialize_dataset_discovery(session: Session) -> dict[str, Any] | None:
+        discovery = getattr(session, "latest_dataset_discovery", None)
+        return sanitize_for_frontend(discovery) if isinstance(discovery, dict) else None
+
+    @staticmethod
+    def _serialize_training_recommendation(session: Session) -> dict[str, Any] | None:
+        recommendation = getattr(session, "latest_training_recommendation", None)
+        return (
+            sanitize_for_frontend(recommendation)
+            if isinstance(recommendation, dict)
+            else None
+        )
+
+    @staticmethod
+    def _serialize_training_preflight(session: Session) -> dict[str, Any] | None:
+        preflight = getattr(session, "latest_training_preflight", None)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
+
+    @staticmethod
     def _pending_tools_for_api(session: Session) -> list[dict[str, Any]] | None:
         pending = session.pending_approval or {}
         tool_calls = pending.get("tool_calls") or []
@@ -392,6 +422,314 @@ class SessionManager:
             "estimated_spend_usd": round(estimated, 4),
             "remaining_usd": remaining,
         }
+
+    @staticmethod
+    def _serialize_run(run: dict[str, Any]) -> dict[str, Any]:
+        provider_metadata = dict(run.get("provider_metadata") or {})
+        payload = {
+            "run_id": str(run.get("run_id") or run.get("_id") or ""),
+            "session_id": str(run.get("session_id") or ""),
+            "status": str(run.get("status") or "queued"),
+            "provider": str(
+                provider_metadata.get("provider") or run.get("provider") or "none"
+            ),
+            "created_at": _iso_or_none(run.get("created_at")),
+            "updated_at": _iso_or_none(run.get("updated_at")),
+            "started_at": _iso_or_none(run.get("started_at")),
+            "completed_at": _iso_or_none(run.get("completed_at")),
+            "last_event_seq": int(run.get("last_event_seq") or 0),
+            "active_tool": run.get("active_tool"),
+            "active_provider_job_id": run.get("active_provider_job_id"),
+            "approval_id": run.get("approval_id"),
+            "error_summary": run.get("error_summary"),
+            "result_summary": run.get("result_summary"),
+            "provider_metadata": {
+                "provider": str(
+                    provider_metadata.get("provider") or run.get("provider") or "none"
+                ),
+                "status": provider_metadata.get("provider_status")
+                or run.get("provider_status"),
+                "job_id": run.get("active_provider_job_id"),
+                "console_url": provider_metadata.get("provider_console_url")
+                or run.get("provider_console_url"),
+                "logs_url": provider_metadata.get("provider_logs_url")
+                or run.get("provider_logs_url"),
+                "artifact_path": provider_metadata.get("provider_artifact_path")
+                or run.get("provider_artifact_path"),
+                "output_policy": provider_metadata.get("provider_output_policy")
+                or run.get("provider_output_policy"),
+                "last_checked_at": provider_metadata.get("last_checked_at"),
+                "training_recommendation": provider_metadata.get(
+                    "training_recommendation"
+                ),
+                "training_preflight": provider_metadata.get("training_preflight"),
+            },
+            "evaluation_id": run.get("evaluation_id"),
+            "evaluation_status": run.get("evaluation_status"),
+            "evaluation_score": run.get("evaluation_score"),
+            "estimated_cost_usd": run.get("estimated_cost_usd"),
+            "known_cost_usd": run.get("known_cost_usd"),
+            "usage_status": run.get("usage_status") or "unknown",
+            "budget_warning": run.get("budget_warning"),
+            "quota_warning": run.get("quota_warning"),
+            "audit_event_count": int(run.get("audit_event_count") or 0),
+            "audit_warning_count": int(run.get("audit_warning_count") or 0),
+            "audit_error_count": int(run.get("audit_error_count") or 0),
+            "latest_audit_event": run.get("latest_audit_event"),
+            "dataset_discovery": run.get("dataset_discovery"),
+            "training_recommendation": run.get("training_recommendation"),
+            "training_preflight": run.get("training_preflight"),
+        }
+        return sanitize_for_frontend(payload)
+
+    @staticmethod
+    def _usage_totals_for_run(
+        run: dict[str, Any], entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if not entries:
+            return run
+        estimated = round(
+            sum(float(entry.get("estimated_cost_usd") or 0.0) for entry in entries), 4
+        )
+        known_values = [
+            entry.get("known_cost_usd")
+            for entry in entries
+            if entry.get("known_cost_usd") is not None
+        ]
+        known = (
+            round(sum(float(value or 0.0) for value in known_values), 4)
+            if known_values
+            else None
+        )
+        statuses = [str(entry.get("status") or "unknown") for entry in entries]
+        run = dict(run)
+        run["estimated_cost_usd"] = estimated
+        run["known_cost_usd"] = known
+        run["usage_status"] = next(
+            (status for status in statuses if status not in {"succeeded", "unknown"}),
+            statuses[0],
+        )
+        run["budget_warning"] = next(
+            (entry.get("warning") for entry in entries if entry.get("warning")), None
+        )
+        run["quota_warning"] = next(
+            (
+                entry.get("error_summary") or entry.get("warning")
+                for entry in entries
+                if entry.get("quota_status") == "blocked" or entry.get("error_summary")
+            ),
+            None,
+        )
+        return run
+
+    @staticmethod
+    def _audit_totals_for_run(
+        run: dict[str, Any], events: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        run = dict(run)
+        run["audit_event_count"] = len(events)
+        run["audit_warning_count"] = sum(
+            1 for event in events if event.get("severity") == "warning"
+        )
+        run["audit_error_count"] = sum(
+            1 for event in events if event.get("severity") in {"error", "critical"}
+        )
+        latest = events[-1] if events else None
+        if latest:
+            latest = dict(latest)
+            latest["timestamp"] = _iso_or_none(latest.get("timestamp"))
+        run["latest_audit_event"] = latest
+        return run
+
+    async def _serialize_run_with_usage(self, run: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(run.get("run_id") or run.get("_id") or "")
+        entries = await self._store().list_usage_entries(run_id=run_id, limit=50)
+        audit_events = await self._store().list_audit_events(run_id=run_id, limit=500)
+        enriched = self._usage_totals_for_run(run, entries)
+        enriched = self._audit_totals_for_run(enriched, audit_events)
+        return self._serialize_run(enriched)
+
+    @staticmethod
+    def _serialize_run_event(event: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "run_id": str(event.get("run_id") or ""),
+            "session_id": str(event.get("session_id") or ""),
+            "seq": int(event.get("seq") or 0),
+            "timestamp": _iso_or_none(
+                event.get("timestamp") or event.get("created_at")
+            ),
+            "event_type": str(event.get("event_type") or ""),
+            "payload": event.get("payload") or event.get("data") or {},
+            "safe_summary": event.get("safe_summary"),
+        }
+        return sanitize_for_frontend(payload)
+
+    async def create_run(
+        self,
+        session_id: str,
+        *,
+        provider: str = "none",
+        request_id: str | None = None,
+        status: str = "queued",
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if not agent_session or not agent_session.is_active:
+            return None
+        run = await self._store().create_run(
+            session_id=session_id,
+            provider=provider,
+            request_id=request_id,
+            status=status,
+        )
+        run_id = str(run.get("run_id") or run.get("_id"))
+        agent_session.session.current_run_id = run_id
+        return await self._serialize_run_with_usage(run)
+
+    async def list_runs(self, session_id: str) -> list[dict[str, Any]]:
+        return [
+            await self._serialize_run_with_usage(run)
+            for run in await self._store().list_runs(session_id)
+        ]
+
+    async def get_run(self, session_id: str, run_id: str) -> dict[str, Any] | None:
+        run = await self._store().get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        return await self._serialize_run_with_usage(run)
+
+    async def get_run_dataset_discovery(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        run = await self.get_run(session_id, run_id)
+        discovery = run.get("dataset_discovery") if isinstance(run, dict) else None
+        return sanitize_for_frontend(discovery) if isinstance(discovery, dict) else None
+
+    async def get_latest_dataset_discovery(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            discovery = self._serialize_dataset_discovery(agent_session.session)
+            if discovery:
+                return discovery
+        for run in await self.list_runs(session_id):
+            discovery = run.get("dataset_discovery")
+            if isinstance(discovery, dict):
+                return sanitize_for_frontend(discovery)
+        return None
+
+    async def get_run_training_recommendation(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        run = await self.get_run(session_id, run_id)
+        recommendation = (
+            run.get("training_recommendation") if isinstance(run, dict) else None
+        )
+        return (
+            sanitize_for_frontend(recommendation)
+            if isinstance(recommendation, dict)
+            else None
+        )
+
+    async def get_latest_training_recommendation(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            recommendation = self._serialize_training_recommendation(
+                agent_session.session
+            )
+            if recommendation:
+                return recommendation
+        for run in await self.list_runs(session_id):
+            recommendation = run.get("training_recommendation")
+            if isinstance(recommendation, dict):
+                return sanitize_for_frontend(recommendation)
+        return None
+
+    async def record_training_preflight(
+        self,
+        *,
+        session_id: str,
+        preflight: dict[str, Any],
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        clean = sanitize_for_frontend(preflight)
+        agent_session = self.sessions.get(session_id)
+        if agent_session and isinstance(clean, dict):
+            agent_session.session.latest_training_preflight = dict(clean)
+        return sanitize_for_frontend(
+            await self._store().record_training_preflight(
+                session_id=session_id,
+                preflight=clean if isinstance(clean, dict) else {},
+                run_id=run_id,
+            )
+        )
+
+    async def get_latest_training_preflight(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        agent_session = self.sessions.get(session_id)
+        if agent_session:
+            preflight = self._serialize_training_preflight(agent_session.session)
+            if preflight:
+                return preflight
+        preflight = await self._store().get_latest_training_preflight(session_id)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
+
+    async def get_run_training_preflight(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        preflight = await self._store().get_run_training_preflight(session_id, run_id)
+        return sanitize_for_frontend(preflight) if isinstance(preflight, dict) else None
+
+    async def list_usage_entries(self, **filters: Any) -> list[dict[str, Any]]:
+        return await self._store().list_usage_entries(**filters)
+
+    async def usage_summary(self, **filters: Any) -> dict[str, Any]:
+        return await self._store().usage_summary(**filters)
+
+    async def record_audit_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        return await self._store().record_audit_event(event)
+
+    async def list_audit_events(self, **filters: Any) -> list[dict[str, Any]]:
+        return await self._store().list_audit_events(**filters)
+
+    async def audit_summary(self, **filters: Any) -> dict[str, Any]:
+        return await self._store().audit_summary(**filters)
+
+    async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
+        return sanitize_for_frontend(await self._store().upsert_evaluation(evaluation))
+
+    async def list_evaluations(self, **filters: Any) -> list[dict[str, Any]]:
+        return sanitize_for_frontend(await self._store().list_evaluations(**filters))
+
+    async def get_evaluation_for_run(
+        self, session_id: str, run_id: str
+    ) -> dict[str, Any] | None:
+        evaluation = await self._store().get_evaluation_for_run(session_id, run_id)
+        return sanitize_for_frontend(evaluation) if evaluation else None
+
+    async def evaluation_summary(self, **filters: Any) -> dict[str, Any]:
+        return sanitize_for_frontend(await self._store().evaluation_summary(**filters))
+
+    async def load_run_events_after(
+        self, session_id: str, run_id: str, after_seq: int = 0
+    ) -> list[dict[str, Any]] | None:
+        run = await self._store().get_run(run_id)
+        if not run or str(run.get("session_id")) != session_id:
+            return None
+        return [
+            self._serialize_run_event(event)
+            for event in await self._store().load_run_events_after(run_id, after_seq)
+        ]
+
+    async def latest_attachable_run(self, session_id: str) -> dict[str, Any] | None:
+        for run in await self.list_runs(session_id):
+            if run["status"] not in RUN_TERMINAL_STATUSES:
+                return run
+        runs = await self.list_runs(session_id)
+        return runs[0] if runs else None
 
     async def _start_agent_session(
         self,
@@ -627,6 +965,15 @@ class SessionManager:
                 uploaded_datasets=self._serialize_uploaded_datasets(
                     agent_session.session
                 ),
+                latest_dataset_discovery=self._serialize_dataset_discovery(
+                    agent_session.session
+                ),
+                latest_training_recommendation=(
+                    self._serialize_training_recommendation(agent_session.session)
+                ),
+                latest_training_preflight=self._serialize_training_preflight(
+                    agent_session.session
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -745,6 +1092,14 @@ class SessionManager:
             for upload in meta.get("uploaded_datasets") or []
             if isinstance(upload, dict)
         ]
+        if isinstance(meta.get("latest_dataset_discovery"), dict):
+            session.latest_dataset_discovery = dict(meta["latest_dataset_discovery"])
+        if isinstance(meta.get("latest_training_recommendation"), dict):
+            session.latest_training_recommendation = dict(
+                meta["latest_training_recommendation"]
+            )
+        if isinstance(meta.get("latest_training_preflight"), dict):
+            session.latest_training_preflight = dict(meta["latest_training_preflight"])
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):
@@ -783,6 +1138,23 @@ class SessionManager:
         if preload_sandbox:
             self._start_cpu_sandbox_preload(agent_session)
         logger.info("Restored session %s for user %s", session_id, owner or user_id)
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_restored",
+                category="session",
+                status="created",
+                actor="system",
+                title="Session restored",
+                message="Session state was restored from durable storage.",
+                provider=cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+                model_name=str(model),
+                output_policy=output_policy,
+                safe_metadata={"training_goal": training_goal},
+            )
+        )
         return agent_session
 
     async def create_session(
@@ -877,6 +1249,23 @@ class SessionManager:
         if is_pro is not None and user_id and user_id != "dev":
             await self._track_pro_status(agent_session, is_pro=is_pro)
 
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_created",
+                category="session",
+                status="created",
+                actor="user",
+                title="Session created",
+                message="A new chat session was created.",
+                provider=cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+                model_name=session.config.model_name,
+                output_policy=output_policy,
+                safe_metadata={"training_goal": training_goal},
+            )
+        )
         logger.info(f"Created session {session_id} for user {user_id}")
         return session_id
 
@@ -1056,6 +1445,18 @@ class SessionManager:
                         )
                         agent_session.is_processing = True
                         try:
+                            if getattr(session, "current_run_id", None):
+                                await self._store().append_run_event(
+                                    run_id=session.current_run_id,
+                                    session_id=session_id,
+                                    event_type="run_started",
+                                    payload={
+                                        "submission_id": submission.id,
+                                        "provider": getattr(
+                                            session, "cloud_provider", "none"
+                                        ),
+                                    },
+                                )
                             should_continue = await process_submission(
                                 session, submission
                             )
@@ -1135,9 +1536,14 @@ class SessionManager:
         cloud_provider: str | None = None,
         training_goal: str | None = None,
         output_policy: str | None = None,
+        *,
+        request_id: str | None = None,
+        run_id: str | None = None,
     ) -> bool:
         """Submit user input to a session."""
         agent_session = self.sessions.get(session_id)
+        if agent_session and not hasattr(agent_session.session, "current_run_id"):
+            agent_session.session.current_run_id = None
         if (
             cloud_provider in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}
             and agent_session
@@ -1156,21 +1562,77 @@ class SessionManager:
         ):
             agent_session.output_policy = output_policy
             agent_session.session.output_policy = output_policy
-        operation = Operation(
-            op_type=OpType.USER_INPUT,
-            data={
-                "text": text,
-                "cloud_provider": cloud_provider,
-                "training_goal": training_goal,
-                "output_policy": output_policy,
-            },
-        )
+        if agent_session:
+            if run_id:
+                agent_session.session.current_run_id = run_id
+            elif background_runs_in_process() or not getattr(
+                agent_session.session, "current_run_id", None
+            ):
+                run = await self.create_run(
+                    session_id,
+                    provider=cloud_provider
+                    or getattr(agent_session.session, "cloud_provider", "none"),
+                    request_id=request_id,
+                )
+                if run:
+                    run_id = run["run_id"]
+        data = {
+            "text": text,
+            "cloud_provider": cloud_provider,
+            "training_goal": training_goal,
+            "output_policy": output_policy,
+        }
+        if run_id:
+            data["run_id"] = run_id
+        elif agent_session:
+            data["run_id"] = getattr(agent_session.session, "current_run_id", None)
+        if agent_session:
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    run_id=run_id,
+                    event_type="chat_prompt_submitted",
+                    category="chat",
+                    status="started",
+                    actor="user",
+                    title="Prompt submitted",
+                    message="User submitted a prompt for agent processing.",
+                    provider=getattr(
+                        agent_session.session, "cloud_provider", "unknown"
+                    ),
+                    entity_type="prompt",
+                    entity_id=request_id or run_id,
+                    output_policy=getattr(agent_session.session, "output_policy", None),
+                    safe_metadata={
+                        "request_id": request_id,
+                        "text_length": len(text or ""),
+                        "training_goal": getattr(
+                            agent_session.session, "training_goal", None
+                        ),
+                    },
+                )
+            )
+        operation = Operation(op_type=OpType.USER_INPUT, data=data)
         return await self.submit(session_id, operation)
 
     async def submit_approval(
-        self, session_id: str, approvals: list[dict[str, Any]]
+        self,
+        session_id: str,
+        approvals: list[dict[str, Any]],
+        *,
+        run_id: str | None = None,
     ) -> bool:
         """Submit tool approvals to a session."""
+        agent_session = self.sessions.get(session_id)
+        if agent_session and run_id:
+            agent_session.session.current_run_id = run_id
+        if agent_session and getattr(agent_session.session, "current_run_id", None):
+            await self._store().append_run_event(
+                run_id=agent_session.session.current_run_id,
+                session_id=session_id,
+                event_type="approval_resolved",
+                payload={"approvals": approvals},
+            )
         operation = Operation(
             op_type=OpType.EXEC_APPROVAL, data={"approvals": approvals}
         )
@@ -1182,6 +1644,13 @@ class SessionManager:
         if not agent_session or not agent_session.is_active:
             return False
         agent_session.session.cancel()
+        if getattr(agent_session.session, "current_run_id", None):
+            await self._store().append_run_event(
+                run_id=agent_session.session.current_run_id,
+                session_id=session_id,
+                event_type="interrupted",
+                payload={"reason": "user_interrupt"},
+            )
         return True
 
     async def undo(self, session_id: str) -> bool:
@@ -1231,9 +1700,38 @@ class SessionManager:
 
         if not agent_session:
             await self._store().soft_delete_session(session_id)
+            await self.record_audit_event(
+                build_audit_event(
+                    session_id=session_id,
+                    event_type="session_deleted",
+                    category="session",
+                    severity="warning",
+                    status="completed",
+                    actor="user",
+                    title="Session deleted",
+                    message="The session was deleted.",
+                    entity_type="session",
+                    entity_id=session_id,
+                )
+            )
             return True
 
         await self._store().soft_delete_session(session_id)
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="session_deleted",
+                category="session",
+                severity="warning",
+                status="completed",
+                actor="user",
+                title="Session deleted",
+                message="The session was deleted.",
+                provider=agent_session.cloud_provider,
+                entity_type="session",
+                entity_id=session_id,
+            )
+        )
 
         # Clean up sandbox Space before cancelling the task
         await self._cleanup_sandbox(agent_session.session)
@@ -1271,8 +1769,25 @@ class SessionManager:
         agent_session = self.sessions.get(session_id)
         if not agent_session or not agent_session.is_active:
             return False
+        previous_model = agent_session.session.config.model_name
         agent_session.session.update_model(model_id)
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="model_changed",
+                category="session",
+                status="completed",
+                actor="user",
+                title="Model changed",
+                message=f"Model changed from {previous_model} to {model_id}.",
+                provider=agent_session.cloud_provider,
+                entity_type="model",
+                entity_id=model_id,
+                model_name=model_id,
+                safe_metadata={"previous_model": previous_model},
+            )
+        )
         return True
 
     async def update_session_cloud_provider(
@@ -1285,6 +1800,11 @@ class SessionManager:
         agent_session = self.sessions.get(session_id)
         if not agent_session or not agent_session.is_active:
             return False
+        previous = {
+            "cloud_provider": agent_session.cloud_provider,
+            "training_goal": agent_session.training_goal,
+            "output_policy": agent_session.output_policy,
+        }
         agent_session.cloud_provider = cloud_provider
         agent_session.session.cloud_provider = cloud_provider
         if training_goal in {"smoke-test", "production", "agent-decide"}:
@@ -1294,6 +1814,28 @@ class SessionManager:
             agent_session.output_policy = output_policy
             agent_session.session.output_policy = output_policy
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
+        await self.record_audit_event(
+            build_audit_event(
+                session_id=session_id,
+                event_type="provider_settings_changed",
+                category="session",
+                status="completed",
+                actor="user",
+                title="Provider settings changed",
+                message=(
+                    f"Provider set to {cloud_provider}; training goal "
+                    f"{agent_session.training_goal}; output policy {agent_session.output_policy}."
+                ),
+                provider=cloud_provider,
+                entity_type="provider_settings",
+                entity_id=cloud_provider,
+                output_policy=agent_session.output_policy,
+                safe_metadata={
+                    "previous": previous,
+                    "training_goal": agent_session.training_goal,
+                },
+            )
+        )
         return True
 
     async def update_session_auto_approval(
@@ -1379,6 +1921,12 @@ class SessionManager:
             "auto_approval": self._auto_approval_summary(agent_session.session),
             "uploaded_datasets": self._serialize_uploaded_datasets(
                 agent_session.session
+            ),
+            "latest_dataset_discovery": self._serialize_dataset_discovery(
+                agent_session.session
+            ),
+            "latest_training_recommendation": (
+                self._serialize_training_recommendation(agent_session.session)
             ),
         }
 
@@ -1475,6 +2023,10 @@ class SessionManager:
                             ),
                         },
                         "uploaded_datasets": row.get("uploaded_datasets") or [],
+                        "latest_dataset_discovery": row.get("latest_dataset_discovery"),
+                        "latest_training_recommendation": row.get(
+                            "latest_training_recommendation"
+                        ),
                     }
                 )
             return results
