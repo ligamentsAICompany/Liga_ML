@@ -619,3 +619,26 @@ async def test_create_session_capacity_response_includes_actionable_metadata(
         "error_type": "per_user",
         "cleanup": {"cleared": 0, "skipped": 10},
     }
+
+
+@pytest.mark.asyncio
+async def test_create_session_route_disables_automatic_sandbox_preload(monkeypatch):
+    captured: dict = {}
+
+    async def fake_create_session(**kwargs):
+        captured.update(kwargs)
+        return "session-1"
+
+    async def request_json():
+        return {}
+
+    monkeypatch.setattr(agent.session_manager, "create_session", fake_create_session)
+    monkeypatch.setattr(agent, "resolve_hf_request_token", lambda _request: None)
+
+    response = await agent.create_session(
+        SimpleNamespace(json=request_json),
+        {"user_id": "u1", "username": "alice", "plan": "free"},
+    )
+
+    assert response.session_id == "session-1"
+    assert captured["preload_sandbox"] is False

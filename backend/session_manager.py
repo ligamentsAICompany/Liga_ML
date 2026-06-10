@@ -14,6 +14,11 @@ from agent.config import load_config
 from agent.core.agent_loop import process_submission
 from agent.core.audit import build_audit_event
 from agent.core.background_runs import RUN_TERMINAL_STATUSES, background_runs_in_process
+from agent.core.post_training_evaluation import (
+    build_post_training_evaluation,
+    evaluation_context_from_response_row,
+    summarize_evaluations,
+)
 from agent.core.redact import sanitize_for_frontend
 from agent.core.session import Event, OpType, Session
 from agent.core.session_persistence import get_session_store
@@ -818,17 +823,93 @@ class SessionManager:
     async def upsert_evaluation(self, evaluation: dict[str, Any]) -> dict[str, Any]:
         return sanitize_for_frontend(await self._store().upsert_evaluation(evaluation))
 
+    async def _response_row_evaluations(
+        self,
+        *,
+        user_id: str = "dev",
+        session_id: str | None = None,
+        run_id: str | None = None,
+        provider: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        store = self._store()
+        if not hasattr(store, "list_response_rows"):
+            return []
+        try:
+            response_page = await store.list_response_rows(
+                user_id=user_id or "dev",
+                session_id=session_id,
+                platform=provider,
+                page=1,
+                page_size=max(1, min(int(limit or 100), 500)),
+            )
+        except Exception as e:
+            logger.debug("Failed to derive evaluations from response rows: %s", e)
+            return []
+        evaluations: list[dict[str, Any]] = []
+        for row in response_page.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            context = evaluation_context_from_response_row(row)
+            if not context:
+                continue
+            evaluation = build_post_training_evaluation(context)
+            if run_id and evaluation.get("run_id") != run_id:
+                continue
+            if status and evaluation.get("status") != status:
+                continue
+            evaluations.append(evaluation)
+        return evaluations
+
     async def list_evaluations(self, **filters: Any) -> list[dict[str, Any]]:
-        return sanitize_for_frontend(await self._store().list_evaluations(**filters))
+        user_id = str(filters.pop("user_id", "dev") or "dev")
+        limit = int(filters.get("limit") or 100)
+        stored = await self._store().list_evaluations(**filters)
+        derived = await self._response_row_evaluations(
+            user_id=user_id,
+            session_id=filters.get("session_id"),
+            run_id=filters.get("run_id"),
+            provider=filters.get("provider"),
+            status=filters.get("status"),
+            limit=limit,
+        )
+        by_id: dict[str, dict[str, Any]] = {}
+        for evaluation in [*derived, *stored]:
+            evaluation_id = str(evaluation.get("evaluation_id") or "")
+            if evaluation_id:
+                by_id[evaluation_id] = evaluation
+        evaluations = sorted(
+            by_id.values(),
+            key=lambda item: str(
+                item.get("updated_at")
+                or item.get("completed_at")
+                or item.get("created_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        return sanitize_for_frontend(evaluations[: max(1, min(limit, 500))])
 
     async def get_evaluation_for_run(
-        self, session_id: str, run_id: str
+        self, session_id: str, run_id: str, *, user_id: str = "dev"
     ) -> dict[str, Any] | None:
         evaluation = await self._store().get_evaluation_for_run(session_id, run_id)
-        return sanitize_for_frontend(evaluation) if evaluation else None
+        if evaluation:
+            return sanitize_for_frontend(evaluation)
+        derived = await self._response_row_evaluations(
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+            limit=50,
+        )
+        return sanitize_for_frontend(derived[0]) if derived else None
 
     async def evaluation_summary(self, **filters: Any) -> dict[str, Any]:
-        return sanitize_for_frontend(await self._store().evaluation_summary(**filters))
+        evaluations = await self.list_evaluations(**filters)
+        return sanitize_for_frontend(
+            {**summarize_evaluations(evaluations), "evaluations": evaluations}
+        )
 
     async def load_run_events_after(
         self, session_id: str, run_id: str, after_seq: int = 0
@@ -1287,6 +1368,7 @@ class SessionManager:
         cloud_provider: str = "hf-jobs",
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
+        preload_sandbox: bool = True,
     ) -> str:
         """Create a new agent session and return its ID.
 
@@ -1389,7 +1471,8 @@ class SessionManager:
             tool_router=tool_router,
         )
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
-        self._start_cpu_sandbox_preload(agent_session)
+        if preload_sandbox:
+            self._start_cpu_sandbox_preload(agent_session)
 
         if is_pro is not None and user_id and user_id != "dev":
             await self._track_pro_status(agent_session, is_pro=is_pro)

@@ -3,8 +3,10 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import { createDatasetDiscoveryPanel } from '../src/lib/dataset-discovery-panel.js';
+import { isSamePanelState } from '../src/lib/panel-state.js';
 
 const toolCallGroupSource = readFileSync('src/components/Chat/ToolCallGroup.tsx', 'utf8');
+const layoutStoreSource = readFileSync('src/store/layoutStore.ts', 'utf8');
 
 test('dataset discovery panel renders allowed sources', () => {
   const panel = createDatasetDiscoveryPanel({
@@ -152,6 +154,36 @@ test('dataset discovery panel renders user-selection requirement and empty candi
   assert.match(panel.markdown, /No uploaded dataset is attached/);
   assert.match(panel.markdown, /No candidate datasets supplied yet/);
   assert.match(panel.markdown, /User selection required before training/);
+});
+
+test('dataset discovery panel state comparison treats equal panel content as unchanged', () => {
+  const panel = createDatasetDiscoveryPanel({
+    candidates: [{ dataset_id: 'public/support', title: 'Support', score: 0.9 }],
+  });
+  const data = {
+    title: 'Dataset Discovery',
+    output: { content: panel.markdown, language: 'markdown' },
+  };
+
+  assert.equal(isSamePanelState(data, 'output', false, { ...data }, 'output'), true);
+  assert.equal(
+    isSamePanelState(
+      data,
+      'output',
+      false,
+      {
+        title: 'Dataset Discovery',
+        output: { content: `${panel.markdown}\nnew line`, language: 'markdown' },
+      },
+      'output',
+    ),
+    false,
+  );
+});
+
+test('layout panel open setters avoid no-op store writes', () => {
+  assert.match(layoutStoreSource, /state\.isRightPanelOpen === open/);
+  assert.match(layoutStoreSource, /state\.isLeftSidebarOpen === open/);
 });
 
 test('dataset discovery tool displays a readable label', () => {

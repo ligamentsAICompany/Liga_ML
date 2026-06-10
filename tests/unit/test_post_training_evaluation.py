@@ -11,6 +11,7 @@ if str(_BACKEND_DIR) not in sys.path:
 from agent.core.post_training_evaluation import (  # noqa: E402
     build_post_training_evaluation,
     domain_from_context,
+    evaluation_context_from_response_row,
     evaluation_enabled,
     metric_summary,
     plan_post_training_evaluation,
@@ -135,6 +136,35 @@ def test_failed_training_is_skipped():
     assert "training did not succeed" in evaluation["failure_summary"].lower()
 
 
+def test_response_row_context_marks_static_evaluation_limitations():
+    context = evaluation_context_from_response_row(
+        {
+            "id": "row-1",
+            "session_id": "s-response",
+            "platform": "hf-jobs",
+            "progress": "completed",
+            "job_id": "https://huggingface.co/jobs/acme/job-1",
+            "final_artifact_or_result": "https://huggingface.co/acme/model",
+            "result_storage": "hf-hub",
+            "run_type": "smoke-test",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "completed_at": "2026-06-10T00:00:00+00:00",
+        }
+    )
+
+    assert context is not None
+    evaluation = build_post_training_evaluation(context)
+
+    assert evaluation["run_id"] == "response_row:row-1"
+    assert evaluation["metadata"]["source"] == "response_row"
+    assert (
+        "Derived from response log row; durable run record unavailable."
+        in evaluation["report_markdown"]
+    )
+    assert evaluation["metadata"]["live_inference_used"] is False
+    assert evaluation["metadata"]["paid_judge_used"] is False
+
+
 @pytest.mark.asyncio
 async def test_store_upserts_evaluation_idempotently_and_updates_run_summary(
     monkeypatch,
@@ -200,6 +230,68 @@ async def test_evaluation_api_endpoints_and_manual_trigger_are_static_idempotent
     assert by_run.evaluation_id == triggered.evaluation_id
     assert report["report_markdown"] == by_run.report_markdown
     assert triggered.metadata["mode"] == "static"
+
+
+class ResponseRowStore(NoopSessionStore):
+    enabled = True
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    async def list_response_rows(self, **kwargs):
+        rows = list(self.rows)
+        session_id = kwargs.get("session_id")
+        if session_id:
+            rows = [row for row in rows if row.get("session_id") == session_id]
+        job_id = kwargs.get("job_id")
+        if job_id:
+            rows = [row for row in rows if job_id in str(row.get("job_id") or "")]
+        platform = kwargs.get("platform")
+        if platform:
+            rows = [row for row in rows if row.get("platform") == platform]
+        return {
+            "rows": rows,
+            "page": 1,
+            "page_size": len(rows) or 1,
+            "total_rows": len(rows),
+            "total_pages": 1 if rows else 0,
+            "has_next": False,
+            "has_previous": False,
+        }
+
+
+@pytest.mark.asyncio
+async def test_evaluation_list_and_summary_include_completed_response_rows(
+    monkeypatch,
+):
+    store = ResponseRowStore(
+        [
+            {
+                "id": "row-1",
+                "session_id": "s-response",
+                "platform": "aws-sagemaker",
+                "progress": "completed",
+                "job_id": "training-job-1",
+                "final_artifact_or_result": "s3://bucket/model.tar.gz",
+                "result_storage": "aws-private",
+                "run_type": "smoke-test",
+                "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+                "completed_at": "2026-06-10T00:00:00+00:00",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+    monkeypatch.setattr(agent.session_manager, "_store", lambda: store)
+
+    listed = await agent.list_evaluations(user={"user_id": "dev"})
+    summary = await agent.evaluations_summary(user={"user_id": "dev"})
+
+    assert listed[0].run_id == "response_row:row-1"
+    assert listed[0].metadata["source"] == "response_row"
+    assert summary.total_evaluations == 1
+    assert summary.evaluations[0].metadata["source"] == "response_row"
 
 
 @pytest.mark.asyncio

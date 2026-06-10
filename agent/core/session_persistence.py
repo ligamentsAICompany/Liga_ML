@@ -2160,9 +2160,11 @@ class MongoSessionStore(NoopSessionStore):
             if not row_id:
                 continue
             row_user_id = str(row.get("user_id") or user_id)
-            existing = _find_existing_response_row(
-                existing_candidates, row, row_user_id
-            ) or existing_by_id.get(row_id)
+            existing = (
+                _find_existing_response_row(existing_candidates, row, row_user_id)
+                or existing_by_id.get(row_id)
+                or {}
+            )
             row.pop("_id", None)
             row.pop("inserted_at", None)
             row.pop("schema_version", None)

@@ -295,7 +295,7 @@ def test_event_from_run_event_maps_dataset_discovery_lifecycle():
     )
 
     assert [event["event_type"] for event in events] == [
-        "dataset_candidates_found",
+        "dataset_discovery_completed",
         "dataset_candidate_recommended",
         "dataset_candidate_excluded",
     ]

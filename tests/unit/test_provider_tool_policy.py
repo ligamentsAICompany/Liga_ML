@@ -197,3 +197,56 @@ def test_hf_provider_is_not_restricted_by_cloud_monitoring_policy():
     session = _session(provider="hf-jobs", events=[_tool_state("hf_jobs")])
 
     assert agent_loop._provider_tool_policy_violation(session, "bash", {}) is None
+
+
+def test_explicit_no_compute_prompt_blocks_sandbox_and_provider_tools():
+    session = _session(provider="hf-jobs")
+    session.compute_tools_blocked_for_turn = True
+
+    for tool_name in [
+        "sandbox_create",
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "hf_jobs",
+        "gcp_vertex_jobs",
+        "aws_sagemaker_jobs",
+    ]:
+        violation = agent_loop._provider_tool_policy_violation(session, tool_name, {})
+
+        assert violation is not None
+        assert "explicitly requested planning/discovery only" in violation
+
+
+def test_no_compute_prompt_detection_catches_phase6_smoke_text():
+    text = (
+        "Do not upload any dataset. Do not download any dataset. "
+        "Do not launch training. Do not use sandbox. "
+        "Do not run Hugging Face Jobs, Google Vertex AI, or AWS SageMaker. "
+        "Only use the application's no-upload dataset discovery and planning tools."
+    )
+
+    assert agent_loop._user_requested_no_compute_tools(text) is True
+
+
+def test_planning_only_completion_summarizes_dataset_discovery():
+    session = _session(provider="hf-jobs")
+    session.compute_tools_blocked_for_turn = True
+    session.latest_dataset_discovery = {
+        "candidates": [],
+        "warnings": ["User selection required before training."],
+        "excluded_sources": ["kaggle"],
+    }
+    session.latest_training_recommendation = {
+        "risks": ["Dataset discovery is required before final launch approval."]
+    }
+
+    message = agent_loop._planning_only_completion_message(session)
+
+    assert message is not None
+    assert "Dataset candidates found: 0" in message
+    assert "User selection required before training" in message
+    assert "kaggle" in message
+    assert "No datasets were uploaded or downloaded" in message
+    assert "no sandbox was created" in message

@@ -913,6 +913,7 @@ async def list_evaluations(
         provider=provider,
         status=status,
         limit=_safe_limit(limit),
+        user_id=user["user_id"],
     )
     return [
         PostTrainingEvaluation(**_serialize_evaluation(evaluation))
@@ -937,6 +938,7 @@ async def evaluations_summary(
         provider=provider,
         status=status,
         limit=_safe_limit(limit),
+        user_id=user["user_id"],
     )
     return _evaluation_summary_response(raw)
 
@@ -950,7 +952,7 @@ async def list_session_evaluations(
 ) -> list[PostTrainingEvaluation]:
     await _check_session_access(session_id, user, preload_sandbox=False)
     evaluations = await session_manager.list_evaluations(
-        session_id=session_id, limit=500
+        session_id=session_id, limit=500, user_id=user["user_id"]
     )
     return [
         PostTrainingEvaluation(**_serialize_evaluation(evaluation))
@@ -968,7 +970,9 @@ async def get_run_evaluation(
     user: dict = Depends(get_current_user),
 ) -> PostTrainingEvaluation:
     await _check_session_access(session_id, user, preload_sandbox=False)
-    evaluation = await session_manager.get_evaluation_for_run(session_id, run_id)
+    evaluation = await session_manager.get_evaluation_for_run(
+        session_id, run_id, user_id=user["user_id"]
+    )
     if not evaluation:
         raise HTTPException(status_code=404, detail="Evaluation not found")
     return PostTrainingEvaluation(**_serialize_evaluation(evaluation))
@@ -1181,7 +1185,9 @@ async def trigger_run_evaluation(
 ) -> PostTrainingEvaluation:
     """Idempotently create a static evaluation without paid inference."""
     await _check_session_access(session_id, user, preload_sandbox=False)
-    existing = await session_manager.get_evaluation_for_run(session_id, run_id)
+    existing = await session_manager.get_evaluation_for_run(
+        session_id, run_id, user_id=user["user_id"]
+    )
     if existing:
         return PostTrainingEvaluation(**_serialize_evaluation(existing))
     run = await session_manager.get_run(session_id, run_id)
@@ -1749,6 +1755,7 @@ async def create_session(
             cloud_provider=cloud_provider,
             training_goal=training_goal,
             output_policy=output_policy,
+            preload_sandbox=False,
         )
     except SessionCapacityError as e:
         raise _session_capacity_http_exception(e)
@@ -1803,6 +1810,7 @@ async def restore_session_summary(
             cloud_provider=cloud_provider,
             training_goal=training_goal,
             output_policy=output_policy,
+            preload_sandbox=False,
         )
     except SessionCapacityError as e:
         raise _session_capacity_http_exception(e)

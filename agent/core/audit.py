@@ -489,23 +489,37 @@ def _dataset_discovery_events(
     candidates = candidates if isinstance(candidates, list) else []
     recommended = structured.get("recommended_candidate")
     recommended = recommended if isinstance(recommended, dict) else None
+    excluded = [
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("excluded") is True
+    ]
     events = [
         build_audit_event(
             session_id=session_id,
             run_id=run_id,
-            event_type="dataset_candidates_found",
+            event_type="dataset_discovery_completed",
             category="dataset",
             status="completed",
             actor="assistant",
-            title="Dataset candidates found",
+            title="Dataset discovery completed",
             message=f"Dataset discovery found {len(candidates)} candidate(s).",
             tool_name="dataset_discovery",
             entity_type="dataset_discovery",
             entity_id=payload.get("tool_call_id"),
             safe_metadata={
+                "tool_call_id": payload.get("tool_call_id"),
                 "query": structured.get("query"),
                 "warnings": structured.get("warnings"),
                 "candidate_count": len(candidates),
+                "excluded_count": len(excluded),
+                "recommended_dataset_id": recommended.get("dataset_id")
+                if recommended
+                else None,
+                "uploads_performed": False,
+                "downloads_performed": False,
+                "provider_jobs_launched": False,
+                "resources_created": False,
             },
         )
     ]
