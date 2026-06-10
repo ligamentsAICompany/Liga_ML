@@ -6,7 +6,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -123,9 +123,15 @@ class AgentSession:
 class SessionCapacityError(Exception):
     """Raised when no more sessions can be created."""
 
-    def __init__(self, message: str, error_type: str = "global") -> None:
+    def __init__(
+        self,
+        message: str,
+        error_type: str = "global",
+        capacity: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type  # "global" or "per_user"
+        self.capacity = capacity or {}
 
 
 # ── Capacity limits ─────────────────────────────────────────────────
@@ -138,6 +144,7 @@ MAX_SESSIONS_PER_USER: int = 10
 DEFAULT_YOLO_COST_CAP_USD: float = 5.0
 SANDBOX_SHUTDOWN_CLEANUP_CONCURRENCY: int = 10
 SANDBOX_SHUTDOWN_CLEANUP_TIMEOUT_S: float = 60.0
+STALE_IDLE_SESSION_MIN_AGE_SECONDS: float = 6 * 60 * 60
 
 
 class SessionManager:
@@ -173,6 +180,116 @@ class SessionManager:
         return sum(
             1 for s in self.sessions.values() if s.user_id == user_id and s.is_active
         )
+
+    @staticmethod
+    def _session_age_seconds(agent_session: AgentSession) -> float:
+        created_at = agent_session.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds()
+
+    def _is_stale_idle_candidate(
+        self,
+        agent_session: AgentSession,
+        *,
+        min_age_seconds: float,
+    ) -> bool:
+        if not agent_session.is_active:
+            return False
+        if self._session_age_seconds(agent_session) < min_age_seconds:
+            return False
+        return True
+
+    @staticmethod
+    def _has_runtime_sandbox_metadata(agent_session: AgentSession) -> bool:
+        session = agent_session.session
+        if getattr(session, "sandbox", None) is not None:
+            return True
+        preload_task = getattr(session, "sandbox_preload_task", None)
+        if preload_task is not None and not preload_task.done():
+            return True
+        sandbox_space_id = getattr(session, "sandbox_space_id", None)
+        sandbox_status = getattr(session, "sandbox_status", None)
+        return bool(sandbox_space_id and sandbox_status != "destroyed")
+
+    async def _has_active_provider_job(self, session_id: str) -> bool:
+        for run in await self._store().list_runs(session_id):
+            status = str(run.get("status") or "queued")
+            provider_metadata = run.get("provider_metadata") or {}
+            active_job_id = run.get("active_provider_job_id") or provider_metadata.get(
+                "job_id"
+            )
+            if active_job_id and status not in RUN_TERMINAL_STATUSES:
+                return True
+        return False
+
+    async def _stale_cleanup_skip_reason(
+        self, agent_session: AgentSession
+    ) -> str | None:
+        if agent_session.is_processing:
+            return "processing"
+        if agent_session.session.pending_approval:
+            return "pending_approval"
+        if self._serialize_uploaded_datasets(agent_session.session):
+            return "uploaded_datasets"
+        if self._has_runtime_sandbox_metadata(agent_session):
+            return "sandbox_metadata"
+        if await self._has_active_provider_job(agent_session.session_id):
+            return "active_provider_job"
+        return None
+
+    async def cleanup_stale_sessions(
+        self,
+        user_id: str | None = None,
+        *,
+        min_age_seconds: float = STALE_IDLE_SESSION_MIN_AGE_SECONDS,
+    ) -> dict[str, int]:
+        """End old idle runtime sessions without deleting durable chat history.
+
+        Cleanup is intentionally conservative: old sessions with processing,
+        approvals, provider jobs, uploaded datasets, or sandbox metadata are
+        skipped so user-visible work is never silently discarded.
+        """
+        async with self._lock:
+            candidates = list(self.sessions.values())
+
+        cleared = 0
+        skipped = 0
+        for agent_session in candidates:
+            if user_id and user_id != "dev" and agent_session.user_id != user_id:
+                continue
+            if not self._is_stale_idle_candidate(
+                agent_session, min_age_seconds=min_age_seconds
+            ):
+                continue
+            if await self._stale_cleanup_skip_reason(agent_session):
+                skipped += 1
+                continue
+
+            async with self._lock:
+                current = self.sessions.get(agent_session.session_id)
+                if current is not agent_session or not current.is_active:
+                    continue
+                current.is_active = False
+                self.sessions.pop(agent_session.session_id, None)
+
+            try:
+                await self._store().update_session_fields(
+                    agent_session.session_id,
+                    runtime_state="idle",
+                    status="ended",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to mark stale session %s ended: %s",
+                    agent_session.session_id,
+                    e,
+                )
+            if agent_session.task and not agent_session.task.done():
+                agent_session.task.cancel()
+            cleared += 1
+
+        return {"cleared": cleared, "skipped": skipped}
 
     def _create_session_sync(
         self,
@@ -1033,11 +1150,12 @@ class SessionManager:
         if user_id != "dev" and owner != "dev" and owner != user_id:
             return None
 
-        await self._cleanup_persisted_sandbox(
-            session_id,
-            meta,
-            hf_token=hf_token,
-        )
+        if preload_sandbox:
+            await self._cleanup_persisted_sandbox(
+                session_id,
+                meta,
+                hf_token=hf_token,
+            )
 
         from litellm import Message
 
@@ -1100,6 +1218,8 @@ class SessionManager:
             )
         if isinstance(meta.get("latest_training_preflight"), dict):
             session.latest_training_preflight = dict(meta["latest_training_preflight"])
+        session.sandbox_space_id = meta.get("sandbox_space_id")
+        session.sandbox_status = meta.get("sandbox_status")
 
         created_at = meta.get("created_at")
         if not isinstance(created_at, datetime):
@@ -1187,21 +1307,46 @@ class SessionManager:
                 maximum number of concurrent sessions.
         """
         # ── Capacity checks ──────────────────────────────────────────
+        cleanup_result = {"cleared": 0, "skipped": 0}
         async with self._lock:
             active_count = self.active_session_count
+        if active_count >= MAX_SESSIONS:
+            cleanup_result = await self.cleanup_stale_sessions()
+            async with self._lock:
+                active_count = self.active_session_count
             if active_count >= MAX_SESSIONS:
                 raise SessionCapacityError(
                     f"Server is at capacity ({active_count}/{MAX_SESSIONS} sessions). "
                     "Please try again later.",
                     error_type="global",
+                    capacity={
+                        "active_sessions": active_count,
+                        "max_sessions": MAX_SESSIONS,
+                        "error_type": "global",
+                        "cleanup": cleanup_result,
+                    },
                 )
-            if user_id != "dev":
+        if user_id != "dev":
+            async with self._lock:
                 user_count = self._count_user_sessions(user_id)
+            if user_count >= MAX_SESSIONS_PER_USER:
+                cleanup_result = await self.cleanup_stale_sessions(user_id=user_id)
+                async with self._lock:
+                    user_count = self._count_user_sessions(user_id)
                 if user_count >= MAX_SESSIONS_PER_USER:
+                    message = (
+                        "You have too many active sessions. Clear stale inactive "
+                        "sessions or delete old sessions to continue."
+                    )
                     raise SessionCapacityError(
-                        f"You have reached the maximum of {MAX_SESSIONS_PER_USER} "
-                        "concurrent sessions. Please close an existing session first.",
+                        message,
                         error_type="per_user",
+                        capacity={
+                            "active_sessions": user_count,
+                            "max_sessions": MAX_SESSIONS_PER_USER,
+                            "error_type": "per_user",
+                            "cleanup": cleanup_result,
+                        },
                     )
 
         session_id = str(uuid.uuid4())

@@ -19,6 +19,7 @@ import ChatBubbleOutlineIcon from '@mui/icons-material/ChatBubbleOutline';
 import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { apiFetch } from '@/utils/api';
+import { normalizeSessionCapacityError } from '@/lib/session-capacity';
 
 interface SessionSidebarProps {
   onClose?: () => void;
@@ -31,6 +32,8 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     useAgentStore();
   const [isCreatingSession, setIsCreatingSession] = useState(false);
   const [capacityError, setCapacityError] = useState<string | null>(null);
+  const [canClearStale, setCanClearStale] = useState(false);
+  const [isClearingStale, setIsClearingStale] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,11 +58,14 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
     if (isCreatingSession) return;
     setIsCreatingSession(true);
     setCapacityError(null);
+    setCanClearStale(false);
     try {
       const response = await apiFetch('/api/session', { method: 'POST' });
       if (response.status === 503) {
         const data = await response.json();
-        setCapacityError(data.detail || 'Server is at capacity.');
+        const capacity = normalizeSessionCapacityError(data);
+        setCapacityError(capacity.message);
+        setCanClearStale(capacity.canCleanup);
         return;
       }
       const data = await response.json();
@@ -73,6 +79,17 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
       setIsCreatingSession(false);
     }
   }, [isCreatingSession, createSession, setPlan, clearPanel, onClose]);
+
+  const handleClearStaleSessions = useCallback(async () => {
+    if (isClearingStale) return;
+    setIsClearingStale(true);
+    try {
+      await apiFetch('/api/session/cleanup-stale', { method: 'POST' });
+      await handleNewSession();
+    } finally {
+      setIsClearingStale(false);
+    }
+  }, [handleNewSession, isClearingStale]);
 
   // -- Delete with dialog confirmation ------------------------------------
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -166,6 +183,19 @@ export default function SessionSidebar({ onClose }: SessionSidebarProps) {
           severity="warning"
           variant="outlined"
           onClose={() => setCapacityError(null)}
+          action={
+            canClearStale ? (
+              <Button
+                color="inherit"
+                size="small"
+                onClick={handleClearStaleSessions}
+                disabled={isClearingStale || isCreatingSession}
+                sx={{ fontSize: '0.68rem', fontWeight: 700, textTransform: 'none' }}
+              >
+                {isClearingStale ? 'Clearing...' : 'Clear stale sessions'}
+              </Button>
+            ) : undefined
+          }
           sx={{
             m: 1,
             fontSize: '0.7rem',

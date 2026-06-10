@@ -369,6 +369,21 @@ def _dataset_upload_hub_http_exception(error: HfHubHTTPError) -> HTTPException:
     )
 
 
+def _session_capacity_http_exception(error: SessionCapacityError) -> HTTPException:
+    capacity = dict(error.capacity or {})
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": "session_capacity",
+            "message": str(error),
+            "active_sessions": capacity.get("active_sessions"),
+            "max_sessions": capacity.get("max_sessions"),
+            "error_type": capacity.get("error_type") or error.error_type,
+            "cleanup": capacity.get("cleanup") or {"cleared": 0, "skipped": 0},
+        },
+    )
+
+
 async def _check_session_access(
     session_id: str,
     user: dict[str, Any],
@@ -1736,7 +1751,7 @@ async def create_session(
             output_policy=output_policy,
         )
     except SessionCapacityError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _session_capacity_http_exception(e)
 
     return SessionResponse(
         session_id=session_id,
@@ -1790,7 +1805,7 @@ async def restore_session_summary(
             output_policy=output_policy,
         )
     except SessionCapacityError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise _session_capacity_http_exception(e)
 
     try:
         summarized = await session_manager.seed_from_summary(session_id, messages)
@@ -1814,12 +1829,18 @@ async def restore_session_summary(
     )
 
 
+@router.post("/session/cleanup-stale")
+async def cleanup_stale_sessions(user: dict = Depends(get_current_user)) -> dict:
+    """Clear old idle runtime sessions for the current user."""
+    return await session_manager.cleanup_stale_sessions(user_id=user["user_id"])
+
+
 @router.get("/session/{session_id}", response_model=SessionInfo)
 async def get_session(
     session_id: str, user: dict = Depends(get_current_user)
 ) -> SessionInfo:
     """Get session information. Only accessible by the session owner."""
-    await _check_session_access(session_id, user)
+    await _check_session_access(session_id, user, preload_sandbox=False)
     info = session_manager.get_session_info(session_id)
     info["runs"] = await session_manager.list_runs(session_id)
     return SessionInfo(**info)
@@ -2174,7 +2195,7 @@ async def create_session_run(
 async def list_session_runs(
     session_id: str, user: dict = Depends(get_current_user)
 ) -> list[RunSummary]:
-    await _check_session_access(session_id, user)
+    await _check_session_access(session_id, user, preload_sandbox=False)
     return [RunSummary(**run) for run in await session_manager.list_runs(session_id)]
 
 
@@ -2182,7 +2203,7 @@ async def list_session_runs(
 async def get_session_run(
     session_id: str, run_id: str, user: dict = Depends(get_current_user)
 ) -> RunSummary:
-    await _check_session_access(session_id, user)
+    await _check_session_access(session_id, user, preload_sandbox=False)
     run = await session_manager.get_run(session_id, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2199,7 +2220,7 @@ async def get_session_run_events(
     since: int = 0,
     user: dict = Depends(get_current_user),
 ) -> list[RunEventInfo]:
-    await _check_session_access(session_id, user)
+    await _check_session_access(session_id, user, preload_sandbox=False)
     events = await session_manager.load_run_events_after(session_id, run_id, since)
     if events is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -2613,7 +2634,9 @@ async def stream_session_run(
     user: dict = Depends(get_current_user),
 ) -> StreamingResponse:
     """Replay persisted run events, then attach to the live session broadcaster."""
-    agent_session = await _check_session_access(session_id, user, request)
+    agent_session = await _check_session_access(
+        session_id, user, request, preload_sandbox=False
+    )
     replay_events = await session_manager.load_run_events_after(
         session_id, run_id, since
     )
@@ -2704,7 +2727,7 @@ async def get_session_messages(
     session_id: str, user: dict = Depends(get_current_user)
 ) -> list[dict]:
     """Return the session's message history from memory."""
-    agent_session = await _check_session_access(session_id, user)
+    agent_session = await _check_session_access(session_id, user, preload_sandbox=False)
     if not agent_session or not agent_session.is_active:
         raise HTTPException(status_code=404, detail="Session not found or inactive")
     return [

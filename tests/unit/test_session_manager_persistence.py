@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,6 +17,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
+import session_manager as session_manager_module  # noqa: E402
 from session_manager import AgentSession, Operation, SessionManager  # noqa: E402
 
 
@@ -46,6 +47,11 @@ class FakeRuntimeSession:
         self.sandbox_hardware = None
         self.sandbox_preload_task = None
         self.sandbox_preload_cancel_event = None
+        self.current_run_id = None
+        self.uploaded_datasets = []
+        self.latest_dataset_discovery = None
+        self.latest_training_recommendation = None
+        self.latest_training_preflight = None
 
     def auto_approval_policy_summary(self):
         cap = self.auto_approval_cost_cap_usd
@@ -168,6 +174,17 @@ def _runtime_agent_session(
         user_id=user_id,
         hf_token=hf_token,
     )
+
+
+def _old_idle_agent_session(
+    session_id: str,
+    *,
+    user_id: str = "owner",
+    age_hours: int = 24,
+) -> AgentSession:
+    agent_session = _runtime_agent_session(session_id, user_id=user_id)
+    agent_session.created_at = datetime.now(UTC) - timedelta(hours=age_hours)
+    return agent_session
 
 
 @pytest.mark.asyncio
@@ -568,6 +585,114 @@ async def test_create_session_schedules_cpu_sandbox_preload():
 
 
 @pytest.mark.asyncio
+async def test_create_session_cleans_stale_idle_sessions_before_user_cap(monkeypatch):
+    monkeypatch.setattr(session_manager_module, "MAX_SESSIONS_PER_USER", 2)
+    manager = _manager_with_store(NoopSessionStore())
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+    manager.sessions["old-idle"] = _old_idle_agent_session("old-idle")
+    manager.sessions["recent-idle"] = _runtime_agent_session("recent-idle")
+
+    try:
+        session_id = await manager.create_session(user_id="owner", hf_token="token")
+
+        assert session_id in manager.sessions
+        assert "old-idle" not in manager.sessions
+        assert "recent-idle" in manager.sessions
+        assert manager._count_user_sessions("owner") == 2
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_create_session_still_blocks_when_sessions_are_not_stale(monkeypatch):
+    monkeypatch.setattr(session_manager_module, "MAX_SESSIONS_PER_USER", 2)
+    manager = _manager_with_store(NoopSessionStore())
+    stop = _install_fake_runtime(manager)
+    manager._start_cpu_sandbox_preload = lambda _agent_session: None  # type: ignore[method-assign]
+    manager.sessions["recent-1"] = _runtime_agent_session("recent-1")
+    manager.sessions["recent-2"] = _runtime_agent_session("recent-2")
+
+    try:
+        with pytest.raises(session_manager_module.SessionCapacityError) as exc_info:
+            await manager.create_session(user_id="owner", hf_token="token")
+
+        assert exc_info.value.error_type == "per_user"
+        assert exc_info.value.capacity["active_sessions"] == 2
+        assert exc_info.value.capacity["max_sessions"] == 2
+    finally:
+        stop.set()
+        await _cancel_runtime_tasks(manager)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_sessions_skips_active_processing():
+    manager = _manager_with_store(NoopSessionStore())
+    manager.sessions["processing"] = _old_idle_agent_session("processing")
+    manager.sessions["processing"].is_processing = True
+
+    result = await manager.cleanup_stale_sessions(user_id="owner")
+
+    assert result == {"cleared": 0, "skipped": 1}
+    assert "processing" in manager.sessions
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_sessions_skips_pending_approval():
+    manager = _manager_with_store(NoopSessionStore())
+    manager.sessions["approval"] = _old_idle_agent_session("approval")
+    manager.sessions["approval"].session.pending_approval = {"tool_calls": [object()]}
+
+    result = await manager.cleanup_stale_sessions(user_id="owner")
+
+    assert result == {"cleared": 0, "skipped": 1}
+    assert "approval" in manager.sessions
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_sessions_skips_active_provider_job_id():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="provider-job", provider="hf-jobs")
+    await store.update_run(run["run_id"], active_provider_job_id="job-123")
+    manager = _manager_with_store(store)
+    manager.sessions["provider-job"] = _old_idle_agent_session("provider-job")
+
+    result = await manager.cleanup_stale_sessions(user_id="owner")
+
+    assert result == {"cleared": 0, "skipped": 1}
+    assert "provider-job" in manager.sessions
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_sessions_skips_uploaded_datasets_metadata():
+    manager = _manager_with_store(NoopSessionStore())
+    manager.sessions["dataset"] = _old_idle_agent_session("dataset")
+    manager.sessions["dataset"].session.uploaded_datasets = [{"repo_id": "owner/data"}]
+
+    result = await manager.cleanup_stale_sessions(user_id="owner")
+
+    assert result == {"cleared": 0, "skipped": 1}
+    assert "dataset" in manager.sessions
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stale_sessions_reports_cleared_and_skipped_counts():
+    manager = _manager_with_store(NoopSessionStore())
+    manager.sessions["stale"] = _old_idle_agent_session("stale")
+    manager.sessions["processing"] = _old_idle_agent_session("processing")
+    manager.sessions["processing"].is_processing = True
+    manager.sessions["fresh"] = _runtime_agent_session("fresh")
+
+    result = await manager.cleanup_stale_sessions(user_id="owner")
+
+    assert result == {"cleared": 1, "skipped": 1}
+    assert "stale" not in manager.sessions
+    assert "processing" in manager.sessions
+    assert "fresh" in manager.sessions
+
+
+@pytest.mark.asyncio
 async def test_create_session_stores_aws_cloud_provider():
     manager = _manager_with_store(NoopSessionStore())
     stop = _install_fake_runtime(manager)
@@ -734,7 +859,9 @@ async def test_lazy_restore_deletes_persisted_sandbox_before_preload(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_lazy_restore_can_skip_cpu_sandbox_preload_after_cleanup(monkeypatch):
+async def test_lazy_restore_preserves_persisted_sandbox_when_preload_disabled(
+    monkeypatch,
+):
     deleted: list[str] = []
 
     class FakeApi:
@@ -774,9 +901,10 @@ async def test_lazy_restore_can_skip_cpu_sandbox_preload_after_cleanup(monkeypat
         )
 
         assert restored is not None
-        assert deleted == ["owner/sandbox-87654321"]
+        assert deleted == []
         assert scheduled == []
-        assert store.metadata["sandbox_space_id"] is None
+        assert store.metadata["sandbox_space_id"] == "owner/sandbox-87654321"
+        assert restored.session.sandbox_space_id == "owner/sandbox-87654321"
     finally:
         stop.set()
         await _cancel_runtime_tasks(manager)
