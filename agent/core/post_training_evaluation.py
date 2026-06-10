@@ -49,6 +49,10 @@ KNOWN_METRIC_KEYS = {
     "epoch",
 }
 MARKER_RE = re.compile(r"^(LIGA_[A-Z0-9_]+)=(.*)$", re.MULTILINE)
+RESPONSE_ROW_LIMITATION = (
+    "Derived from response log row; durable run record unavailable."
+)
+COMPLETED_RESPONSE_PROGRESS = {"completed", "succeeded", "success"}
 
 
 def _now() -> datetime:
@@ -247,6 +251,16 @@ def _privacy_checks() -> list[dict[str, str]]:
 
 def plan_post_training_evaluation(context: dict[str, Any]) -> dict[str, Any]:
     domain = str(context.get("domain") or domain_from_context(context))
+    metadata = (
+        context.get("metadata") if isinstance(context.get("metadata"), dict) else {}
+    )
+    limitations = [
+        "Static evaluation only; no live model inference was run.",
+        "Scores are heuristics, not a certified benchmark.",
+        "Human review is required before demo or client use.",
+    ]
+    if metadata.get("source") == "response_row":
+        limitations.append(RESPONSE_ROW_LIMITATION)
     plan = {
         "evaluation_type": "static_result_review",
         "domain": domain,
@@ -260,11 +274,7 @@ def plan_post_training_evaluation(context: dict[str, Any]) -> dict[str, Any]:
             "Escalate high-risk or professional domains to qualified review.",
         ],
         "metrics_to_inspect": sorted(KNOWN_METRIC_KEYS),
-        "limitations": [
-            "Static evaluation only; no live model inference was run.",
-            "Scores are heuristics, not a certified benchmark.",
-            "Human review is required before demo or client use.",
-        ],
+        "limitations": limitations,
     }
     return redact_json_like(plan)
 
@@ -409,6 +419,20 @@ def build_post_training_evaluation(context: dict[str, Any]) -> dict[str, Any]:
         if status == "succeeded" and scores["overall_score"] >= 0.65
         else "Do not use for client demos until a human reviews outputs and missing signals."
     )
+    context_metadata = (
+        dict(safe_context.get("metadata"))
+        if isinstance(safe_context.get("metadata"), dict)
+        else {}
+    )
+    context_metadata.update(
+        {
+            "mode": evaluation_mode(),
+            "paid_judge_used": False,
+            "paid_judge_enabled": paid_judge_enabled(),
+            "live_inference_used": False,
+        }
+    )
+    context_metadata.setdefault("source", "static_training_result")
     evaluation = {
         "evaluation_id": str(
             safe_context.get("evaluation_id") or _evaluation_id(session_id, run_id)
@@ -441,19 +465,59 @@ def build_post_training_evaluation(context: dict[str, Any]) -> dict[str, Any]:
         "report_markdown": "",
         "artifact_paths": [str(artifact_ref)] if artifact_ref else [],
         "metadata": {
-            "mode": evaluation_mode(),
-            "paid_judge_used": False,
-            "paid_judge_enabled": paid_judge_enabled(),
-            "source": "static_training_result",
-            **(
-                safe_context.get("metadata")
-                if isinstance(safe_context.get("metadata"), dict)
-                else {}
-            ),
+            **context_metadata,
         },
     }
     evaluation["report_markdown"] = _report(evaluation, plan, summary)
     return redact_json_like(evaluation)
+
+
+def _row_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def evaluation_context_from_response_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a safe static-evaluation context from a completed Responses row."""
+
+    progress = _row_text(row.get("progress")).lower()
+    if progress not in COMPLETED_RESPONSE_PROGRESS:
+        return None
+    session_id = _row_text(row.get("session_id"))
+    row_id = _row_text(row.get("id"))
+    if not session_id or not row_id:
+        return None
+    artifact_ref = _row_text(row.get("final_artifact_or_result"))
+    if not artifact_ref or artifact_ref.lower() in {"unknown", "unavailable", "none"}:
+        return None
+    provider = _row_text(row.get("platform")) or "unknown"
+    job_id = _row_text(row.get("job_id")) or None
+    run_id = f"response_row:{row_id}"
+    return redact_json_like(
+        {
+            "session_id": session_id,
+            "run_id": run_id,
+            "provider": provider,
+            "job_id": job_id,
+            "model_ref": _row_text(row.get("model_name")) or artifact_ref,
+            "artifact_ref": artifact_ref,
+            "dataset_ref": row.get("dataset_ref") or row.get("dataset_name"),
+            "training_status": "completed",
+            "created_at": row.get("created_at") or row.get("completed_at"),
+            "completed_at": row.get("completed_at"),
+            "metadata": {
+                "source": "response_row",
+                "response_row_id": row_id,
+                "source_limitation": RESPONSE_ROW_LIMITATION,
+                "durable_run_record_available": False,
+                "result_storage": row.get("result_storage"),
+                "run_type": row.get("run_type"),
+                "terminal_progress": progress,
+                "live_inference_used": False,
+                "paid_judge_used": False,
+                "provider_jobs_launched": False,
+            },
+        }
+    )
 
 
 def summarize_evaluations(evaluations: list[dict[str, Any]]) -> dict[str, Any]:

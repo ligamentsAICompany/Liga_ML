@@ -23,8 +23,14 @@ export const useLayoutStore = create<LayoutStore>()(
       isRightPanelOpen: false,
       rightPanelWidth: 450,
       themeMode: 'light' as ThemeMode,
-      setLeftSidebarOpen: (open) => set({ isLeftSidebarOpen: open }),
-      setRightPanelOpen: (open) => set({ isRightPanelOpen: open }),
+      setLeftSidebarOpen: (open) =>
+        set((state) =>
+          state.isLeftSidebarOpen === open ? state : { isLeftSidebarOpen: open },
+        ),
+      setRightPanelOpen: (open) =>
+        set((state) =>
+          state.isRightPanelOpen === open ? state : { isRightPanelOpen: open },
+        ),
       setRightPanelWidth: (width) => set({ rightPanelWidth: width }),
       toggleLeftSidebar: () => set((state) => ({ isLeftSidebarOpen: !state.isLeftSidebarOpen })),
       toggleRightPanel: () => set((state) => ({ isRightPanelOpen: !state.isRightPanelOpen })),

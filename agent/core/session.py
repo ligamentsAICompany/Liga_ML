@@ -184,7 +184,9 @@ class Session:
                 "data": persistence_data,
             }
         )
-        if self.persistence_store is not None and background_runs_in_process():
+        if self.persistence_store is not None and (
+            background_runs_in_process() or self.current_run_id
+        ):
             try:
                 event.seq = await self.persistence_store.append_event(
                     self.session_id,

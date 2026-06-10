@@ -26,6 +26,7 @@ import {
 } from '@/lib/training-preflight-action';
 import { getLatestSessionPreflight, getRunPreflight, runTrainingPreflight } from '@/lib/training-preflight-api';
 import { createDatasetDiscoveryPanel } from '@/lib/dataset-discovery-panel';
+import { isSamePanelState } from '@/lib/panel-state';
 import { appendAwsTrainingResultSummary, buildAwsStateMarkdown, createAwsSageMakerRunPanel } from '@/lib/aws-sagemaker-panel';
 import { redactJsonLike, redactText, redactedJsonString } from '@/lib/redaction';
 import type { OutputPolicy, TrainingGoal } from '@/types/agent';
@@ -914,6 +915,20 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
 
   const isProcessing = useAgentStore(s => s.isProcessing);
   const { setRightPanelOpen, setLeftSidebarOpen } = useLayoutStore();
+  const setPanelIfChanged = useCallback(
+    (
+      data: Parameters<typeof setPanel>[0],
+      view?: Parameters<typeof setPanel>[1],
+      editable?: Parameters<typeof setPanel>[2],
+    ) => {
+      const state = useAgentStore.getState();
+      if (isSamePanelState(state.panelData, state.panelView, state.panelEditable, data, view, editable)) {
+        return;
+      }
+      setPanel(data, view, editable);
+    },
+    [setPanel],
+  );
 
   // ── Batch approval state ──────────────────────────────────────────
   const pendingTools = useMemo(
@@ -1264,7 +1279,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       const outputText = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
       const planningPanel = createPreflightPanel(tool.toolName, outputText, args);
       if (planningPanel) {
-        setPanel(planningPanel, 'output');
+        setPanelIfChanged(planningPanel, 'output');
         setRightPanelOpen(true);
         return;
       }
@@ -1306,7 +1321,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       }
     },
-    [toolDisplayMap, setPanel, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
+    [toolDisplayMap, setPanel, setPanelIfChanged, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
   );
 
   // ── Panel click handler ───────────────────────────────────────────

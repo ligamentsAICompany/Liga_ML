@@ -1,7 +1,11 @@
 """Unit tests for the optional durable session store abstraction."""
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
+from agent.core.session import Event, Session
 from agent.core.session_persistence import (
     MongoSessionStore,
     NoopSessionStore,
@@ -101,6 +105,78 @@ async def test_noop_store_records_sanitized_training_preflight_for_session_and_r
     assert by_run["preflight_id"] == "pf1"
     assert updated["provider_metadata"]["training_preflight"]["preflight_id"] == "pf1"
     assert "hf_" not in str(latest)
+
+
+@pytest.mark.asyncio
+async def test_session_send_event_persists_run_scoped_dataset_discovery(monkeypatch):
+    monkeypatch.setattr("agent.core.session.background_runs_in_process", lambda: False)
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s1", provider="hf-jobs", request_id="r1")
+    session = object.__new__(Session)
+    session.session_id = "s1"
+    session.current_run_id = run["run_id"]
+    session.persistence_store = store
+    session.event_queue = asyncio.Queue()
+    session.logged_events = []
+    session.config = SimpleNamespace(save_sessions=False)
+
+    async def _no_notifications(_event):
+        return None
+
+    session._enqueue_auto_notification_requests = _no_notifications
+    structured = {
+        "query": "hardware support",
+        "allowed_sources": ["huggingface"],
+        "excluded_sources": ["kaggle"],
+        "candidates": [
+            {
+                "dataset_id": "public/hardware-support",
+                "title": "Hardware Support QA",
+                "overall_score": 0.91,
+            }
+        ],
+        "recommended_candidate": {"dataset_id": "public/hardware-support"},
+        "warnings": ["User selection required before training."],
+        "timestamp": "2026-06-10T00:00:00+00:00",
+        "requires_user_selection": True,
+    }
+
+    await Session.send_event(
+        session,
+        Event(
+            event_type="tool_call",
+            data={
+                "tool": "dataset_discovery",
+                "tool_call_id": "tc1",
+                "arguments": {"operation": "plan", "query": "hardware support"},
+            },
+        ),
+    )
+    await Session.send_event(
+        session,
+        Event(
+            event_type="tool_output",
+            data={
+                "tool": "dataset_discovery",
+                "tool_call_id": "tc1",
+                "success": True,
+                "structured": structured,
+            },
+        ),
+    )
+
+    saved = await store.get_run(run["run_id"])
+    audits = await store.list_audit_events(session_id="s1", run_id=run["run_id"])
+
+    assert saved["dataset_discovery"]["recommended_candidate"]["dataset_id"] == (
+        "public/hardware-support"
+    )
+    assert saved["provider_metadata"]["dataset_discovery"]["timestamp"]
+    assert {event["event_type"] for event in audits} >= {
+        "dataset_discovery_started",
+        "dataset_discovery_completed",
+    }
+    assert "hf_" not in str(saved)
 
 
 def test_unsafe_message_payload_is_replaced_with_marker():
