@@ -377,6 +377,23 @@ def _provider_tool_policy_violation(
 ) -> str | None:
     """Block compute-provider drift while an active provider job is being monitored."""
 
+    if getattr(session, "compute_tools_blocked_for_turn", False) and tool_name in {
+        "sandbox_create",
+        "bash",
+        "read",
+        "write",
+        "edit",
+        "hf_jobs",
+        "gcp_vertex_jobs",
+        "aws_sagemaker_jobs",
+    }:
+        return (
+            "The user explicitly requested planning/discovery only and forbade "
+            "sandbox, provider jobs, downloads, uploads, and resource creation. "
+            "Use dataset_discovery, training_planner, or a plain assistant "
+            "summary instead."
+        )
+
     provider = str(getattr(session, "cloud_provider", "hf-jobs") or "hf-jobs").strip()
     operation = _operation(tool_args)
 
@@ -411,6 +428,41 @@ def _provider_tool_policy_violation(
             return _GCP_PROVIDER_DRIFT_MESSAGE
 
     return None
+
+
+def _user_requested_no_compute_tools(text: str) -> bool:
+    normalized = str(text or "").lower()
+    sandbox_blocked = any(
+        marker in normalized
+        for marker in (
+            "do not use sandbox",
+            "do not create sandbox",
+            "no sandbox",
+            "without sandbox",
+        )
+    )
+    provider_jobs_blocked = any(
+        marker in normalized
+        for marker in (
+            "do not launch training",
+            "do not run hugging face jobs",
+            "do not run hf jobs",
+            "do not run google vertex ai",
+            "do not run aws sagemaker",
+            "only use the application's no-upload dataset discovery",
+            "planning tools",
+        )
+    )
+    upload_download_blocked = any(
+        marker in normalized
+        for marker in (
+            "do not upload",
+            "do not download",
+            "no-upload",
+            "no upload",
+        )
+    )
+    return sandbox_blocked and (provider_jobs_blocked or upload_download_blocked)
 
 
 def _uploaded_dataset_instruction(session: Session) -> str | None:
@@ -1440,6 +1492,75 @@ async def _emit_visible_assistant_message(session: Session, message: str) -> Non
     await session.send_event(
         Event(event_type="assistant_message", data={"content": message})
     )
+
+
+def _planning_only_completion_message(session: Session) -> str | None:
+    if not getattr(session, "compute_tools_blocked_for_turn", False):
+        return None
+
+    discovery = getattr(session, "latest_dataset_discovery", None)
+    if not isinstance(discovery, dict) or not discovery:
+        return None
+
+    candidates = discovery.get("candidates")
+    candidates = candidates if isinstance(candidates, list) else []
+    excluded_sources = discovery.get("excluded_sources")
+    excluded_sources = excluded_sources if isinstance(excluded_sources, list) else []
+    warnings = discovery.get("warnings")
+    warnings = warnings if isinstance(warnings, list) else []
+    recommended = discovery.get("recommended_candidate")
+    recommendation = getattr(session, "latest_training_recommendation", None)
+    risks = (
+        recommendation.get("risks")
+        if isinstance(recommendation, dict)
+        else ["Training still requires dataset selection and explicit launch approval."]
+    )
+    risks = risks if isinstance(risks, list) and risks else []
+
+    lines = [
+        "Planning/discovery complete. No datasets were uploaded or downloaded, "
+        "no sandbox was created, no provider jobs were launched, and no cloud "
+        "resources were created.",
+        "",
+        f"Dataset candidates found: {len(candidates)}.",
+    ]
+    if candidates:
+        lines.extend(
+            f"- {candidate.get('title') or candidate.get('dataset_id') or 'Unnamed dataset'}"
+            for candidate in candidates
+            if isinstance(candidate, dict)
+        )
+    else:
+        lines.append(
+            "- No candidate datasets were available from the current no-upload "
+            "discovery inputs."
+        )
+
+    if isinstance(recommended, dict):
+        lines.extend(
+            [
+                "",
+                "Recommended candidate: "
+                f"{recommended.get('title') or recommended.get('dataset_id')}.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Risks and warnings:",
+            *[f"- {risk}" for risk in risks],
+            *[f"- {warning}" for warning in warnings],
+            "",
+            "Excluded sources:",
+            *[f"- {source}" for source in excluded_sources],
+            "",
+            "Before launch: the user must explicitly select a dataset, approve "
+            "any upload/download or provider job, and approve any billable "
+            "cloud or sandbox resource creation.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 async def _compact_and_notify(session: Session) -> None:
@@ -2578,6 +2699,14 @@ class Handlers:
                         final_response = terminal_provider_output
                         break
 
+                    planning_only_summary = _planning_only_completion_message(session)
+                    if planning_only_summary is not None:
+                        await _emit_visible_assistant_message(
+                            session, planning_only_summary
+                        )
+                        final_response = planning_only_summary
+                        break
+
                 # If there are tools requiring approval, ask for batch approval
                 if approval_required_tools:
                     # Prepare batch approval data
@@ -3069,6 +3198,7 @@ async def process_submission(session: Session, submission) -> bool:
 
     if op.op_type == OpType.USER_INPUT:
         text = op.data.get("text", "") if op.data else ""
+        session.compute_tools_blocked_for_turn = _user_requested_no_compute_tools(text)
         cloud_provider = op.data.get("cloud_provider") if op.data else None
         training_goal = op.data.get("training_goal") if op.data else None
         output_policy = op.data.get("output_policy") if op.data else None
@@ -3156,6 +3286,19 @@ async def process_submission(session: Session, submission) -> bool:
                 Message(
                     role="user",
                     content=f"[SYSTEM: {provider_instruction}]",
+                )
+            )
+        if getattr(session, "compute_tools_blocked_for_turn", False):
+            session.context_manager.add_message(
+                Message(
+                    role="user",
+                    content=(
+                        "[SYSTEM: This turn is planning/discovery only. Do not "
+                        "call sandbox_create, bash, read, write, edit, hf_jobs, "
+                        "gcp_vertex_jobs, or aws_sagemaker_jobs. Use "
+                        "dataset_discovery/training_planner and explain what "
+                        "approval would be required before any launch.]"
+                    ),
                 )
             )
         upload_instruction = _uploaded_dataset_instruction(session)

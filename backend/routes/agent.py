@@ -1755,6 +1755,7 @@ async def create_session(
             cloud_provider=cloud_provider,
             training_goal=training_goal,
             output_policy=output_policy,
+            preload_sandbox=False,
         )
     except SessionCapacityError as e:
         raise _session_capacity_http_exception(e)
@@ -1809,6 +1810,7 @@ async def restore_session_summary(
             cloud_provider=cloud_provider,
             training_goal=training_goal,
             output_policy=output_policy,
+            preload_sandbox=False,
         )
     except SessionCapacityError as e:
         raise _session_capacity_http_exception(e)

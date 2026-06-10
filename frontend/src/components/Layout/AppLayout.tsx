@@ -358,16 +358,12 @@ export default function AppLayout() {
             }}
           >
             {activeSessionId ? (
-              // Render ALL sessions — each owns its own useAgentChat.
-              // Only the active one renders visible UI (others return null).
-              sessions.map((s) => (
-                <SessionChat
-                  key={s.id}
-                  sessionId={s.id}
-                  isActive={s.id === activeSessionId}
-                  onSessionDead={handleSessionDead}
-                />
-              ))
+              <SessionChat
+                key={activeSessionId}
+                sessionId={activeSessionId}
+                isActive
+                onSessionDead={handleSessionDead}
+              />
             ) : (
               <Box
                 sx={{

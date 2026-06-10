@@ -48,3 +48,14 @@ test('new task UIs expose clear stale sessions retry action', () => {
   assert.match(sidebarSource, /\/api\/session\/cleanup-stale/);
   assert.match(sidebarSource, /handleNewSession\(\)/);
 });
+
+test('layout mounts only the active chat session', () => {
+  const layoutSource = readFileSync(
+    join(process.cwd(), 'src/components/Layout/AppLayout.tsx'),
+    'utf8',
+  );
+
+  assert.doesNotMatch(layoutSource, /sessions\.map\(\(s\) =>/);
+  assert.match(layoutSource, /activeSessionId/);
+  assert.match(layoutSource, /<SessionChat/);
+});

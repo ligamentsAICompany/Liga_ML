@@ -1368,6 +1368,7 @@ class SessionManager:
         cloud_provider: str = "hf-jobs",
         training_goal: str = "agent-decide",
         output_policy: str = "cloud-and-hf-hub",
+        preload_sandbox: bool = True,
     ) -> str:
         """Create a new agent session and return its ID.
 
@@ -1470,7 +1471,8 @@ class SessionManager:
             tool_router=tool_router,
         )
         await self.persist_session_snapshot(agent_session, runtime_state="idle")
-        self._start_cpu_sandbox_preload(agent_session)
+        if preload_sandbox:
+            self._start_cpu_sandbox_preload(agent_session)
 
         if is_pro is not None and user_id and user_id != "dev":
             await self._track_pro_status(agent_session, is_pro=is_pro)
