@@ -14,6 +14,7 @@ import { useSessionStore } from '@/store/sessionStore';
 import { useAgentStore } from '@/store/agentStore';
 import { apiFetch } from '@/utils/api';
 import { isInIframe, triggerLogin } from '@/hooks/useAuth';
+import { normalizeSessionCapacityError } from '@/lib/session-capacity';
 
 const BRAND_GREEN = '#00D084';
 
@@ -183,6 +184,8 @@ export default function WelcomeScreen() {
   const { setPlan, clearPanel, user } = useAgentStore();
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [canClearStale, setCanClearStale] = useState(false);
+  const [isClearingStale, setIsClearingStale] = useState(false);
 
   const inIframe = isInIframe();
   const isAuthenticated = !!user?.authenticated;
@@ -192,12 +195,15 @@ export default function WelcomeScreen() {
     if (isCreating) return;
     setIsCreating(true);
     setError(null);
+    setCanClearStale(false);
 
     try {
       const response = await apiFetch('/api/session', { method: 'POST' });
       if (response.status === 503) {
         const data = await response.json();
-        setError(data.detail || 'Server is at capacity. Please try again later.');
+        const capacityError = normalizeSessionCapacityError(data);
+        setError(capacityError.message);
+        setCanClearStale(capacityError.canCleanup);
         return;
       }
       if (response.status === 401) {
@@ -218,6 +224,17 @@ export default function WelcomeScreen() {
       setIsCreating(false);
     }
   }, [isCreating, createSession, setPlan, clearPanel]);
+
+  const handleClearStaleSessions = useCallback(async () => {
+    if (isClearingStale) return;
+    setIsClearingStale(true);
+    try {
+      await apiFetch('/api/session/cleanup-stale', { method: 'POST' });
+      await handleStartSession();
+    } finally {
+      setIsClearingStale(false);
+    }
+  }, [handleStartSession, isClearingStale]);
 
   // ---- Step status helpers ----
 
@@ -370,6 +387,19 @@ export default function WelcomeScreen() {
             severity="warning"
             variant="outlined"
             onClose={() => setError(null)}
+            action={
+              canClearStale ? (
+                <Button
+                  color="inherit"
+                  size="small"
+                  onClick={handleClearStaleSessions}
+                  disabled={isClearingStale || isCreating}
+                  sx={{ fontSize: '0.72rem', fontWeight: 700, textTransform: 'none' }}
+                >
+                  {isClearingStale ? 'Clearing...' : 'Clear stale sessions'}
+                </Button>
+              ) : undefined
+            }
             sx={{
               mt: 3,
               maxWidth: 400,

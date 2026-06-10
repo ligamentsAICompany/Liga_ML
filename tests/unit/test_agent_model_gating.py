@@ -515,6 +515,38 @@ async def test_delete_session_access_check_skips_sandbox_preload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_get_session_access_check_skips_sandbox_preload(monkeypatch):
+    ensure_calls = []
+
+    async def fake_ensure_session_loaded(session_id, user_id, **kwargs):
+        ensure_calls.append((session_id, user_id, kwargs))
+        return SimpleNamespace(user_id=user_id)
+
+    monkeypatch.setattr(
+        agent.session_manager,
+        "ensure_session_loaded",
+        fake_ensure_session_loaded,
+    )
+    monkeypatch.setattr(
+        agent.session_manager,
+        "get_session_info",
+        lambda session_id: {
+            "session_id": session_id,
+            "created_at": "2026-06-10T00:00:00Z",
+            "is_active": True,
+            "is_processing": False,
+            "message_count": 0,
+            "user_id": "u1",
+        },
+    )
+
+    response = await agent.get_session("s1", {"user_id": "u1"})
+
+    assert response.session_id == "s1"
+    assert ensure_calls[0][2]["preload_sandbox"] is False
+
+
+@pytest.mark.asyncio
 async def test_teardown_session_access_check_skips_sandbox_preload(monkeypatch):
     ensure_calls = []
     teardown_calls = []
@@ -542,3 +574,48 @@ async def test_teardown_session_access_check_skips_sandbox_preload(monkeypatch):
     assert response == {"status": "teardown_requested", "session_id": "s1"}
     assert teardown_calls == ["s1"]
     assert ensure_calls[0][2]["preload_sandbox"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_session_capacity_response_includes_actionable_metadata(
+    monkeypatch,
+):
+    error = agent.SessionCapacityError(
+        "You have too many active sessions. Clear stale inactive sessions or "
+        "delete old sessions to continue.",
+        error_type="per_user",
+    )
+    error.capacity = {
+        "active_sessions": 10,
+        "max_sessions": 10,
+        "error_type": "per_user",
+        "cleanup": {"cleared": 0, "skipped": 10},
+    }
+
+    async def fake_create_session(**_kwargs):
+        raise error
+
+    async def request_json():
+        return {}
+
+    monkeypatch.setattr(agent.session_manager, "create_session", fake_create_session)
+    monkeypatch.setattr(agent, "resolve_hf_request_token", lambda _request: None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await agent.create_session(
+            SimpleNamespace(json=request_json),
+            {"user_id": "u1", "username": "alice", "plan": "free"},
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {
+        "error": "session_capacity",
+        "message": (
+            "You have too many active sessions. Clear stale inactive sessions or "
+            "delete old sessions to continue."
+        ),
+        "active_sessions": 10,
+        "max_sessions": 10,
+        "error_type": "per_user",
+        "cleanup": {"cleared": 0, "skipped": 10},
+    }
