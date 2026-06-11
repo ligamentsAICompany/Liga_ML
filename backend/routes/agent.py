@@ -1052,6 +1052,256 @@ async def get_run_recommendations(
     return recommendation
 
 
+def _record_value(record: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _nested_record(record: dict[str, Any], key: str) -> dict[str, Any]:
+    value = record.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _known_recommendation_value(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    if isinstance(value, str) and value.strip().lower() in {"unknown", "null", "none"}:
+        return False
+    return True
+
+
+def _catalog_provider_record(provider_id: Any) -> dict[str, Any]:
+    if not _known_recommendation_value(provider_id):
+        return {}
+    return next(
+        (
+            provider.to_dict()
+            for provider in provider_catalog()
+            if provider.provider_id == str(provider_id)
+        ),
+        {"provider_id": str(provider_id)},
+    )
+
+
+def _catalog_model_record(model_id: Any) -> dict[str, Any]:
+    if not _known_recommendation_value(model_id):
+        return {}
+    return next(
+        (
+            model.to_dict()
+            for model in model_catalog()
+            if model.model_id == str(model_id)
+        ),
+        {"model_id": str(model_id)},
+    )
+
+
+def _hardware_id_from_args(provider_id: Any, hardware_args: Any) -> str | None:
+    if not _known_recommendation_value(provider_id) or not isinstance(
+        hardware_args, dict
+    ):
+        return None
+    for hardware in hardware_catalog():
+        if hardware.provider_id != str(provider_id):
+            continue
+        if all(
+            hardware.hardware_args.get(key) == value
+            for key, value in hardware_args.items()
+        ):
+            return hardware.hardware_id
+    return None
+
+
+def _catalog_hardware_record(hardware_id: Any) -> dict[str, Any]:
+    if not _known_recommendation_value(hardware_id):
+        return {}
+    return next(
+        (
+            hardware.to_dict()
+            for hardware in hardware_catalog()
+            if hardware.hardware_id == str(hardware_id)
+        ),
+        {"hardware_id": str(hardware_id)},
+    )
+
+
+def _recommendation_body(record: dict[str, Any]) -> dict[str, Any]:
+    nested = _nested_record(record, "recommendation")
+    return nested if nested else record
+
+
+def _normalize_preflight_recommendation(recommendation: Any) -> dict[str, Any] | None:
+    if not isinstance(recommendation, dict) or not recommendation:
+        return None
+    payload = dict(recommendation)
+    body = dict(_recommendation_body(payload))
+    provider = _record_value(
+        payload,
+        "provider",
+        "provider_id",
+        "cloud_provider",
+    ) or _record_value(_nested_record(body, "selected_provider"), "provider_id")
+    model_id = _record_value(
+        payload,
+        "recommended_model",
+        "model_id",
+    ) or _record_value(_nested_record(body, "selected_model"), "model_id")
+    hardware_id = (
+        _record_value(payload, "hardware_id")
+        or _record_value(_nested_record(body, "selected_hardware"), "hardware_id")
+        or _hardware_id_from_args(provider, payload.get("recommended_hardware"))
+    )
+    output_policy = _record_value(payload, "output_policy") or _record_value(
+        body,
+        "output_policy",
+    )
+
+    if _known_recommendation_value(provider):
+        payload["provider"] = str(provider)
+        body["selected_provider"] = {
+            **_catalog_provider_record(provider),
+            **_nested_record(body, "selected_provider"),
+            "provider_id": str(provider),
+        }
+    if _known_recommendation_value(model_id):
+        payload["recommended_model"] = str(model_id)
+        body["selected_model"] = {
+            **_catalog_model_record(model_id),
+            **_nested_record(body, "selected_model"),
+            "model_id": str(model_id),
+        }
+    if _known_recommendation_value(hardware_id):
+        payload["hardware_id"] = str(hardware_id)
+        body["selected_hardware"] = {
+            **_catalog_hardware_record(hardware_id),
+            **_nested_record(body, "selected_hardware"),
+            "hardware_id": str(hardware_id),
+        }
+    if _known_recommendation_value(output_policy):
+        payload["output_policy"] = str(output_policy)
+        body["output_policy"] = str(output_policy)
+
+    payload["recommendation"] = body
+    return payload
+
+
+def _has_preflight_recommendation_fields(recommendation: Any) -> bool:
+    recommendation = _normalize_preflight_recommendation(recommendation)
+    if not isinstance(recommendation, dict) or not recommendation:
+        return False
+    nested = _nested_record(recommendation, "recommendation")
+    source = nested if nested else recommendation
+    provider = _record_value(
+        recommendation,
+        "provider",
+        "provider_id",
+    ) or _record_value(_nested_record(source, "selected_provider"), "provider_id")
+    model_id = _record_value(
+        recommendation,
+        "recommended_model",
+        "model_id",
+    ) or _record_value(_nested_record(source, "selected_model"), "model_id")
+    hardware_id = _record_value(
+        recommendation,
+        "hardware_id",
+    ) or _record_value(_nested_record(source, "selected_hardware"), "hardware_id")
+    output_policy = _record_value(recommendation, "output_policy") or _record_value(
+        source,
+        "output_policy",
+    )
+    return all(
+        _known_recommendation_value(value)
+        for value in (provider, model_id, hardware_id, output_policy)
+    )
+
+
+def _merge_preflight_recommendation(
+    primary: Any,
+    fallback: Any,
+) -> dict[str, Any] | None:
+    normalized_primary = _normalize_preflight_recommendation(primary)
+    normalized_fallback = _normalize_preflight_recommendation(fallback)
+    if normalized_primary is None:
+        return normalized_fallback
+    if normalized_fallback is None:
+        return normalized_primary
+
+    merged = {**normalized_fallback, **normalized_primary}
+    primary_body = _nested_record(normalized_primary, "recommendation")
+    fallback_body = _nested_record(normalized_fallback, "recommendation")
+    merged_body = {**fallback_body, **primary_body}
+
+    for selected_key, id_key in (
+        ("selected_provider", "provider_id"),
+        ("selected_model", "model_id"),
+        ("selected_hardware", "hardware_id"),
+    ):
+        primary_selected = _nested_record(primary_body, selected_key)
+        fallback_selected = _nested_record(fallback_body, selected_key)
+        primary_id = _record_value(primary_selected, id_key)
+        if _known_recommendation_value(primary_id):
+            merged_body[selected_key] = {**fallback_selected, **primary_selected}
+        elif fallback_selected:
+            merged_body[selected_key] = fallback_selected
+
+    for key in ("provider", "recommended_model", "hardware_id", "output_policy"):
+        if not _known_recommendation_value(merged.get(key)):
+            fallback_value = normalized_fallback.get(key)
+            if _known_recommendation_value(fallback_value):
+                merged[key] = fallback_value
+    if not _known_recommendation_value(merged_body.get("output_policy")):
+        fallback_value = fallback_body.get("output_policy")
+        if _known_recommendation_value(fallback_value):
+            merged_body["output_policy"] = fallback_value
+
+    merged["recommendation"] = merged_body
+    return _normalize_preflight_recommendation(merged)
+
+
+async def _resolve_preflight_recommendation(
+    request: TrainingPreflightRequest,
+    agent_session: AgentSession,
+) -> dict[str, Any] | None:
+    request_recommendation = _normalize_preflight_recommendation(request.recommendation)
+    if _has_preflight_recommendation_fields(request_recommendation):
+        return request_recommendation
+
+    session_recommendation = getattr(
+        getattr(agent_session, "session", None),
+        "latest_training_recommendation",
+        None,
+    )
+    session_recommendation = (
+        sanitize_for_frontend(session_recommendation)
+        if isinstance(session_recommendation, dict)
+        else None
+    )
+    resolved = _merge_preflight_recommendation(
+        request_recommendation,
+        session_recommendation,
+    )
+    if _has_preflight_recommendation_fields(resolved):
+        return resolved
+
+    if request.run_id:
+        run_recommendation = await session_manager.get_run_training_recommendation(
+            request.session_id,
+            request.run_id,
+        )
+        resolved = _merge_preflight_recommendation(resolved, run_recommendation)
+        if _has_preflight_recommendation_fields(resolved):
+            return resolved
+
+    stored_recommendation = await session_manager.get_latest_training_recommendation(
+        request.session_id
+    )
+    resolved = _merge_preflight_recommendation(resolved, stored_recommendation)
+    return resolved
+
+
 @router.post("/training-preflight", response_model=TrainingPreflightResultModel)
 async def run_training_preflight(
     request: TrainingPreflightRequest,
@@ -1065,22 +1315,7 @@ async def run_training_preflight(
         user,
         preload_sandbox=False,
     )
-    recommendation = request.recommendation
-    if recommendation is None:
-        session_recommendation = getattr(
-            getattr(agent_session, "session", None),
-            "latest_training_recommendation",
-            None,
-        )
-        recommendation = (
-            sanitize_for_frontend(session_recommendation)
-            if isinstance(session_recommendation, dict)
-            else None
-        )
-    if recommendation is None:
-        recommendation = await session_manager.get_latest_training_recommendation(
-            request.session_id
-        )
+    recommendation = await _resolve_preflight_recommendation(request, agent_session)
     dataset_discovery = await session_manager.get_latest_dataset_discovery(
         request.session_id
     )

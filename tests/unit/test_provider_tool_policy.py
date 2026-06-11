@@ -230,6 +230,95 @@ def test_no_compute_prompt_detection_catches_phase6_smoke_text():
     assert agent_loop._user_requested_no_compute_tools(text) is True
 
 
+def test_planner_only_prompt_detection_prefers_training_planner():
+    text = (
+        "Use the training planner only to plan a quick smoke-test fine-tuning "
+        "workflow using Google Vertex AI. Do not launch any provider job."
+    )
+
+    assert agent_loop._user_requested_training_planner_only(text) is True
+
+
+def test_planner_only_no_upload_download_still_prefers_training_planner():
+    text = (
+        "Use the training planner only to plan a quick smoke-test fine-tuning "
+        "workflow. Do not upload or download datasets."
+    )
+
+    assert agent_loop._user_requested_training_planner_only(text) is True
+
+
+def test_dataset_discovery_prompt_is_not_planner_only():
+    text = "Use dataset discovery to find GST tax support datasets before planning."
+
+    assert agent_loop._user_requested_training_planner_only(text) is False
+
+
+def test_planner_only_turn_blocks_dataset_discovery_but_allows_training_planner():
+    session = _session(provider="gcp-vertex")
+    session.training_planner_only_for_turn = True
+
+    violation = agent_loop._provider_tool_policy_violation(
+        session,
+        "dataset_discovery",
+        {"operation": "plan"},
+    )
+
+    assert violation is not None
+    assert "training planner only" in violation.lower()
+    assert (
+        agent_loop._provider_tool_policy_violation(
+            session,
+            "training_planner",
+            {"operation": "recommend", "provider": "gcp-vertex"},
+        )
+        is None
+    )
+
+
+def test_textual_vertex_request_overrides_default_provider_selection():
+    selected = agent_loop._resolve_cloud_provider_for_turn(
+        "hf-jobs",
+        "Use Google Vertex AI as the training platform. Do not use Hugging Face Jobs.",
+    )
+
+    assert selected == "gcp-vertex"
+
+
+def test_textual_provider_rejections_prevent_rejected_provider_defaults():
+    assert (
+        agent_loop._resolve_cloud_provider_for_turn(
+            "aws-sagemaker",
+            "Use Google Vertex AI. Do not use AWS SageMaker.",
+        )
+        == "gcp-vertex"
+    )
+    assert (
+        agent_loop._resolve_cloud_provider_for_turn(
+            "hf-jobs",
+            "Use Google Vertex AI. Do not use Hugging Face Jobs.",
+        )
+        == "gcp-vertex"
+    )
+
+
+def test_rejected_selected_provider_is_not_retained_without_positive_request():
+    assert (
+        agent_loop._resolve_cloud_provider_for_turn(
+            "aws-sagemaker",
+            "Do not use AWS SageMaker for this planning turn.",
+        )
+        != "aws-sagemaker"
+    )
+    assert (
+        agent_loop._resolve_cloud_provider_for_turn(
+            "hf-jobs",
+            "Do not use Hugging Face Jobs. Do not use AWS SageMaker.",
+        )
+        == "gcp-vertex"
+    )
+
+
 def test_planning_only_completion_summarizes_dataset_discovery():
     session = _session(provider="hf-jobs")
     session.compute_tools_blocked_for_turn = True

@@ -971,7 +971,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
             markdown,
           },
         }));
-        setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+        setPanelIfChanged({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
         setRightPanelOpen(true);
         return;
       }
@@ -992,13 +992,13 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         onStateChange: (next) => {
           setPreflightStates(prev => ({ ...prev, [tool.toolCallId]: next }));
           if (next.markdown) {
-            setPanel({ title: 'Training Preflight', output: { content: next.markdown, language: 'markdown' } }, 'output');
+            setPanelIfChanged({ title: 'Training Preflight', output: { content: next.markdown, language: 'markdown' } }, 'output');
             setRightPanelOpen(true);
           }
         },
       });
     },
-    [activeSessionId, setPanel, setRightPanelOpen],
+    [activeSessionId, setPanelIfChanged, setRightPanelOpen],
   );
 
   useEffect(() => {
@@ -1064,6 +1064,20 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       }
     }
   }, [tools, setToolError, getToolError]);
+
+  // Persist parsed HF job status outside render so stale job output cannot
+  // trigger a store update while React is reconciling the tool list.
+  useEffect(() => {
+    for (const tool of tools) {
+      if (tool.toolName !== 'hf_jobs') continue;
+      if (!tool.output && !(tool as Record<string, unknown>).errorText) continue;
+      if (getJobStatus(tool.toolCallId)) continue;
+      const jobStatus = parseJobMeta(tool.output ?? (tool as Record<string, unknown>).errorText).jobStatus;
+      if (jobStatus) {
+        setJobStatus(tool.toolCallId, jobStatus);
+      }
+    }
+  }, [tools, getJobStatus, setJobStatus]);
 
   const { scriptLabelMap, toolDisplayMap } = useMemo(() => {
     const hfJobs = tools.filter(t => t.toolName === 'hf_jobs' && (t.input as Record<string, unknown>)?.script);
@@ -1177,7 +1191,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
         const hasOutput = (tool.state === 'output-available' || tool.state === 'output-error') && jobOutput;
         const scriptContent = redactText(getEditedScript(tool.toolCallId) || String(args.script));
-        setPanel(
+        setPanelIfChanged(
           {
             title: displayName,
             script: { content: scriptContent, language: 'python' },
@@ -1201,7 +1215,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           .join('\n\n'));
 
         if (vertexPanel) {
-          setPanel(
+          setPanelIfChanged(
             {
               ...vertexPanel.data,
               ...(outputContent
@@ -1220,7 +1234,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         }
 
         if (outputContent) {
-          setPanel(
+          setPanelIfChanged(
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
@@ -1244,7 +1258,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           .join('\n\n'));
 
         if (awsPanel) {
-          setPanel(
+          setPanelIfChanged(
             {
               ...awsPanel.data,
               ...(outputContent
@@ -1263,7 +1277,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         }
 
         if (outputContent) {
-          setPanel(
+          setPanelIfChanged(
             {
               title: displayName,
               output: { content: outputContent, language: 'markdown' },
@@ -1295,33 +1309,23 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         if (content.trim().startsWith('{') || content.trim().startsWith('[')) language = 'json';
         else if (content.includes('```')) language = 'markdown';
 
-        setPanel({ title: displayName, output: { content, language }, input: inputSection }, 'output');
+        setPanelIfChanged({ title: displayName, output: { content, language }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       } else if (tool.state === 'output-error') {
         const content = `Tool \`${tool.toolName}\` returned an error with no output message.`;
-        setPanel({ title: displayName, output: { content, language: 'markdown' }, input: inputSection }, 'output');
+        setPanelIfChanged({ title: displayName, output: { content, language: 'markdown' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       } else if (hasCompleted && args) {
         // Tool completed but has no output - show input as fallback
-        setPanel({ title: displayName, output: { content: redactedJsonString(args), language: 'json' }, input: inputSection }, 'output');
+        setPanelIfChanged({ title: displayName, output: { content: redactedJsonString(args), language: 'json' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       } else if (args) {
-        const runningMessages = [
-          'Crunching numbers and herding tensors...',
-          'Teaching the model some new tricks...',
-          'Consulting the GPU oracle...',
-          'Wrangling data into submission...',
-          'Brewing a fresh batch of predictions...',
-          'Negotiating with the transformer heads...',
-          'Polishing the attention weights...',
-          'Aligning the embedding stars...',
-        ];
-        const funMsg = runningMessages[Math.floor(Math.random() * runningMessages.length)];
-        setPanel({ title: displayName, output: { content: funMsg, language: 'text' }, input: inputSection }, 'output');
+        const funMsg = 'Preparing tool output...';
+        setPanelIfChanged({ title: displayName, output: { content: funMsg, language: 'text' }, input: inputSection }, 'output');
         setRightPanelOpen(true);
       }
     },
-    [toolDisplayMap, setPanel, setPanelIfChanged, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
+    [toolDisplayMap, setPanelIfChanged, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
   );
 
   // ── Panel click handler ───────────────────────────────────────────
@@ -1522,11 +1526,6 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           const awsMetaFromOutput = tool.toolName === 'aws_sagemaker_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)
             ? parseAwsMeta(tool.output ?? (tool as Record<string, unknown>).errorText)
             : {};
-
-          // Store job status if we just parsed it and don't have it stored yet
-          if (tool.toolName === 'hf_jobs' && jobMetaFromOutput.jobStatus && !jobStatusFromStore) {
-            setJobStatus(tool.toolCallId, jobMetaFromOutput.jobStatus);
-          }
 
           // Combine job URL and status from store (persisted) with output metadata (freshly parsed)
           // Prefer stored values to ensure they persist across renders
@@ -1881,7 +1880,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                           const markdown = preflightState.status === 'success' && preflightState.markdown
                             ? preflightState.markdown
                             : createManualPreflightNotRunMarkdown();
-                          setPanel({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
+                          setPanelIfChanged({ title: 'Training Preflight', output: { content: markdown, language: 'markdown' } }, 'output');
                           setRightPanelOpen(true);
                         }}
                         sx={{

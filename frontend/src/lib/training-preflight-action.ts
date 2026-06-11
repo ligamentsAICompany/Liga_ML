@@ -73,6 +73,55 @@ function getRecord(record: PlannerRecord, ...keys: string[]): PlannerRecord | nu
   return null;
 }
 
+function knownValue(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.trim().length > 0 &&
+    !['unknown', 'null', 'none'].includes(value.trim().toLowerCase())
+  );
+}
+
+function recommendationBody(record: PlannerRecord): PlannerRecord {
+  return getRecord(record, 'recommendation') ?? record;
+}
+
+function recordValue(record: PlannerRecord, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = record[key];
+    if (knownValue(value)) return value;
+  }
+  return null;
+}
+
+function isCompletePreflightRecommendation(value: PlannerRecord | null): value is PlannerRecord {
+  if (!value || !Object.keys(value).length) return false;
+  const body = recommendationBody(value);
+  const provider = recordValue(value, 'provider', 'provider_id', 'cloud_provider')
+    ?? recordValue(getRecord(body, 'selected_provider') ?? {}, 'provider_id');
+  const modelId = recordValue(value, 'recommended_model', 'model_id')
+    ?? recordValue(getRecord(body, 'selected_model') ?? {}, 'model_id');
+  const hardwareId = recordValue(value, 'hardware_id')
+    ?? recordValue(getRecord(body, 'selected_hardware') ?? {}, 'hardware_id');
+  const outputPolicy = recordValue(value, 'output_policy')
+    ?? recordValue(body, 'output_policy');
+
+  return [provider, modelId, hardwareId, outputPolicy].every(knownValue);
+}
+
+function preflightRecommendation(record: PlannerRecord): PlannerRecord | null {
+  const nested = getRecord(record, 'recommendation');
+  const hasTopLevelRecommendationFields = [
+    recordValue(record, 'provider', 'provider_id', 'cloud_provider'),
+    recordValue(record, 'recommended_model', 'model_id'),
+    recordValue(record, 'hardware_id'),
+    recordValue(record, 'output_policy'),
+  ].every(knownValue);
+  if (nested && hasTopLevelRecommendationFields && isCompletePreflightRecommendation(record)) return record;
+  if (isCompletePreflightRecommendation(nested)) return nested;
+  if (isCompletePreflightRecommendation(record)) return record;
+  return null;
+}
+
 function safeRecord(value: PlannerRecord | null): Record<string, unknown> | undefined {
   if (!value || !Object.keys(value).length) return undefined;
   return redactJsonLike(value);
@@ -80,7 +129,7 @@ function safeRecord(value: PlannerRecord | null): Record<string, unknown> | unde
 
 export function buildManualPreflightRequest(input: ManualPreflightRequestInput): RunTrainingPreflightRequest {
   const record = firstRecord(input.plannerOutput, input.plannerInput);
-  const recommendation = getRecord(record, 'recommendation');
+  const recommendation = preflightRecommendation(record);
   const datasetSummary = getRecord(record, 'datasetSummary', 'dataset_summary');
   const safeRecommendation = safeRecord(recommendation);
   const safeDatasetSummary = safeRecord(datasetSummary);

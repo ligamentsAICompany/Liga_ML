@@ -191,6 +191,34 @@ def test_provider_specific_hardware_shapes_are_returned():
     assert hf.recommended_hardware == {"hardware_flavor": "t4-small"}
 
 
+def test_explicit_google_vertex_request_selects_vertex_smoke_plan():
+    plan = recommend_training_plan(
+        provider="gcp-vertex",
+        domain="finance",
+        training_goal="smoke-test",
+        dataset_summary={"rows": 25, "columns": ["question", "answer"]},
+        requested_output_policy="cloud-private",
+        explicit_provider=True,
+        provider_readiness={"gcp-vertex": {"configured": False}},
+    )
+
+    assert plan.provider == "gcp-vertex"
+    assert plan.recommendation.selected_provider.provider_id == "gcp-vertex"
+    assert (
+        plan.recommendation.selected_provider.display_name == "Google Cloud Vertex AI"
+    )
+    assert plan.recommended_model == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert plan.recommendation.selected_hardware.provider_id == "gcp-vertex"
+    assert plan.recommendation.selected_hardware.hardware_id.startswith("gcp-vertex:")
+    assert plan.recommended_hardware["accelerator_type"] == "NVIDIA_TESLA_T4"
+    assert plan.output_policy == "cloud-private"
+    assert plan.recommendation.estimated_cost_usd is not None
+    assert any(
+        "readiness is false" in warning.message.lower()
+        for warning in plan.recommendation.warnings
+    )
+
+
 def test_user_model_preference_is_respected_with_risk_notes():
     plan = recommend_training_plan(
         provider="hf-jobs",
