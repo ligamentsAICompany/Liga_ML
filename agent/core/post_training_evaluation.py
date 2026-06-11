@@ -53,6 +53,7 @@ RESPONSE_ROW_LIMITATION = (
     "Derived from response log row; durable run record unavailable."
 )
 COMPLETED_RESPONSE_PROGRESS = {"completed", "succeeded", "success"}
+FAILED_RESPONSE_PROGRESS = {"failed", "error", "cancelled", "canceled", "expired"}
 
 
 def _now() -> datetime:
@@ -477,18 +478,22 @@ def _row_text(value: Any) -> str:
 
 
 def evaluation_context_from_response_row(row: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a safe static-evaluation context from a completed Responses row."""
+    """Build a safe static-evaluation context from a terminal Responses row."""
 
     progress = _row_text(row.get("progress")).lower()
-    if progress not in COMPLETED_RESPONSE_PROGRESS:
+    if progress not in COMPLETED_RESPONSE_PROGRESS | FAILED_RESPONSE_PROGRESS:
         return None
     session_id = _row_text(row.get("session_id"))
     row_id = _row_text(row.get("id"))
     if not session_id or not row_id:
         return None
     artifact_ref = _row_text(row.get("final_artifact_or_result"))
-    if not artifact_ref or artifact_ref.lower() in {"unknown", "unavailable", "none"}:
+    if progress in COMPLETED_RESPONSE_PROGRESS and (
+        not artifact_ref or artifact_ref.lower() in {"unknown", "unavailable", "none"}
+    ):
         return None
+    if not artifact_ref or artifact_ref.lower() in {"unknown", "unavailable", "none"}:
+        artifact_ref = _row_text(row.get("error"))
     provider = _row_text(row.get("platform")) or "unknown"
     job_id = _row_text(row.get("job_id")) or None
     run_id = f"response_row:{row_id}"
@@ -501,7 +506,9 @@ def evaluation_context_from_response_row(row: dict[str, Any]) -> dict[str, Any] 
             "model_ref": _row_text(row.get("model_name")) or artifact_ref,
             "artifact_ref": artifact_ref,
             "dataset_ref": row.get("dataset_ref") or row.get("dataset_name"),
-            "training_status": "completed",
+            "training_status": "completed"
+            if progress in COMPLETED_RESPONSE_PROGRESS
+            else "failed",
             "created_at": row.get("created_at") or row.get("completed_at"),
             "completed_at": row.get("completed_at"),
             "metadata": {

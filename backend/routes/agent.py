@@ -907,6 +907,7 @@ async def list_evaluations(
     """List safe static post-training evaluations."""
     if session_id:
         await _check_session_access(session_id, user, preload_sandbox=False)
+    await _refresh_response_rows_for_evaluations(user["user_id"])
     evaluations = await session_manager.list_evaluations(
         session_id=session_id,
         run_id=run_id,
@@ -932,6 +933,7 @@ async def evaluations_summary(
 ) -> EvaluationSummary:
     if session_id:
         await _check_session_access(session_id, user, preload_sandbox=False)
+    await _refresh_response_rows_for_evaluations(user["user_id"])
     raw = await session_manager.evaluation_summary(
         session_id=session_id,
         run_id=run_id,
@@ -1631,6 +1633,8 @@ def _hf_job_identity(row: dict[str, Any]) -> tuple[str | None, str | None]:
 
 def _normalize_hf_job_progress(stage: Any) -> str:
     text = str(stage or "").strip().lower()
+    if text.startswith("job_state_"):
+        text = text.removeprefix("job_state_")
     if text in {"completed", "complete", "succeeded", "success", "done", "finished"}:
         return "completed"
     if text in {"failed", "failure", "expired"}:
@@ -1644,6 +1648,122 @@ def _normalize_hf_job_progress(stage: Any) -> str:
     if text in {"running", "queued"}:
         return text
     return text or "unknown"
+
+
+def _gcp_job_identity(row: dict[str, Any]) -> str | None:
+    raw_job = str(row.get("job_id") or "").strip()
+    if re.fullmatch(r"projects/[^/]+/locations/[^/]+/customJobs/[^/]+", raw_job):
+        return raw_job
+    return None
+
+
+def _gcp_job_location(job_name: str) -> str | None:
+    match = re.fullmatch(
+        r"projects/[^/]+/locations/(?P<location>[^/]+)/customJobs/[^/]+", job_name
+    )
+    return match.group("location") if match else None
+
+
+def _gcp_job_console_url(job_name: str) -> str | None:
+    match = re.fullmatch(
+        r"projects/(?P<project>[^/]+)/locations/(?P<location>[^/]+)/customJobs/(?P<job_id>[^/]+)",
+        job_name,
+    )
+    if not match:
+        return None
+    return (
+        "https://console.cloud.google.com/vertex-ai/training/custom-jobs/"
+        f"locations/{match.group('location')}/customJobs/{match.group('job_id')}"
+        f"?project={match.group('project')}"
+    )
+
+
+def _gcp_describe_value(job_info: Any, key: str) -> Any:
+    if isinstance(job_info, dict):
+        return job_info.get(key)
+    return getattr(job_info, key, None)
+
+
+def _gcp_state_text(state: Any) -> str:
+    text = str(getattr(state, "name", None) or state or "").strip()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
+def _iso_from_describe_time(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return parsed.isoformat()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
+def _gcp_described_response_row(
+    row: dict[str, Any], job_info: Any, *, job_name: str
+) -> dict[str, Any]:
+    state = _gcp_state_text(_gcp_describe_value(job_info, "state"))
+    progress = _normalize_hf_job_progress(state)
+    output_dir = (
+        _gcp_describe_value(job_info, "output_dir")
+        or _gcp_describe_value(job_info, "gcs_output_dir")
+        or _gcp_describe_value(job_info, "artifact_uri")
+        or row.get("final_artifact_or_result")
+    )
+    job_url = _gcp_describe_value(job_info, "job_url") or _gcp_job_console_url(job_name)
+    completed_at = (
+        _iso_from_describe_time(_gcp_describe_value(job_info, "end_time"))
+        or _iso_from_describe_time(_gcp_describe_value(job_info, "update_time"))
+        or _iso_from_describe_time(_gcp_describe_value(job_info, "updateTime"))
+    )
+    updated = dict(row)
+    updated["progress"] = progress
+    updated["job_id"] = job_name
+    if output_dir:
+        updated["final_artifact_or_result"] = str(output_dir)
+    if progress in TERMINAL_RESPONSE_PROGRESS:
+        updated["completed_at"] = (
+            row.get("completed_at") or completed_at or datetime.now(UTC).isoformat()
+        )
+    updated["provider_metadata"] = {
+        **dict(row.get("provider_metadata") or {}),
+        "tool": "gcp_vertex_jobs",
+        "state": state or progress,
+        "refreshed_from": "gcp_vertex_describe",
+    }
+    if job_url:
+        updated["provider_metadata"]["jobUrl"] = job_url
+    return updated
+
+
+async def _describe_gcp_vertex_job(job_name: str) -> Any:
+    location = _gcp_job_location(job_name)
+    if not location:
+        raise ValueError(
+            "Vertex job name must include project, location, and custom job id."
+        )
+    from google.cloud import aiplatform_v1
+
+    client = aiplatform_v1.JobServiceAsyncClient(
+        client_options={"api_endpoint": f"{location}-aiplatform.googleapis.com"}
+    )
+    job = await client.get_custom_job(name=job_name)
+    output_dir = ""
+    try:
+        output_dir = job.job_spec.base_output_directory.output_uri_prefix
+    except AttributeError:
+        output_dir = ""
+    return {
+        "state": _gcp_state_text(job.state),
+        "update_time": getattr(job, "update_time", None),
+        "end_time": getattr(job, "end_time", None),
+        "output_dir": output_dir,
+        "job_url": _gcp_job_console_url(job_name),
+    }
 
 
 def _completed_at_from_hf_job(job_info: Any) -> str:
@@ -1738,6 +1858,81 @@ async def _refresh_stale_hf_rows_from_hub(
     return False
 
 
+async def _refresh_stale_gcp_rows_from_vertex(
+    rows: list[dict[str, Any]],
+    *,
+    user_id: str,
+    describe_job: Any = None,
+) -> bool:
+    stale_gcp_rows = [
+        row
+        for row in rows
+        if row.get("platform") == "gcp-vertex"
+        and str(row.get("progress") or "").lower() not in TERMINAL_RESPONSE_PROGRESS
+        and row.get("job_id")
+    ]
+    if not stale_gcp_rows:
+        return False
+    describer = describe_job or _describe_gcp_vertex_job
+    refreshed: list[dict[str, Any]] = []
+    for row in stale_gcp_rows:
+        job_name = _gcp_job_identity(row)
+        if not job_name:
+            continue
+        try:
+            job_info = await describer(job_name)
+        except Exception as e:
+            logger.debug("Vertex stale row refresh failed for %s: %s", job_name, e)
+            continue
+        updated = _gcp_described_response_row(row, job_info, job_name=job_name)
+        if updated.get("progress") != row.get("progress") or updated.get(
+            "completed_at"
+        ) != row.get("completed_at"):
+            refreshed.append(updated)
+    if not refreshed:
+        return False
+    store = session_manager.persistence_store
+    if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
+        await store.upsert_response_rows(refreshed, user_id=user_id)
+        return True
+    return False
+
+
+async def _refresh_stale_response_rows(
+    rows: list[dict[str, Any]],
+    *,
+    user_id: str,
+) -> bool:
+    refreshed = False
+    if await _refresh_stale_hf_rows_from_hub(rows, user_id=user_id):
+        refreshed = True
+    if await _refresh_stale_gcp_rows_from_vertex(rows, user_id=user_id):
+        refreshed = True
+    return refreshed
+
+
+async def _refresh_response_rows_for_evaluations(user_id: str) -> None:
+    store = session_manager.persistence_store
+    if not (getattr(store, "enabled", False) and hasattr(store, "list_response_rows")):
+        return
+    response_page = await store.list_response_rows(
+        user_id=user_id,
+        page=1,
+        page_size=200,
+    )
+    rows = response_page.get("rows", [])
+    stale_session_ids = _stale_response_session_ids(rows)
+    if stale_session_ids:
+        await _sync_response_sessions(user_id, stale_session_ids)
+        response_page = await store.list_response_rows(
+            user_id=user_id,
+            page=1,
+            page_size=200,
+        )
+        rows = response_page.get("rows", [])
+    await _refresh_stale_response_rows(rows, user_id=user_id)
+
+
 async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
     if not session_ids:
         return
@@ -1812,7 +2007,7 @@ async def get_responses(
                 response_page = await store.list_response_rows(
                     user_id=user["user_id"], **filters
                 )
-                if await _refresh_stale_hf_rows_from_hub(
+                if await _refresh_stale_response_rows(
                     response_page.get("rows", []), user_id=user["user_id"]
                 ):
                     response_page = await store.list_response_rows(
@@ -1823,7 +2018,7 @@ async def get_responses(
                 response_page = await store.list_response_rows(
                     user_id=user["user_id"], **filters
                 )
-                if await _refresh_stale_hf_rows_from_hub(
+                if await _refresh_stale_response_rows(
                     response_page.get("rows", []), user_id=user["user_id"]
                 ):
                     response_page = await store.list_response_rows(

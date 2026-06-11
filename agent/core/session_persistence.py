@@ -2063,6 +2063,8 @@ class MongoSessionStore(NoopSessionStore):
             (normalized.get("provider_metadata") or {}).get("state") or ""
         ).lower()
         status = state if progress in {"", "unknown"} else progress
+        if status.startswith("job_state_"):
+            status = status.removeprefix("job_state_")
         if status in {"succeeded", "success", "complete"}:
             normalized["progress"] = "completed"
         elif status == "failure":

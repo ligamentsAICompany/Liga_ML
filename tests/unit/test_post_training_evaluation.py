@@ -165,6 +165,38 @@ def test_response_row_context_marks_static_evaluation_limitations():
     assert evaluation["metadata"]["paid_judge_used"] is False
 
 
+def test_failed_vertex_response_row_builds_skipped_static_evaluation():
+    context = evaluation_context_from_response_row(
+        {
+            "id": "row-vertex-failed",
+            "session_id": "s-vertex",
+            "platform": "gcp-vertex",
+            "progress": "failed",
+            "job_id": "projects/p/locations/us/customJobs/failed",
+            "final_artifact_or_result": "gs://liga-output/job-failed",
+            "result_storage": "cloud-private",
+            "run_type": "smoke-test",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "completed_at": "2026-06-10T00:00:00+00:00",
+            "error": "trainer crashed",
+        }
+    )
+
+    assert context is not None
+    assert context["training_status"] == "failed"
+    assert context["artifact_ref"] == "gs://liga-output/job-failed"
+
+    evaluation = build_post_training_evaluation(context)
+
+    assert evaluation["status"] == "skipped"
+    assert evaluation["provider"] == "gcp-vertex"
+    assert evaluation["artifact_ref"] == "gs://liga-output/job-failed"
+    assert "training did not succeed" in evaluation["failure_summary"].lower()
+    assert evaluation["metadata"]["source"] == "response_row"
+    assert evaluation["metadata"]["live_inference_used"] is False
+    assert evaluation["metadata"]["paid_judge_used"] is False
+
+
 @pytest.mark.asyncio
 async def test_store_upserts_evaluation_idempotently_and_updates_run_summary(
     monkeypatch,
@@ -292,6 +324,61 @@ async def test_evaluation_list_and_summary_include_completed_response_rows(
     assert listed[0].metadata["source"] == "response_row"
     assert summary.total_evaluations == 1
     assert summary.evaluations[0].metadata["source"] == "response_row"
+
+
+@pytest.mark.asyncio
+async def test_evaluation_list_and_summary_include_vertex_response_rows(
+    monkeypatch,
+):
+    store = ResponseRowStore(
+        [
+            {
+                "id": "row-vertex-completed",
+                "session_id": "s-vertex",
+                "platform": "gcp-vertex",
+                "progress": "completed",
+                "job_id": "projects/p/locations/us/customJobs/succeeded",
+                "final_artifact_or_result": "gs://liga-output/job-succeeded",
+                "result_storage": "cloud-private",
+                "run_type": "smoke-test",
+                "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+                "completed_at": "2026-06-10T00:00:00+00:00",
+            },
+            {
+                "id": "row-vertex-failed",
+                "session_id": "s-vertex",
+                "platform": "gcp-vertex",
+                "progress": "failed",
+                "job_id": "projects/p/locations/us/customJobs/failed",
+                "final_artifact_or_result": "gs://liga-output/job-failed",
+                "result_storage": "cloud-private",
+                "run_type": "smoke-test",
+                "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+                "completed_at": "2026-06-10T00:01:00+00:00",
+                "error": "trainer crashed",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+    monkeypatch.setattr(agent.session_manager, "_store", lambda: store)
+
+    listed = await agent.list_evaluations(
+        provider="gcp-vertex", user={"user_id": "dev"}
+    )
+    summary = await agent.evaluations_summary(
+        provider="gcp-vertex", user={"user_id": "dev"}
+    )
+
+    statuses = {evaluation.run_id: evaluation.status for evaluation in listed}
+    assert statuses["response_row:row-vertex-completed"] == "succeeded"
+    assert statuses["response_row:row-vertex-failed"] == "skipped"
+    assert summary.total_evaluations == 2
+    assert summary.counts_by_status == {"succeeded": 1, "skipped": 1}
+    assert all(
+        evaluation.metadata["source"] == "response_row"
+        for evaluation in summary.evaluations
+    )
 
 
 @pytest.mark.asyncio

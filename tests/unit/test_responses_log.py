@@ -783,6 +783,15 @@ def test_mongo_response_rows_normalize_persisted_provider_states():
         )["progress"]
         == "completed"
     )
+    assert (
+        store._normalize_response_row(
+            {
+                "progress": "unknown",
+                "provider_metadata": {"state": "JOB_STATE_SUCCEEDED"},
+            }
+        )["progress"]
+        == "completed"
+    )
 
 
 class _AsyncListCursor:
@@ -1415,3 +1424,60 @@ async def test_responses_routes_refresh_stale_gcp_rows_from_persisted_events(
 
     assert rows["rows"][0]["progress"] == "completed"
     assert rows["rows"][0]["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_responses_routes_refresh_stale_gcp_rows_from_vertex_describe(
+    monkeypatch,
+):
+    manager = _StoreBackedManager()
+    job_name = "projects/p/locations/us/customJobs/456"
+    await manager.persistence_store.upsert_response_rows(
+        [
+            {
+                "id": f"persisted:gcp-vertex:{job_name}",
+                "display_session_number": 13,
+                "actual_sequence_number": 13,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "short_session_id": "persiste",
+                "session_title": "Persisted Vertex run",
+                "model_name": "moonshotai/Kimi-K2.6",
+                "platform": "gcp-vertex",
+                "run_type": "smoke-test",
+                "result_storage": "cloud-and-hf-hub",
+                "progress": "running",
+                "job_id": job_name,
+                "final_artifact_or_result": "gs://liga-output/job-456",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {"state": "JOB_STATE_RUNNING"},
+            }
+        ]
+    )
+    monkeypatch.setattr(agent, "session_manager", manager)
+
+    async def fake_describe_vertex(job_id):
+        assert job_id == job_name
+        return SimpleNamespace(
+            state="JOB_STATE_SUCCEEDED",
+            update_time=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+            end_time=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+            output_dir="gs://liga-output/job-456",
+            job_url="https://console.cloud.google.com/vertex-ai/jobs/456",
+        )
+
+    refreshed = await agent._refresh_stale_gcp_rows_from_vertex(
+        list(manager.persistence_store.response_rows),
+        user_id="dev",
+        describe_job=fake_describe_vertex,
+    )
+
+    assert refreshed is True
+    [row] = manager.persistence_store.response_rows
+    assert row["progress"] == "completed"
+    assert row["completed_at"] == "2026-01-01T00:02:00+00:00"
+    assert row["job_id"] == job_name
+    assert row["final_artifact_or_result"] == "gs://liga-output/job-456"
+    assert row["provider_metadata"]["state"] == "JOB_STATE_SUCCEEDED"
+    assert row["provider_metadata"]["refreshed_from"] == "gcp_vertex_describe"
