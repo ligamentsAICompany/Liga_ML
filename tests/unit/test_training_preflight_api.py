@@ -20,12 +20,28 @@ def _recommendation() -> dict:
     return {
         "provider": "hf-jobs",
         "recommended_model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "hardware_id": "hf-jobs:t4-small",
         "output_policy": "cloud-and-hf-hub",
         "recommendation": {
             "selected_provider": {"provider_id": "hf-jobs"},
             "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
             "selected_hardware": {"hardware_id": "hf-jobs:t4-small"},
             "output_policy": "cloud-and-hf-hub",
+        },
+    }
+
+
+def _vertex_recommendation() -> dict:
+    return {
+        "provider": "gcp-vertex",
+        "recommended_model": "Qwen/Qwen2.5-0.5B-Instruct",
+        "hardware_id": "gcp-vertex:n1-standard-8-t4",
+        "output_policy": "cloud-private",
+        "recommendation": {
+            "selected_provider": {"provider_id": "gcp-vertex"},
+            "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+            "selected_hardware": {"hardware_id": "gcp-vertex:n1-standard-8-t4"},
+            "output_policy": "cloud-private",
         },
     }
 
@@ -101,7 +117,76 @@ async def test_post_training_preflight_uses_latest_session_recommendation(
 
     assert response.provider == "hf-jobs"
     assert response.model_id == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert response.hardware_id == "hf-jobs:t4-small"
+    assert response.output_policy == "cloud-and-hf-hub"
     assert response.launch_ready is False
+
+
+@pytest.mark.asyncio
+async def test_post_training_preflight_uses_latest_when_request_recommendation_incomplete(
+    preflight_store,
+    allow_access,
+):
+    response = await agent.run_training_preflight(
+        TrainingPreflightRequest(
+            session_id="s1",
+            recommendation={"selected_provider": {"provider_id": "unknown"}},
+            dataset_summary={"rows": 10},
+        ),
+        user={"user_id": "dev"},
+    )
+
+    assert response.provider == "hf-jobs"
+    assert response.model_id == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert response.hardware_id == "hf-jobs:t4-small"
+    assert response.launch_ready is False
+
+
+@pytest.mark.asyncio
+async def test_post_training_preflight_merges_partial_request_from_latest_vertex(
+    preflight_store,
+    monkeypatch,
+):
+    async def _allow_access(session_id, user, request=None, preload_sandbox=True):
+        return SimpleNamespace(
+            session_id=session_id,
+            user_id=user["user_id"],
+            session=SimpleNamespace(
+                latest_training_recommendation=_vertex_recommendation(),
+                latest_dataset_discovery=None,
+            ),
+            is_active=True,
+        )
+
+    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+
+    response = await agent.run_training_preflight(
+        TrainingPreflightRequest(
+            session_id="s1",
+            recommendation={
+                "selected_provider": {"provider_id": "unknown"},
+                "selected_model": {"model_id": "unknown"},
+                "selected_hardware": {"hardware_id": None},
+            },
+            dataset_summary={"rows": 10},
+        ),
+        user={"user_id": "dev"},
+    )
+    saved = await preflight_store.get_latest_training_preflight("s1")
+
+    assert response.provider == "gcp-vertex"
+    assert response.model_id == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert response.hardware_id == "gcp-vertex:n1-standard-8-t4"
+    assert response.output_policy == "cloud-private"
+    assert response.metadata["provider_jobs_launched"] is False
+    assert response.metadata["resources_created"] is False
+    assert saved["provider"] == "gcp-vertex"
+    assert saved["model_id"] == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert saved["hardware_id"] == "gcp-vertex:n1-standard-8-t4"
+    assert any(
+        check.provider == "gcp-vertex" and check.check_id.startswith("gcp.")
+        for check in response.primary.checks
+    )
 
 
 @pytest.mark.asyncio

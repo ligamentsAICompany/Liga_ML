@@ -107,6 +107,48 @@ test('training planner panel renders phase 7 recommendation sections', () => {
   assert.match(panel.markdown, /Production alternative: Qwen\/Qwen2\.5-3B-Instruct on aws-sagemaker:ml\.g5\.2xlarge/);
 });
 
+test('training planner panel renders Vertex provider hardware output policy and cost', () => {
+  const panel = createTrainingPlannerPanel({
+    provider: 'gcp-vertex',
+    trainingGoal: 'smoke-test',
+    recommendedModel: 'Qwen/Qwen2.5-0.5B-Instruct',
+    recommendedHardware: {
+      machine_type: 'n1-standard-8',
+      accelerator_type: 'NVIDIA_TESLA_T4',
+      accelerator_count: 1,
+    },
+    outputPolicy: 'cloud-private',
+    recommendation: {
+      selected_model: {
+        model_id: 'Qwen/Qwen2.5-0.5B-Instruct',
+        family: 'Qwen',
+        parameter_count_b: 0.5,
+        license: 'apache-2.0',
+        access: 'open',
+      },
+      selected_provider: {
+        provider_id: 'gcp-vertex',
+        display_name: 'Google Cloud Vertex AI',
+      },
+      selected_hardware: {
+        hardware_id: 'gcp-vertex:n1-standard-8-t4',
+        display_name: 'n1-standard-8 + T4',
+        gpu_memory_gb: 16,
+      },
+      estimated_cost_usd: 1.1,
+      warnings: [{ message: 'GCloud readiness is unknown; verify configuration.' }],
+      fallbacks: [],
+    },
+  });
+
+  assert.match(panel.markdown, /Provider: Google Cloud Vertex AI/);
+  assert.match(panel.markdown, /Provider: gcp-vertex/);
+  assert.match(panel.markdown, /Hardware: n1-standard-8 \+ T4/);
+  assert.match(panel.markdown, /Hardware id: gcp-vertex:n1-standard-8-t4/);
+  assert.match(panel.markdown, /Output policy: Google Cloud Storage only/);
+  assert.match(panel.markdown, /Estimated cost: \$1\.10/);
+});
+
 test('training planner panel redacts secret-looking recommendation values', () => {
   const panel = createTrainingPlannerPanel({
     provider: 'hf-jobs',
@@ -130,4 +172,12 @@ test('training planner panel handles missing optional fields gracefully', () => 
 test('training planner tool displays a readable label', () => {
   assert.match(toolCallGroupSource, /training_planner/);
   assert.match(toolCallGroupSource, /Training Planner/);
+});
+
+test('tool call group persists parsed HF job status outside render', () => {
+  assert.match(toolCallGroupSource, /Persist parsed HF job status outside render/);
+  assert.doesNotMatch(
+    toolCallGroupSource,
+    /setJobStatus\(tool\.toolCallId,\s*jobMetaFromOutput\.jobStatus\);/,
+  );
 });

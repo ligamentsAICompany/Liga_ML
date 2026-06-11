@@ -377,6 +377,18 @@ def _provider_tool_policy_violation(
 ) -> str | None:
     """Block compute-provider drift while an active provider job is being monitored."""
 
+    if (
+        getattr(session, "training_planner_only_for_turn", False)
+        and tool_name == "dataset_discovery"
+    ):
+        return (
+            "The user explicitly requested the training planner only for this "
+            "turn. Do not call dataset_discovery; call training_planner with "
+            "provider gcp-vertex/hf-jobs/aws-sagemaker as requested, then "
+            "summarize that dataset selection or discovery would require a "
+            "separate user request."
+        )
+
     if getattr(session, "compute_tools_blocked_for_turn", False) and tool_name in {
         "sandbox_create",
         "bash",
@@ -463,6 +475,103 @@ def _user_requested_no_compute_tools(text: str) -> bool:
         )
     )
     return sandbox_blocked and (provider_jobs_blocked or upload_download_blocked)
+
+
+def _user_requested_training_planner_only(text: str) -> bool:
+    normalized = str(text or "").lower()
+    planner_only = any(
+        marker in normalized
+        for marker in (
+            "training planner only",
+            "planner only",
+            "use the training_planner only",
+            "use training_planner only",
+        )
+    )
+    if not planner_only:
+        return False
+    discovery_requested = any(
+        marker in normalized
+        for marker in (
+            "dataset discovery",
+            "dataset_discovery",
+            "discover dataset",
+            "find datasets",
+            "search datasets",
+        )
+    )
+    return not discovery_requested
+
+
+def _requested_training_provider_from_text(text: str) -> str | None:
+    normalized = str(text or "").lower()
+    rejected = _rejected_training_providers_from_text(normalized)
+    if (
+        any(
+            marker in normalized
+            for marker in (
+                "google vertex ai",
+                "vertex ai",
+                "gcp vertex",
+                "gcloud",
+                "google cloud",
+            )
+        )
+        and "gcp-vertex" not in rejected
+    ):
+        return "gcp-vertex"
+    if (
+        any(marker in normalized for marker in ("aws sagemaker", "sagemaker"))
+        and "aws-sagemaker" not in rejected
+    ):
+        return "aws-sagemaker"
+    if (
+        any(
+            marker in normalized
+            for marker in ("hugging face jobs", "hf jobs", "hf-jobs")
+        )
+        and "hf-jobs" not in rejected
+    ):
+        return "hf-jobs"
+    return None
+
+
+def _rejected_training_providers_from_text(text: str) -> set[str]:
+    normalized = str(text or "").lower()
+    rejected: set[str] = set()
+    rejection_patterns = {
+        "gcp-vertex": (
+            r"\bdo\s+not\s+(?:use|run)\b[^.?!\n]*(?:google\s+vertex|vertex\s+ai|gcp\s+vertex|google\s+cloud)",
+            r"\bno\s+(?:google\s+vertex|vertex\s+ai|gcp\s+vertex)\b",
+        ),
+        "aws-sagemaker": (
+            r"\bdo\s+not\s+(?:use|run)\b[^.?!\n]*(?:aws\s+sagemaker|sagemaker)",
+            r"\bno\s+(?:aws\s+sagemaker|sagemaker)\b",
+        ),
+        "hf-jobs": (
+            r"\bdo\s+not\s+(?:use|run)\b[^.?!\n]*(?:hugging\s+face\s+jobs|hf\s+jobs|hf-jobs)",
+            r"\bno\s+(?:hugging\s+face\s+jobs|hf\s+jobs|hf-jobs)\b",
+        ),
+    }
+    for provider, patterns in rejection_patterns.items():
+        if any(re.search(pattern, normalized) for pattern in patterns):
+            rejected.add(provider)
+    return rejected
+
+
+def _resolve_cloud_provider_for_turn(
+    selected_provider: str | None, text: str
+) -> str | None:
+    requested_provider = _requested_training_provider_from_text(text)
+    if requested_provider:
+        return requested_provider
+    rejected = _rejected_training_providers_from_text(text)
+    if selected_provider in rejected:
+        for fallback_provider in ("gcp-vertex", "hf-jobs", "aws-sagemaker"):
+            if fallback_provider not in rejected:
+                return fallback_provider
+        return None
+    return selected_provider
 
 
 def _uploaded_dataset_instruction(session: Session) -> str | None:
@@ -3199,7 +3308,11 @@ async def process_submission(session: Session, submission) -> bool:
     if op.op_type == OpType.USER_INPUT:
         text = op.data.get("text", "") if op.data else ""
         session.compute_tools_blocked_for_turn = _user_requested_no_compute_tools(text)
-        cloud_provider = op.data.get("cloud_provider") if op.data else None
+        session.training_planner_only_for_turn = _user_requested_training_planner_only(
+            text
+        )
+        selected_cloud_provider = op.data.get("cloud_provider") if op.data else None
+        cloud_provider = _resolve_cloud_provider_for_turn(selected_cloud_provider, text)
         training_goal = op.data.get("training_goal") if op.data else None
         output_policy = op.data.get("output_policy") if op.data else None
         if cloud_provider in {"hf-jobs", "gcp-vertex", "aws-sagemaker"}:
@@ -3289,6 +3402,13 @@ async def process_submission(session: Session, submission) -> bool:
                 )
             )
         if getattr(session, "compute_tools_blocked_for_turn", False):
+            planning_tool_instruction = (
+                "training_planner only. Do not call dataset_discovery for this "
+                "turn; mention that dataset discovery requires a separate user "
+                "request if needed."
+                if getattr(session, "training_planner_only_for_turn", False)
+                else "dataset_discovery/training_planner"
+            )
             session.context_manager.add_message(
                 Message(
                     role="user",
@@ -3296,7 +3416,7 @@ async def process_submission(session: Session, submission) -> bool:
                         "[SYSTEM: This turn is planning/discovery only. Do not "
                         "call sandbox_create, bash, read, write, edit, hf_jobs, "
                         "gcp_vertex_jobs, or aws_sagemaker_jobs. Use "
-                        "dataset_discovery/training_planner and explain what "
+                        f"{planning_tool_instruction} and explain what "
                         "approval would be required before any launch.]"
                     ),
                 )

@@ -62,6 +62,7 @@ test('manual preflight request uses planner context and safe defaults', () => {
         selected_provider: { provider_id: 'hf-jobs' },
         selected_model: { model_id: 'Qwen/Qwen2.5-0.5B-Instruct' },
         selected_hardware: { hardware_id: 'hf-jobs:t4-small' },
+        output_policy: 'cloud-and-hf-hub',
       },
       datasetSummary: { rows: 10 },
     },
@@ -73,6 +74,7 @@ test('manual preflight request uses planner context and safe defaults', () => {
     selected_provider: { provider_id: 'hf-jobs' },
     selected_model: { model_id: 'Qwen/Qwen2.5-0.5B-Instruct' },
     selected_hardware: { hardware_id: 'hf-jobs:t4-small' },
+    output_policy: 'cloud-and-hf-hub',
   });
   assert.deepEqual(request.dataset_summary, { rows: 10 });
   assert.equal(request.include_fallbacks, true);
@@ -103,6 +105,44 @@ test('manual preflight request falls back to session-only when recommendation mi
     force_refresh: false,
     timeout_seconds: 15,
   });
+});
+
+test('manual preflight request sends full planner recommendation when available', () => {
+  const request = buildManualPreflightRequest({
+    sessionId: 's1',
+    plannerOutput: {
+      provider: 'gcp-vertex',
+      recommended_model: 'Qwen/Qwen2.5-0.5B-Instruct',
+      hardware_id: 'gcp-vertex:n1-standard-8-t4',
+      output_policy: 'cloud-private',
+      recommendation: {
+        selected_provider: { provider_id: 'gcp-vertex' },
+        selected_model: { model_id: 'Qwen/Qwen2.5-0.5B-Instruct' },
+        selected_hardware: { hardware_id: 'gcp-vertex:n1-standard-8-t4' },
+        output_policy: 'cloud-private',
+      },
+    },
+  });
+
+  assert.equal(request.recommendation?.provider, 'gcp-vertex');
+  assert.equal(request.recommendation?.recommended_model, 'Qwen/Qwen2.5-0.5B-Instruct');
+  assert.equal(request.recommendation?.hardware_id, 'gcp-vertex:n1-standard-8-t4');
+  assert.equal(request.recommendation?.output_policy, 'cloud-private');
+});
+
+test('manual preflight request omits incomplete unknown recommendation', () => {
+  const request = buildManualPreflightRequest({
+    sessionId: 's1',
+    plannerOutput: {
+      recommendation: {
+        selected_provider: { provider_id: 'unknown' },
+        selected_model: { model_id: 'unknown' },
+        selected_hardware: { hardware_id: null },
+      },
+    },
+  });
+
+  assert.equal('recommendation' in request, false);
 });
 
 test('manual preflight not-run copy is safety-focused', () => {
@@ -299,6 +339,14 @@ test('tool group exposes a manual preflight button without auto-run', () => {
   assert.match(toolCallGroupSource, /handleRunPreflight/);
   assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}runTrainingPreflight/);
   assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}force_refresh:\s*true/);
+});
+
+test('manual preflight panel writes use the idempotent panel guard', () => {
+  assert.match(toolCallGroupSource, /setPanelIfChanged/);
+  assert.doesNotMatch(
+    toolCallGroupSource,
+    /setPanel\(\{\s*title:\s*'Training Preflight'/,
+  );
 });
 
 test('manual action copy avoids provider job launch wording', () => {
