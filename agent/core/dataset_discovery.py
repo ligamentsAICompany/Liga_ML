@@ -18,6 +18,12 @@ from agent.core.redact import redact_json_like, redact_text
 DEFAULT_ALLOWED_SOURCES = ["huggingface", "github", "papers", "public_web"]
 DEFAULT_EXCLUDED_SOURCES = ["kaggle"]
 DIRECTLY_LOADABLE_SOURCES = {"huggingface", "session_upload"}
+_HF_DATASET_URL_RE = re.compile(
+    r"huggingface\.co/datasets/([A-Za-z0-9][\w.-]+/[A-Za-z0-9][\w.-]+)"
+)
+_HF_REPO_ID_RE = re.compile(
+    r"(?<![\w./-])([A-Za-z0-9][\w.-]+/[A-Za-z0-9][\w.-]+)(?![\w./-])"
+)
 
 SOURCE_LABELS = {
     "huggingface": "Hugging Face Datasets",
@@ -219,6 +225,7 @@ class DatasetDiscoveryResult:
     candidates: list[DatasetCandidate]
     warnings: list[str] = field(default_factory=list)
     selected_candidate: dict[str, Any] | None = None
+    no_candidates_reason: str | None = None
     timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     requires_user_selection: bool = True
 
@@ -748,7 +755,12 @@ def build_dataset_discovery_result(
     ]
     ranked = rank_candidates(normalized)
     warnings = ["User selection required before training."]
+    no_candidates_reason = None
     if not ranked:
+        no_candidates_reason = (
+            "No candidate datasets supplied yet. Search allowed public sources, "
+            "then inspect schema, license, privacy, and quality before training."
+        )
         warnings.append("No candidate datasets supplied yet.")
     if any(candidate.excluded for candidate in ranked):
         warnings.append("Kaggle is excluded as future work only.")
@@ -762,6 +774,7 @@ def build_dataset_discovery_result(
         selected_candidate=redact_json_like(selected_candidate)
         if selected_candidate
         else None,
+        no_candidates_reason=no_candidates_reason,
     )
 
 
@@ -785,6 +798,37 @@ def build_dataset_discovery_plan(
         excluded_sources=excluded_sources,
         candidates=candidates,
     )
+
+
+def extract_hf_dataset_candidates_from_text(text: str) -> list[dict[str, Any]]:
+    """Extract safe Hugging Face dataset identifiers from research summaries."""
+    raw_text = redact_text(text or "")
+    matches: list[tuple[int, str]] = []
+    for pattern in (_HF_DATASET_URL_RE, _HF_REPO_ID_RE):
+        matches.extend(
+            (match.start(), match.group(1).strip().rstrip(".,);]"))
+            for match in pattern.finditer(raw_text)
+        )
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for _position, dataset_id in sorted(matches, key=lambda item: item[0]):
+        if dataset_id in seen:
+            continue
+        seen.add(dataset_id)
+        candidates.append(
+            {
+                "dataset_id": dataset_id,
+                "repo_id": dataset_id,
+                "source": "huggingface",
+                "title": dataset_id.split("/", 1)[1]
+                .replace("-", " ")
+                .replace("_", " "),
+                "reason": (
+                    "Extracted from research output for dataset discovery persistence."
+                ),
+            }
+        )
+    return candidates
 
 
 def _candidate_lines(
@@ -852,7 +896,7 @@ def format_dataset_discovery_plan(plan: DatasetDiscoveryPlan) -> str:
     ]
     if not plan.candidates:
         lines.append(
-            "- No candidates supplied yet. Search allowed public sources, then inspect schema, license, privacy, and quality before training."
+            f"- {plan.no_candidates_reason or 'No candidates supplied yet. Search allowed public sources, then inspect schema, license, privacy, and quality before training.'}"
         )
     else:
         recommended_id = recommended.dataset_id if recommended else None

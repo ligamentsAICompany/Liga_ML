@@ -7,7 +7,10 @@ from typing import Any
 
 import pytest
 
-from agent.core.preflight_gcp_vertex import run_gcp_vertex_preflight_checks
+from agent.core.preflight_gcp_vertex import (
+    _probe_vertex_custom_jobs,
+    run_gcp_vertex_preflight_checks,
+)
 from agent.core.training_preflight import PreflightStatus, run_training_preflight
 
 
@@ -137,6 +140,18 @@ class FakeGcpClient:
         raise AssertionError("create_bucket must not be called")
 
 
+class FakeListCustomJobsClientWithoutPageSize:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def list_custom_jobs(self, *, parent: str):
+        self.calls.append({"parent": parent})
+        return iter([])
+
+    def create_custom_job(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("create_custom_job must not be called")
+
+
 def _recommendation(
     *,
     provider: str = "gcp-vertex",
@@ -159,6 +174,18 @@ def _recommendation(
 
 def _checks_by_id(result) -> dict[str, Any]:
     return {check.check_id: check for check in result.primary.checks}
+
+
+def test_vertex_custom_jobs_probe_retries_without_page_size_for_older_sdk():
+    client = FakeListCustomJobsClientWithoutPageSize()
+
+    result = _probe_vertex_custom_jobs(
+        client,
+        parent="projects/proj-1/locations/us-central1",
+    )
+
+    assert result is True
+    assert client.calls == [{"parent": "projects/proj-1/locations/us-central1"}]
 
 
 @pytest.mark.asyncio
@@ -286,6 +313,27 @@ async def test_vertex_api_disabled_blocks_launch():
 
     checks = {check.check_id: check for check in result.checks}
     assert checks["gcp.vertex.api"].status == PreflightStatus.FAILED
+    assert result.launch_ready is False
+
+
+@pytest.mark.asyncio
+async def test_vertex_api_auth_or_permission_error_still_blocks_launch():
+    result = await run_gcp_vertex_preflight_checks(
+        provider="gcp-vertex",
+        model_id="Qwen/Qwen2.5-0.5B-Instruct",
+        hardware_id="gcp-vertex:n1-standard-8-t4",
+        output_policy="cloud-private",
+        project_id="proj-1",
+        region="us-central1",
+        target_bucket="gs://bucket",
+        gcp_client_factory=lambda: FakeGcpClient(
+            vertex_api=RuntimeError("403 permission denied")
+        ),
+    )
+
+    checks = {check.check_id: check for check in result.checks}
+    assert checks["gcp.vertex.api"].status == PreflightStatus.FAILED
+    assert checks["gcp.vertex.api"].error_code == "permission_denied"
     assert result.launch_ready is False
 
 

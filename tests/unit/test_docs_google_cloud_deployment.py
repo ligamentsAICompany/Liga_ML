@@ -3,10 +3,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 DOC_PATH = ROOT / "docs" / "google-cloud-deployment.md"
+CLOUDBUILD_PATH = ROOT / "cloudbuild.yaml"
 
 
 def _doc_text() -> str:
     return DOC_PATH.read_text(encoding="utf-8")
+
+
+def _cloudbuild_text() -> str:
+    return CLOUDBUILD_PATH.read_text(encoding="utf-8")
 
 
 def test_google_cloud_deployment_doc_covers_required_apis_roles_and_secrets() -> None:
@@ -53,6 +58,20 @@ def test_google_cloud_deployment_doc_covers_deploy_verify_and_smoke_test() -> No
         "Hugging Face Hub",
     ]:
         assert phrase in text
+
+
+def test_google_cloud_deployment_uses_existing_gcs_bucket_consistently() -> None:
+    doc_text = _doc_text()
+    cloudbuild_text = _cloudbuild_text()
+
+    assert "_GCS_BUCKET: liga-ml" in cloudbuild_text
+    assert "_GCS_BUCKET=liga-ml" in doc_text
+    assert '"bucket": "liga-ml"' in doc_text
+    assert "GCS_BUCKET=${_GCS_BUCKET}" in cloudbuild_text
+    assert (
+        "VERTEX_AI_STAGING_BUCKET=gs://${_GCS_BUCKET}/vertex-staging" in cloudbuild_text
+    )
+    assert "VERTEX_AI_OUTPUT_DIR=gs://${_GCS_BUCKET}/vertex-outputs" in cloudbuild_text
 
 
 def test_google_cloud_deployment_doc_covers_troubleshooting() -> None:

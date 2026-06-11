@@ -33,6 +33,29 @@ async def test_dataset_discovery_plan_returns_no_upload_guidance():
 
 
 @pytest.mark.asyncio
+async def test_dataset_discovery_plan_persists_explicit_no_candidate_reason():
+    class FakeSession:
+        latest_dataset_discovery = None
+
+    session = FakeSession()
+
+    output, ok = await dataset_discovery_handler(
+        {
+            "operation": "plan",
+            "query": "Find GST tax support datasets",
+            "provider": "gcp-vertex",
+        },
+        session=session,
+        tool_call_id="tool-1",
+    )
+
+    assert ok is True
+    assert "No candidate datasets supplied yet" in output
+    assert session.latest_dataset_discovery["candidates"] == []
+    assert session.latest_dataset_discovery["no_candidates_reason"]
+
+
+@pytest.mark.asyncio
 async def test_dataset_discovery_plan_includes_intent_scores_and_load_dataset_snippet():
     output, ok = await dataset_discovery_handler(
         {
@@ -64,6 +87,53 @@ async def test_dataset_discovery_plan_includes_intent_scores_and_load_dataset_sn
     assert "Schema: compatible" in output
     assert "from datasets import load_dataset" in output
     assert "User selection required before training" in output
+
+
+@pytest.mark.asyncio
+async def test_dataset_discovery_plan_persists_gst_candidate_results():
+    class FakeSession:
+        latest_dataset_discovery = None
+
+    session = FakeSession()
+
+    _output, ok = await dataset_discovery_handler(
+        {
+            "operation": "plan",
+            "query": "Find GST tax support data for Vertex fine-tuning",
+            "provider": "gcp-vertex",
+            "candidates": [
+                {
+                    "dataset_id": "transitionGap/gst-india-preference-dataset-prep-small",
+                    "source": "huggingface",
+                    "repo_id": "transitionGap/gst-india-preference-dataset-prep-small",
+                    "title": "GST India Preference Dataset Prep Small",
+                    "license": "unknown",
+                    "columns": ["prompt", "chosen", "rejected"],
+                    "row_count": 1000,
+                },
+                {
+                    "dataset_id": "Kahrhoff/openfinancial-chatbot-dataset",
+                    "source": "huggingface",
+                    "repo_id": "Kahrhoff/openfinancial-chatbot-dataset",
+                    "title": "Open Financial Chatbot Dataset",
+                    "license": "unknown",
+                    "columns": ["question", "answer"],
+                    "row_count": 1000,
+                },
+            ],
+        },
+        session=session,
+        tool_call_id="tool-2",
+    )
+
+    assert ok is True
+    assert [
+        candidate["dataset_id"]
+        for candidate in session.latest_dataset_discovery["candidates"]
+    ] == [
+        "transitionGap/gst-india-preference-dataset-prep-small",
+        "Kahrhoff/openfinancial-chatbot-dataset",
+    ]
 
 
 @pytest.mark.asyncio

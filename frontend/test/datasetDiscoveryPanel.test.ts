@@ -149,10 +149,13 @@ test('dataset discovery panel redacts secrets from structured payloads', () => {
 });
 
 test('dataset discovery panel renders user-selection requirement and empty candidates', () => {
-  const panel = createDatasetDiscoveryPanel({ candidates: [] });
+  const panel = createDatasetDiscoveryPanel({
+    candidates: [],
+    no_candidates_reason: 'No safe public GST datasets were found.',
+  });
 
   assert.match(panel.markdown, /No uploaded dataset is attached/);
-  assert.match(panel.markdown, /No candidate datasets supplied yet/);
+  assert.match(panel.markdown, /No safe public GST datasets were found/);
   assert.match(panel.markdown, /User selection required before training/);
 });
 

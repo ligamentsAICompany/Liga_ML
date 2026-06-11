@@ -188,6 +188,7 @@ class DatasetDiscoveryResponse(BaseModel):
     recommended_candidate: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
     selected_candidate: dict[str, Any] | None = None
+    no_candidates_reason: str | None = None
     timestamp: str | None = None
     requires_user_selection: bool = True
 

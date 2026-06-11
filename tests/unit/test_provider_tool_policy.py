@@ -339,3 +339,16 @@ def test_planning_only_completion_summarizes_dataset_discovery():
     assert "kaggle" in message
     assert "No datasets were uploaded or downloaded" in message
     assert "no sandbox was created" in message
+
+
+def test_planning_only_completion_waits_for_training_recommendation():
+    session = _session(provider="gcp-vertex")
+    session.compute_tools_blocked_for_turn = True
+    session.latest_dataset_discovery = {
+        "candidates": [],
+        "warnings": ["No candidate datasets supplied yet."],
+        "excluded_sources": ["kaggle"],
+    }
+    session.latest_training_recommendation = None
+
+    assert agent_loop._planning_only_completion_message(session) is None

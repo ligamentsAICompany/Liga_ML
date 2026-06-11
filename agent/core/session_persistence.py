@@ -27,6 +27,10 @@ from agent.core.audit import (
     summarize_audit_events,
     training_preflight_audit_events,
 )
+from agent.core.dataset_discovery import (
+    build_dataset_discovery_result,
+    extract_hf_dataset_candidates_from_text,
+)
 from agent.core.post_training_evaluation import (
     build_post_training_evaluation,
     evaluation_context_from_liga_output,
@@ -237,11 +241,25 @@ def _safe_message_doc(message: dict[str, Any]) -> dict[str, Any]:
 def _dataset_discovery_from_event(
     event_type: str, payload: dict[str, Any]
 ) -> dict[str, Any] | None:
-    if event_type != "tool_output" or payload.get("tool") != "dataset_discovery":
+    if event_type != "tool_output":
+        return None
+    tool = payload.get("tool")
+    if tool not in {"dataset_discovery", "research"}:
         return None
     structured = payload.get("structured")
     if isinstance(structured, dict):
+        if tool == "research" and structured.get("kind") != "dataset_discovery":
+            return None
         return sanitize_for_persistence(structured)
+    if tool == "research" and payload.get("success") is not False:
+        text = str(payload.get("output") or payload.get("formatted") or "")
+        candidates = extract_hf_dataset_candidates_from_text(text)
+        if candidates:
+            result = build_dataset_discovery_result(
+                query="Research-derived dataset candidates",
+                candidates=candidates,
+            )
+            return sanitize_for_persistence(result.to_dict())
     return None
 
 

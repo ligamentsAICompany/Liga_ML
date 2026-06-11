@@ -3,6 +3,7 @@ from agent.core.dataset_discovery import (
     build_dataset_discovery_result,
     build_dataset_discovery_plan,
     extract_dataset_intent,
+    extract_hf_dataset_candidates_from_text,
     format_dataset_discovery_plan,
     rank_candidates,
 )
@@ -195,3 +196,27 @@ def test_discovery_result_redacts_secret_like_candidate_text():
     assert "hf_secret" not in str(payload)
     assert "sk-test-secret" not in str(payload)
     assert "[REDACTED]" in str(payload)
+
+
+def test_no_candidate_result_includes_explicit_reason():
+    result = build_dataset_discovery_result(query="Find GST tax support data")
+    payload = result.to_dict()
+
+    assert payload["candidates"] == []
+    assert payload["no_candidates_reason"]
+    assert "No candidate datasets supplied yet" in payload["no_candidates_reason"]
+
+
+def test_extracts_hf_dataset_candidates_from_research_text_for_persistence():
+    candidates = extract_hf_dataset_candidates_from_text(
+        """
+        Recommended datasets:
+        1. transitionGap/gst-india-preference-dataset-prep-small is GST-specific.
+        2. https://huggingface.co/datasets/Kahrhoff/openfinancial-chatbot-dataset
+        """
+    )
+
+    assert [candidate["dataset_id"] for candidate in candidates] == [
+        "transitionGap/gst-india-preference-dataset-prep-small",
+        "Kahrhoff/openfinancial-chatbot-dataset",
+    ]
