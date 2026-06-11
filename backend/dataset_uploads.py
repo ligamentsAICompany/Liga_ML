@@ -4,6 +4,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import os
 import re
 import uuid
@@ -536,12 +537,19 @@ def _markdown_section_rows(text: str, filename: str) -> list[dict[str, Any]]:
 
 
 def _normalize_pdf(contents: bytes, filename: str) -> list[dict[str, Any]]:
+    pypdf_loggers = [logging.getLogger("pypdf"), logging.getLogger("pypdf._reader")]
+    previous_levels = [logger.level for logger in pypdf_loggers]
     try:
+        for logger in pypdf_loggers:
+            logger.setLevel(logging.ERROR)
         reader = PdfReader(io.BytesIO(contents))
     except Exception:
         _bad_dataset(
             "PDF dataset has no extractable text. Scanned PDFs are not supported."
         )
+    finally:
+        for logger, level in zip(pypdf_loggers, previous_levels, strict=True):
+            logger.setLevel(level)
     rows: list[dict[str, Any]] = []
     for page_index, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
