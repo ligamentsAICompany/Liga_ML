@@ -585,6 +585,64 @@ async def test_create_session_schedules_cpu_sandbox_preload():
 
 
 @pytest.mark.asyncio
+async def test_run_event_persists_dataset_discovery_candidates_from_research():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s1", provider="gcp-vertex")
+
+    await store.append_run_event(
+        run_id=run["run_id"],
+        session_id="s1",
+        event_type="tool_output",
+        payload={
+            "tool": "research",
+            "success": True,
+            "structured": {
+                "kind": "dataset_discovery",
+                "query": "GST tax support fine-tuning",
+                "candidates": [
+                    {
+                        "dataset_id": "transitionGap/gst-india-preference-dataset-prep-small",
+                        "source": "huggingface",
+                        "title": "GST India Preference Dataset Prep Small",
+                    }
+                ],
+            },
+        },
+    )
+
+    persisted = await store.get_run(run["run_id"])
+
+    discovery = persisted["dataset_discovery"]
+    assert discovery["candidates"][0]["dataset_id"] == (
+        "transitionGap/gst-india-preference-dataset-prep-small"
+    )
+    assert persisted["provider_metadata"]["dataset_discovery"] == discovery
+
+
+@pytest.mark.asyncio
+async def test_latest_dataset_discovery_prefers_active_session_candidates():
+    manager = _manager_with_store(NoopSessionStore())
+    existing = _runtime_agent_session("s1", user_id="owner")
+    existing.session.latest_dataset_discovery = {
+        "query": "GST tax support fine-tuning",
+        "candidates": [
+            {
+                "dataset_id": "Kahrhoff/openfinancial-chatbot-dataset",
+                "source": "huggingface",
+                "title": "Open Financial Chatbot Dataset",
+            }
+        ],
+    }
+    manager.sessions["s1"] = existing
+
+    discovery = await manager.get_latest_dataset_discovery("s1")
+
+    assert discovery["candidates"][0]["dataset_id"] == (
+        "Kahrhoff/openfinancial-chatbot-dataset"
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_session_cleans_stale_idle_sessions_before_user_cap(monkeypatch):
     monkeypatch.setattr(session_manager_module, "MAX_SESSIONS_PER_USER", 2)
     manager = _manager_with_store(NoopSessionStore())

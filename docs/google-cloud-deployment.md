@@ -55,7 +55,7 @@ Create one regional training bucket for Vertex staging and outputs:
 ```bash
 export PROJECT_ID=your-project-id
 export REGION=us-central1
-export GCS_BUCKET=liga-ml-training
+export GCS_BUCKET=liga-ml
 
 gsutil mb -p "$PROJECT_ID" -l "$REGION" "gs://$GCS_BUCKET"
 ```
@@ -107,7 +107,7 @@ From the repository root:
 
 ```bash
 gcloud builds submit \
-  --substitutions=_REGION=us-central1,_SERVICE_NAME=liga-ml-intern,_ARTIFACT_REPO=liga-ml-containers,_IMAGE_NAME=liga-ml-intern,_GCS_BUCKET=liga-ml-training,_VERTEX_AI_SERVICE_ACCOUNT=vertex-runner@PROJECT_ID.iam.gserviceaccount.com,_AWS_REGION=us-east-1,_AWS_S3_BUCKET=your-s3-bucket,_AWS_SAGEMAKER_ROLE_ARN=arn:aws:iam::123456789012:role/LigaMLSageMakerExecutionRole,_AWS_SAGEMAKER_TRAINING_IMAGE_URI=123456789012.dkr.ecr.us-east-1.amazonaws.com/your-training-image:latest,_MONGODB_URI_SECRET=mongodb-uri
+  --substitutions=_REGION=us-central1,_SERVICE_NAME=liga-ml-intern,_ARTIFACT_REPO=liga-ml-containers,_IMAGE_NAME=liga-ml-intern,_GCS_BUCKET=liga-ml,_VERTEX_AI_SERVICE_ACCOUNT=vertex-runner@PROJECT_ID.iam.gserviceaccount.com,_AWS_REGION=us-east-1,_AWS_S3_BUCKET=your-s3-bucket,_AWS_SAGEMAKER_ROLE_ARN=arn:aws:iam::123456789012:role/LigaMLSageMakerExecutionRole,_AWS_SAGEMAKER_TRAINING_IMAGE_URI=123456789012.dkr.ecr.us-east-1.amazonaws.com/your-training-image:latest,_MONGODB_URI_SECRET=mongodb-uri
 ```
 
 Leave `_VERTEX_AI_SERVICE_ACCOUNT` empty to use the Cloud Run service account for Vertex job submission. Pass `_MONGODB_URI_SECRET=mongodb-uri` only after creating that Secret Manager secret; if omitted, the service deploys with a non-durable session-store and background-run health warning. The build creates the Artifact Registry repository if needed, builds the Docker image, pushes `$COMMIT_SHA` and `latest` tags, then deploys Cloud Run with 4 GiB memory, 2 CPU, 3600 second timeout, concurrency 5, min instances 1, port 8080, production environment variables including `BACKGROUND_RUNS_ENABLED=true` and `RUN_WORKER_MODE=in_process`, and Secret Manager-backed `HF_TOKEN`, `HUGGINGFACE_HUB_TOKEN`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`. Temporary AWS sessions may also set `_AWS_SESSION_TOKEN_SECRET`; durable sessions may set `_MONGODB_URI_SECRET`; future encrypted token handoff may set `_SESSION_TOKEN_ENCRYPTION_KEY_SECRET`.
@@ -158,7 +158,7 @@ Expected `/api/health/providers` behavior:
     "configured": true,
     "missing_env": [],
     "region": "us-central1",
-    "bucket": "liga-ml-training",
+    "bucket": "liga-ml",
     "credentials_detected": true
   },
   "aws_sagemaker": {

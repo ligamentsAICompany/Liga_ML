@@ -11,7 +11,7 @@ substitutions:
   _AWS_SECRET_ACCESS_KEY_SECRET: aws-secret-access-key
   _AWS_SESSION_TOKEN_SECRET: ""
   _ML_INTERN_DEFAULT_MODEL_ID: moonshotai/Kimi-K2.6
-  _GCS_BUCKET: liga-ml-training
+  _GCS_BUCKET: liga-ml
   _VERTEX_AI_SERVICE_ACCOUNT: ""
   _AWS_REGION: ""
   _AWS_S3_BUCKET: ""

@@ -300,6 +300,7 @@ def test_event_from_run_event_maps_dataset_discovery_lifecycle():
         "dataset_candidate_excluded",
     ]
     assert events[0]["category"] == "dataset"
+    assert events[0]["safe_metadata"]["candidate_count"] == 2
     assert events[1]["dataset_name"] == "Hardware Support QA"
     assert events[2]["severity"] == "warning"
 

@@ -15,6 +15,10 @@ from typing import Any
 from litellm import Message, acompletion
 
 from agent.core import telemetry
+from agent.core.dataset_discovery import (
+    build_dataset_discovery_result,
+    extract_hf_dataset_candidates_from_text,
+)
 from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.prompt_caching import with_prompt_caching
@@ -28,6 +32,34 @@ logger = logging.getLogger(__name__)
 _RESEARCH_CONTEXT_WARN = 170_000  # 85% of 200k
 _RESEARCH_CONTEXT_MAX = 190_000
 _RESEARCH_WALL_CLOCK_MAX_SECONDS = 12 * 60
+
+
+def _persist_research_dataset_discovery(
+    *,
+    session: Any,
+    tool_call_id: str | None,
+    task: str,
+    context: str,
+    content: str,
+) -> None:
+    intent_text = f"{task}\n{context}".lower()
+    if not any(term in intent_text for term in ("dataset", "fine-tun", "training")):
+        return
+    candidates = extract_hf_dataset_candidates_from_text(content)
+    if not candidates:
+        return
+    discovery = build_dataset_discovery_result(
+        query="Research-derived dataset candidates",
+        candidates=candidates,
+    ).to_dict()
+    setattr(session, "latest_dataset_discovery", discovery)
+    outputs = getattr(session, "_structured_tool_outputs", None)
+    if not isinstance(outputs, dict):
+        outputs = {}
+        setattr(session, "_structured_tool_outputs", outputs)
+    if tool_call_id:
+        outputs[tool_call_id] = {"kind": "dataset_discovery", **discovery}
+
 
 # Tools the research agent can use (read-only subset)
 RESEARCH_TOOL_NAMES = {
@@ -442,6 +474,13 @@ async def research_handler(
         if not msg.tool_calls:
             await _log("Research complete.")
             content = msg.content or "Research completed but no summary generated."
+            _persist_research_dataset_discovery(
+                session=session,
+                tool_call_id=tool_call_id,
+                task=task,
+                context=context,
+                content=content,
+            )
             return content, True
 
         # Execute tool calls and add results.
@@ -544,6 +583,13 @@ async def research_handler(
             logger.debug("research telemetry failed: %s", _telem_err)
         content = response.choices[0].message.content or ""
         if content:
+            _persist_research_dataset_discovery(
+                session=session,
+                tool_call_id=tool_call_id,
+                task=task,
+                context=context,
+                content=content,
+            )
             return content, True
     except Exception as e:
         logger.error("Research summary call failed: %s", e)

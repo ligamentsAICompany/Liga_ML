@@ -12,7 +12,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
-from models import TrainingPreflightRequest  # noqa: E402
+from models import DatasetDiscoveryResponse, TrainingPreflightRequest  # noqa: E402
 from routes import agent  # noqa: E402
 
 
@@ -44,6 +44,17 @@ def _vertex_recommendation() -> dict:
             "output_policy": "cloud-private",
         },
     }
+
+
+def test_dataset_discovery_response_preserves_no_candidate_reason():
+    response = DatasetDiscoveryResponse(
+        candidates=[],
+        no_candidates_reason="No safe public GST datasets were found.",
+    )
+
+    assert response.model_dump()["no_candidates_reason"] == (
+        "No safe public GST datasets were found."
+    )
 
 
 @pytest.fixture()

@@ -1619,12 +1619,14 @@ def _planning_only_completion_message(session: Session) -> str | None:
     warnings = warnings if isinstance(warnings, list) else []
     recommended = discovery.get("recommended_candidate")
     recommendation = getattr(session, "latest_training_recommendation", None)
-    risks = (
-        recommendation.get("risks")
-        if isinstance(recommendation, dict)
-        else ["Training still requires dataset selection and explicit launch approval."]
-    )
+    if not isinstance(recommendation, dict) or not recommendation:
+        return None
+    risks = recommendation.get("risks")
     risks = risks if isinstance(risks, list) and risks else []
+    no_candidates_reason = discovery.get("no_candidates_reason")
+    no_candidates_reason = (
+        no_candidates_reason if isinstance(no_candidates_reason, str) else None
+    )
 
     lines = [
         "Planning/discovery complete. No datasets were uploaded or downloaded, "
@@ -1641,8 +1643,7 @@ def _planning_only_completion_message(session: Session) -> str | None:
         )
     else:
         lines.append(
-            "- No candidate datasets were available from the current no-upload "
-            "discovery inputs."
+            f"- {no_candidates_reason or 'No candidate datasets were available from the current no-upload discovery inputs.'}"
         )
 
     if isinstance(recommended, dict):

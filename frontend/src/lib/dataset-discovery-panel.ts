@@ -303,7 +303,10 @@ export function createDatasetDiscoveryPanel(input: unknown): DatasetDiscoveryPan
       const prefix = `${recommended ? 'Recommended · ' : ''}${selected ? 'Selected · ' : ''}`;
       return `${prefix}${candidateSummary(candidate)}`;
     })
-    : ['No candidate datasets supplied yet. Search allowed public sources, then inspect schema, license, privacy, and quality before training.'];
+    : [
+      getString(record, ['no_candidates_reason', 'noCandidatesReason'])
+        || 'No candidate datasets supplied yet. Search allowed public sources, then inspect schema, license, privacy, and quality before training.',
+    ];
   const riskLines = candidates.flatMap((candidate) => [...candidate.risks, ...candidate.warnings]);
   const extractedIntentLines = intentLines(record);
   const summaryLines = [

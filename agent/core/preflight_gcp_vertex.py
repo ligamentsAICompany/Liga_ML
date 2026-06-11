@@ -44,6 +44,21 @@ class GcpReadOnlyClient(Protocol):
 GcpClientFactory = Callable[[], GcpReadOnlyClient]
 
 
+def _probe_vertex_custom_jobs(client: Any, *, parent: str) -> bool | None:
+    """Verify Vertex metadata access without requiring newer paging kwargs."""
+    try:
+        iterator = client.list_custom_jobs(parent=parent, page_size=1)
+    except TypeError as error:
+        if "page_size" not in str(error):
+            return None
+        try:
+            iterator = client.list_custom_jobs(parent=parent)
+        except TypeError:
+            return None
+    next(iter(iterator), None)
+    return True
+
+
 @dataclass(frozen=True)
 class _GoogleReadOnlyClient:
     def discover_credentials(self) -> tuple[Any, str | None]:
@@ -68,16 +83,10 @@ class _GoogleReadOnlyClient:
             )
             # Read-only, cheap request. An empty iterator still proves the API
             # endpoint and credentials can be used for Vertex metadata access.
-            next(
-                iter(
-                    client.list_custom_jobs(
-                        parent=f"projects/{project_id}/locations/{region}",
-                        page_size=1,
-                    )
-                ),
-                None,
+            return _probe_vertex_custom_jobs(
+                client,
+                parent=f"projects/{project_id}/locations/{region}",
             )
-            return True
         except ImportError:
             return None
 

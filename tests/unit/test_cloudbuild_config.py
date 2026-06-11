@@ -30,7 +30,7 @@ def test_cloudbuild_deploys_cloud_run_on_port_8080_with_required_env() -> None:
     assert substitutions["_SERVICE_NAME"] == "liga-ml-intern"
     assert substitutions["_ARTIFACT_REPO"] == "liga-ml-containers"
     assert substitutions["_IMAGE_NAME"] == "liga-ml-intern"
-    assert substitutions["_GCS_BUCKET"] == "liga-ml-training"
+    assert substitutions["_GCS_BUCKET"] == "liga-ml"
 
     deploy_args = _step_text(_deploy_step(config))
     assert "gcloud run deploy" in deploy_args
