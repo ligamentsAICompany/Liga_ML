@@ -378,6 +378,12 @@ def _provider_tool_policy_violation(
 ) -> str | None:
     """Block compute-provider drift while an active provider job is being monitored."""
 
+    if tool_name == "sandbox_create" and _should_skip_sandbox_preload(session):
+        return (
+            "Sandbox creation is blocked for this turn because the user requested a "
+            "no-sandbox provider workflow."
+        )
+
     if (
         getattr(session, "training_planner_only_for_turn", False)
         and tool_name == "dataset_discovery"
@@ -495,6 +501,90 @@ def _user_explicitly_requests_bounded_provider_launch(text: str) -> bool:
         )
     )
     return bounded_smoke and launch_intent
+
+
+def _user_requested_no_sandbox(text: str) -> bool:
+    normalized = str(text or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "do not use sandbox",
+            "do not create sandbox",
+            "no sandbox",
+            "without sandbox",
+        )
+    )
+
+
+def _should_skip_sandbox_preload(session: Session) -> bool:
+    if getattr(session, "skip_sandbox_preload", False):
+        return True
+    if getattr(session, "bounded_vertex_smoke_for_turn", False):
+        return True
+    if getattr(
+        session, "compute_tools_blocked_for_turn", False
+    ) and _user_requested_no_sandbox(getattr(session, "latest_user_prompt", "") or ""):
+        return True
+    return False
+
+
+def _snapshot_pending_approval(pending: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not pending:
+        return None
+    tool_calls = pending.get("tool_calls") or []
+    approvals = pending.get("approvals") or []
+    serialized_calls = []
+    for tc in tool_calls:
+        if hasattr(tc, "model_dump"):
+            serialized_calls.append(tc.model_dump(mode="json"))
+        elif isinstance(tc, dict):
+            serialized_calls.append(dict(tc))
+    return {
+        "tool_calls": serialized_calls,
+        "approvals": [dict(record) for record in approvals if isinstance(record, dict)],
+    }
+
+
+def _restore_pending_approval_from_snapshot(
+    session: Session,
+) -> dict[str, Any] | None:
+    snapshot = getattr(session, "pending_approval_snapshot", None)
+    if not isinstance(snapshot, dict):
+        return None
+    from litellm import ChatCompletionMessageToolCall as ToolCall
+
+    restored_calls = []
+    for raw in snapshot.get("tool_calls") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            if "function" in raw:
+                restored_calls.append(ToolCall(**raw))
+            else:
+                restored_calls.append(
+                    ToolCall(
+                        id=raw["tool_call_id"],
+                        type="function",
+                        function={
+                            "name": raw["tool"],
+                            "arguments": json.dumps(raw.get("arguments") or {}),
+                        },
+                    )
+                )
+        except Exception as exc:
+            logger.warning("Dropping malformed approval snapshot tool call: %s", exc)
+    if not restored_calls:
+        return None
+    pending = {
+        "tool_calls": restored_calls,
+        "approvals": [
+            dict(record)
+            for record in (snapshot.get("approvals") or [])
+            if isinstance(record, dict)
+        ],
+    }
+    session.pending_approval = pending
+    return pending
 
 
 def _user_requested_no_compute_tools(text: str) -> bool:
@@ -3162,6 +3252,10 @@ class Handlers:
                         "tool_calls": [tc for tc, _, _, _ in approval_required_tools],
                         "approvals": approval_records,
                     }
+                    session.pending_approval_snapshot = _snapshot_pending_approval(
+                        session.pending_approval
+                    )
+                    session.waiting_for_tool_approval = True
 
                     # Return early - wait for EXEC_APPROVAL operation
                     return None
@@ -3207,7 +3301,7 @@ class Handlers:
         if session.is_cancelled:
             await _cleanup_on_cancel(session)
             await session.send_event(Event(event_type="interrupted"))
-        elif not errored:
+        elif not errored and not getattr(session, "waiting_for_tool_approval", False):
             await session.send_event(
                 Event(
                     event_type="turn_complete",
@@ -3221,7 +3315,8 @@ class Handlers:
             )
 
         # Increment turn counter and check for auto-save
-        session.increment_turn()
+        if not getattr(session, "waiting_for_tool_approval", False):
+            session.increment_turn()
         await session.auto_save_if_needed()
 
         return final_response
@@ -3264,7 +3359,26 @@ class Handlers:
     @staticmethod
     async def exec_approval(session: Session, approvals: list[dict]) -> None:
         """Handle batch job execution approval"""
-        if not session.pending_approval:
+        requested_ids = {
+            str(item.get("tool_call_id"))
+            for item in approvals
+            if isinstance(item, dict) and item.get("tool_call_id")
+        }
+        consumed_ids = (
+            getattr(session, "consumed_approval_tool_call_ids", set()) or set()
+        )
+        if requested_ids and requested_ids.issubset(consumed_ids):
+            logger.info(
+                "Ignoring duplicate approval submission for already-consumed tool calls: %s",
+                sorted(requested_ids),
+            )
+            return
+
+        pending = session.pending_approval
+        if not pending:
+            pending = _restore_pending_approval_from_snapshot(session)
+
+        if not pending:
             await session.send_event(
                 Event(
                     event_type="error",
@@ -3273,7 +3387,10 @@ class Handlers:
             )
             return
 
-        tool_calls = session.pending_approval.get("tool_calls", [])
+        session.pending_approval = pending
+        session.waiting_for_tool_approval = False
+
+        tool_calls = pending.get("tool_calls", [])
         if not tool_calls:
             await session.send_event(
                 Event(
@@ -3369,9 +3486,14 @@ class Handlers:
             else:
                 rejected_tasks.append((tc, tool_name, approval_decision))
 
+        for tc, _tool_name, _tool_args, _was_edited in approved_tasks:
+            consumed_ids.add(str(tc.id))
+        session.consumed_approval_tool_call_ids = consumed_ids
+
         # Clear pending approval immediately so a page refresh during
         # execution won't re-show the approval dialog.
         session.pending_approval = None
+        session.pending_approval_snapshot = None
 
         # Notify frontend of approval decisions immediately (before execution)
         for tc, tool_name, tool_args, _was_edited in approved_tasks:
@@ -3574,6 +3696,10 @@ async def process_submission(session: Session, submission) -> bool:
         session.bounded_vertex_smoke_for_turn = (
             _user_explicitly_requests_bounded_provider_launch(text)
         )
+        session.skip_sandbox_preload = (
+            _user_requested_no_sandbox(text) or session.bounded_vertex_smoke_for_turn
+        )
+        session.latest_user_prompt = text
         session.training_planner_only_for_turn = _user_requested_training_planner_only(
             text
         )
@@ -3785,7 +3911,7 @@ async def submission_loop(
     )
     if session_holder is not None:
         session_holder[0] = session
-    if not local_mode:
+    if not local_mode and not _should_skip_sandbox_preload(session):
         start_cpu_sandbox_preload(session)
     logger.info("Agent loop started")
 

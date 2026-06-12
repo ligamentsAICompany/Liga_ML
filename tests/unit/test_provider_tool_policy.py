@@ -370,6 +370,7 @@ OPTION_B_PROMPT = (
 def test_bounded_vertex_smoke_prompt_does_not_block_compute_tools():
     assert agent_loop._user_explicitly_requests_bounded_provider_launch(OPTION_B_PROMPT)
     assert agent_loop._user_requested_no_compute_tools(OPTION_B_PROMPT) is False
+    assert agent_loop._user_requested_no_sandbox(OPTION_B_PROMPT) is True
 
 
 def test_no_compute_prompt_detection_still_blocks_phase6_planning_only():

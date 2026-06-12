@@ -957,7 +957,11 @@ class SessionManager:
     def _start_cpu_sandbox_preload(agent_session: AgentSession) -> None:
         """Kick off a best-effort cpu-basic sandbox for the session."""
         try:
+            from agent.core.agent_loop import _should_skip_sandbox_preload
             from agent.tools.sandbox_tool import start_cpu_sandbox_preload
+
+            if _should_skip_sandbox_preload(agent_session.session):
+                return
 
             start_cpu_sandbox_preload(agent_session.session)
         except Exception as e:
@@ -1690,7 +1694,10 @@ class SessionManager:
                             )
                         finally:
                             agent_session.is_processing = False
-                            await self.persist_session_snapshot(agent_session)
+                            runtime_state = self._runtime_state(agent_session)
+                            await self.persist_session_snapshot(
+                                agent_session, runtime_state=runtime_state
+                            )
                         if not should_continue:
                             break
                     except asyncio.TimeoutError:
@@ -1843,6 +1850,19 @@ class SessionManager:
         operation = Operation(op_type=OpType.USER_INPUT, data=data)
         return await self.submit(session_id, operation)
 
+    async def _restore_pending_approval_if_missing(
+        self, agent_session: AgentSession
+    ) -> None:
+        if agent_session.session.pending_approval:
+            return
+        loaded = await self._store().load_session(agent_session.session_id)
+        if not loaded:
+            return
+        meta = loaded.get("metadata") or {}
+        self._restore_pending_approval(
+            agent_session.session, meta.get("pending_approval") or []
+        )
+
     async def submit_approval(
         self,
         session_id: str,
@@ -1852,6 +1872,8 @@ class SessionManager:
     ) -> bool:
         """Submit tool approvals to a session."""
         agent_session = self.sessions.get(session_id)
+        if agent_session:
+            await self._restore_pending_approval_if_missing(agent_session)
         if agent_session and run_id:
             agent_session.session.current_run_id = run_id
         if agent_session and getattr(agent_session.session, "current_run_id", None):
