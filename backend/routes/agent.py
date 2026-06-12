@@ -1254,6 +1254,15 @@ def _merge_preflight_recommendation(
             fallback_value = normalized_fallback.get(key)
             if _known_recommendation_value(fallback_value):
                 merged[key] = fallback_value
+    for key in ("training_goal", "domain", "task_type"):
+        if not _known_recommendation_value(merged.get(key)):
+            fallback_value = normalized_fallback.get(key)
+            if _known_recommendation_value(fallback_value):
+                merged[key] = fallback_value
+        if not _known_recommendation_value(merged_body.get(key)):
+            fallback_value = fallback_body.get(key)
+            if _known_recommendation_value(fallback_value):
+                merged_body[key] = fallback_value
     if not _known_recommendation_value(merged_body.get("output_policy")):
         fallback_value = fallback_body.get("output_policy")
         if _known_recommendation_value(fallback_value):
@@ -1268,9 +1277,6 @@ async def _resolve_preflight_recommendation(
     agent_session: AgentSession,
 ) -> dict[str, Any] | None:
     request_recommendation = _normalize_preflight_recommendation(request.recommendation)
-    if _has_preflight_recommendation_fields(request_recommendation):
-        return request_recommendation
-
     session_recommendation = getattr(
         getattr(agent_session, "session", None),
         "latest_training_recommendation",
@@ -1281,6 +1287,14 @@ async def _resolve_preflight_recommendation(
         if isinstance(session_recommendation, dict)
         else None
     )
+    if _has_preflight_recommendation_fields(request_recommendation):
+        if session_recommendation:
+            return _merge_preflight_recommendation(
+                request_recommendation,
+                session_recommendation,
+            )
+        return request_recommendation
+
     resolved = _merge_preflight_recommendation(
         request_recommendation,
         session_recommendation,
@@ -1363,6 +1377,10 @@ async def run_training_preflight(
         metadata={
             **request.metadata,
             "agent_session_active": bool(getattr(agent_session, "is_active", False)),
+            "training_goal": getattr(
+                getattr(agent_session, "session", None), "training_goal", None
+            )
+            or request.metadata.get("training_goal"),
         },
         allow_unknown_override=request.allow_unknown_override,
         hf_token=hf_token,

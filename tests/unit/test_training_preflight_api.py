@@ -34,16 +34,42 @@ def _recommendation() -> dict:
 def _vertex_recommendation() -> dict:
     return {
         "provider": "gcp-vertex",
+        "training_goal": "smoke-test",
         "recommended_model": "Qwen/Qwen2.5-0.5B-Instruct",
         "hardware_id": "gcp-vertex:n1-standard-8-t4",
         "output_policy": "cloud-private",
         "recommendation": {
+            "training_goal": "smoke-test",
+            "estimated_cost_usd": 1.1,
             "selected_provider": {"provider_id": "gcp-vertex"},
             "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
             "selected_hardware": {"hardware_id": "gcp-vertex:n1-standard-8-t4"},
             "output_policy": "cloud-private",
         },
     }
+
+
+def test_merge_preflight_recommendation_preserves_session_training_goal():
+    merged = agent._merge_preflight_recommendation(
+        {
+            "provider": "gcp-vertex",
+            "recommended_model": "Qwen/Qwen2.5-0.5B-Instruct",
+            "hardware_id": "gcp-vertex:n1-standard-8-t4",
+            "output_policy": "cloud-private",
+            "recommendation": {
+                "estimated_cost_usd": 1.1,
+                "selected_provider": {"provider_id": "gcp-vertex"},
+                "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+                "selected_hardware": {"hardware_id": "gcp-vertex:n1-standard-8-t4"},
+                "output_policy": "cloud-private",
+            },
+        },
+        _vertex_recommendation(),
+    )
+
+    assert merged is not None
+    assert merged["training_goal"] == "smoke-test"
+    assert merged["recommendation"]["estimated_cost_usd"] == 1.1
 
 
 def test_dataset_discovery_response_preserves_no_candidate_reason():
