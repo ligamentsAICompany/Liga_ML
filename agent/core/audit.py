@@ -59,7 +59,13 @@ PROVIDER_TOOL_NAMES = {
     "aws_sagemaker_jobs": "aws-sagemaker",
 }
 TERMINAL_SUCCESS_STATES = {"succeeded", "completed", "success"}
-TERMINAL_FAILURE_STATES = {"failed", "error", "billing_required"}
+TERMINAL_FAILURE_STATES = {
+    "failed",
+    "error",
+    "billing_required",
+    "blocked",
+    "launch_blocked",
+}
 
 
 def utc_now() -> datetime:
@@ -968,6 +974,15 @@ def _provider_job_events(
         title = f"{provider} job succeeded"
         message = f"{provider} job {job_id or tool_call_id} succeeded."
         severity = "info"
+    elif state in {"blocked", "launch_blocked"}:
+        status = "failed"
+        event_type = "provider_launch_blocked"
+        category = "provider_job"
+        title = f"{provider} launch blocked"
+        message = _safe_text(
+            payload.get("reason") or payload.get("failureReason"), 500
+        ) or (f"{provider} job was not launched before provider submission.")
+        severity = "error"
     elif state in TERMINAL_FAILURE_STATES:
         status = "failed"
         event_type = "provider_job_failed"

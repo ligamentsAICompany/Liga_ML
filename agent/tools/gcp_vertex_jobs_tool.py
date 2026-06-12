@@ -454,6 +454,7 @@ class GcpVertexJobsTool:
             display_name=display_name,
             hf_token=token,
             max_rows=max_rows,
+            column_mapping=dict(args.get("column_mapping") or {}),
             upload_file=lambda local_path, gcs_uri: self._upload_file_to_gcs(
                 local_path, gcs_uri
             ),
@@ -630,6 +631,7 @@ class GcpVertexJobsTool:
                 if output_policy in {"hf-hub", "cloud-and-hf-hub"}:
                     hf_model_target = template_config.hub_model_id
             except Exception as e:
+                await self._emit_prelaunch_blocked(str(e), training_goal=training_goal)
                 return self._error(str(e))
 
         if script and command:
@@ -1060,6 +1062,30 @@ class GcpVertexJobsTool:
             cache = {}
             setattr(self.session, "_gcp_vertex_monitor_cache", cache)
         cache[str(job_name)] = {"monotonic": time.monotonic(), "state": state}
+
+    async def _emit_prelaunch_blocked(
+        self,
+        reason: str,
+        *,
+        training_goal: str | None = None,
+        output_policy: str | None = None,
+    ) -> None:
+        if self.session is None or not self.tool_call_id:
+            return
+        await self.session.send_event(
+            Event(
+                event_type="tool_state_change",
+                data={
+                    "tool_call_id": self.tool_call_id,
+                    "tool": "gcp_vertex_jobs",
+                    "provider": "gcp-vertex",
+                    "state": "blocked",
+                    "reason": redact_text(reason)[:500],
+                    "training_goal": training_goal,
+                    "outputPolicy": output_policy,
+                },
+            )
+        )
 
     @staticmethod
     def _error(message: str) -> ToolResult:
