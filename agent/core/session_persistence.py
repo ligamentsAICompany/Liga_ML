@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from agent.core.background_runs import (
+    RUN_TERMINAL_STATUSES,
     provider_metadata_from_event,
     run_status_from_event,
     safe_event_summary,
@@ -272,6 +273,31 @@ def _training_recommendation_from_event(
     structured = payload.get("structured")
     if isinstance(structured, dict):
         return sanitize_for_persistence(structured)
+    return None
+
+
+async def _resolve_active_run_id(
+    store: Any,
+    *,
+    session_id: str,
+    run_id: str | None,
+) -> str | None:
+    if run_id:
+        return run_id
+    list_runs = getattr(store, "list_runs", None)
+    if not callable(list_runs):
+        return None
+    runs = await list_runs(session_id)
+    if not isinstance(runs, list):
+        return None
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        status = str(run.get("status") or "")
+        if status not in RUN_TERMINAL_STATUSES:
+            return str(run.get("run_id") or run.get("_id") or "") or None
+    if runs and isinstance(runs[0], dict):
+        return str(runs[0].get("run_id") or runs[0].get("_id") or "") or None
     return None
 
 
@@ -1076,6 +1102,7 @@ class MongoSessionStore(NoopSessionStore):
         latest_dataset_discovery: dict[str, Any] | None = None,
         latest_training_recommendation: dict[str, Any] | None = None,
         latest_training_preflight: dict[str, Any] | None = None,
+        current_run_id: str | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -1124,6 +1151,7 @@ class MongoSessionStore(NoopSessionStore):
                     "latest_training_preflight": sanitize_for_persistence(
                         latest_training_preflight or {}
                     ),
+                    "current_run_id": current_run_id,
                 },
             },
             upsert=True,
@@ -1154,6 +1182,7 @@ class MongoSessionStore(NoopSessionStore):
         latest_dataset_discovery: dict[str, Any] | None = None,
         latest_training_recommendation: dict[str, Any] | None = None,
         latest_training_preflight: dict[str, Any] | None = None,
+        current_run_id: str | None = None,
     ) -> None:
         if not self._ready():
             return
@@ -1181,6 +1210,7 @@ class MongoSessionStore(NoopSessionStore):
             latest_dataset_discovery=latest_dataset_discovery,
             latest_training_recommendation=latest_training_recommendation,
             latest_training_preflight=latest_training_preflight,
+            current_run_id=current_run_id,
         )
         ops: list[Any] = []
         for idx, raw in enumerate(messages):
@@ -1277,6 +1307,11 @@ class MongoSessionStore(NoopSessionStore):
         if not self._ready():
             return None
         try:
+            resolved_run_id = await _resolve_active_run_id(
+                self,
+                session_id=session_id,
+                run_id=run_id,
+            )
             seq = await self._next_seq(f"event:{session_id}")
             safe_data = sanitize_for_persistence(data or {})
             await self.db.session_events.insert_one(
@@ -1287,11 +1322,12 @@ class MongoSessionStore(NoopSessionStore):
                     "event_type": event_type,
                     "data": safe_data,
                     "created_at": _now(),
+                    "run_id": resolved_run_id,
                 }
             )
-            if run_id:
+            if resolved_run_id:
                 return await self.append_run_event(
-                    run_id=run_id,
+                    run_id=resolved_run_id,
                     session_id=session_id,
                     event_type=event_type,
                     payload=safe_data,

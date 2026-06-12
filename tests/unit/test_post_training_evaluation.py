@@ -127,13 +127,14 @@ def test_build_evaluation_redacts_report_and_scores_static_result():
     assert "Bearer abc" not in str(evaluation)
 
 
-def test_failed_training_is_skipped():
+def test_failed_training_returns_failed_job_stub():
     evaluation = build_post_training_evaluation(
         _context(training_status="failed", artifact_ref="s3://bucket/model.tar.gz")
     )
 
-    assert evaluation["status"] == "skipped"
-    assert "training did not succeed" in evaluation["failure_summary"].lower()
+    assert evaluation["status"] == "failed"
+    assert "provider job failed" in evaluation["failure_summary"].lower()
+    assert evaluation["metadata"]["live_inference_used"] is False
 
 
 def test_response_row_context_marks_static_evaluation_limitations():
@@ -165,7 +166,7 @@ def test_response_row_context_marks_static_evaluation_limitations():
     assert evaluation["metadata"]["paid_judge_used"] is False
 
 
-def test_failed_vertex_response_row_builds_skipped_static_evaluation():
+def test_failed_vertex_response_row_builds_failed_job_static_evaluation():
     context = evaluation_context_from_response_row(
         {
             "id": "row-vertex-failed",
@@ -188,11 +189,12 @@ def test_failed_vertex_response_row_builds_skipped_static_evaluation():
 
     evaluation = build_post_training_evaluation(context)
 
-    assert evaluation["status"] == "skipped"
+    assert evaluation["status"] == "failed"
     assert evaluation["provider"] == "gcp-vertex"
     assert evaluation["artifact_ref"] == "gs://liga-output/job-failed"
-    assert "training did not succeed" in evaluation["failure_summary"].lower()
+    assert "provider job failed" in evaluation["failure_summary"].lower()
     assert evaluation["metadata"]["source"] == "response_row"
+    assert evaluation["metadata"]["failure_reason"] == "trainer crashed"
     assert evaluation["metadata"]["live_inference_used"] is False
     assert evaluation["metadata"]["paid_judge_used"] is False
 
@@ -372,9 +374,9 @@ async def test_evaluation_list_and_summary_include_vertex_response_rows(
 
     statuses = {evaluation.run_id: evaluation.status for evaluation in listed}
     assert statuses["response_row:row-vertex-completed"] == "succeeded"
-    assert statuses["response_row:row-vertex-failed"] == "skipped"
+    assert statuses["response_row:row-vertex-failed"] == "failed"
     assert summary.total_evaluations == 2
-    assert summary.counts_by_status == {"succeeded": 1, "skipped": 1}
+    assert summary.counts_by_status == {"succeeded": 1, "failed": 1}
     assert all(
         evaluation.metadata["source"] == "response_row"
         for evaluation in summary.evaluations

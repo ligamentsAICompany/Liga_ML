@@ -84,7 +84,11 @@ from agent.core.audit import (
     audit_timeline_enabled,
     build_audit_event,
 )
-from agent.core.background_runs import background_run_status, background_runs_in_process
+from agent.core.background_runs import (
+    RUN_TERMINAL_STATUSES,
+    background_run_status,
+    background_runs_in_process,
+)
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot
 from agent.core.hf_access import get_jobs_access
 from agent.core.hf_tokens import resolve_hf_request_token, resolve_hf_router_token
@@ -972,6 +976,7 @@ async def get_run_evaluation(
     user: dict = Depends(get_current_user),
 ) -> PostTrainingEvaluation:
     await _check_session_access(session_id, user, preload_sandbox=False)
+    await _refresh_response_rows_for_evaluations(user["user_id"])
     evaluation = await session_manager.get_evaluation_for_run(
         session_id, run_id, user_id=user["user_id"]
     )
@@ -1874,6 +1879,86 @@ async def _refresh_stale_hf_rows_from_hub(
         await store.upsert_response_rows(refreshed, user_id=user_id)
         return True
     return False
+
+
+async def _sync_runs_from_terminal_response_rows(
+    rows: list[dict[str, Any]],
+) -> bool:
+    """Align durable run records with terminal provider response rows."""
+
+    progress_to_run_status = {
+        "completed": "succeeded",
+        "succeeded": "succeeded",
+        "success": "succeeded",
+        "failed": "failed",
+        "error": "failed",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+        "interrupted": "interrupted",
+        "blocked": "failed",
+    }
+    updated_any = False
+    store = session_manager.persistence_store
+    if not getattr(store, "enabled", False) or not hasattr(store, "update_run"):
+        return False
+    for row in rows:
+        progress = str(row.get("progress") or "").lower()
+        if progress not in TERMINAL_RESPONSE_PROGRESS:
+            continue
+        session_id = str(row.get("session_id") or "")
+        job_id = str(row.get("job_id") or "")
+        if not session_id:
+            continue
+        target_status = progress_to_run_status.get(progress)
+        if not target_status:
+            continue
+        runs = await store.list_runs(session_id)
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            run_id = str(run.get("run_id") or run.get("_id") or "")
+            if not run_id:
+                continue
+            active_job = str(run.get("active_provider_job_id") or "")
+            if job_id and active_job:
+                if not (
+                    active_job == job_id
+                    or active_job.endswith(job_id)
+                    or job_id.endswith(active_job)
+                ):
+                    continue
+            elif (
+                job_id and not active_job and run.get("status") in RUN_TERMINAL_STATUSES
+            ):
+                continue
+            if str(run.get("status") or "") == target_status and run.get(
+                "completed_at"
+            ):
+                continue
+            provider_metadata = dict(run.get("provider_metadata") or {})
+            provider_metadata.update(
+                {
+                    "provider_status": progress,
+                    "active_provider_job_id": job_id or active_job or None,
+                    "last_checked_at": datetime.now(UTC).isoformat(),
+                    "refreshed_from": "response_row_terminal_sync",
+                }
+            )
+            if row.get("error"):
+                provider_metadata["failure_reason"] = row.get("error")
+            if row.get("final_artifact_or_result"):
+                provider_metadata["artifact_path"] = row.get("final_artifact_or_result")
+            await store.update_run(
+                run_id,
+                status=target_status,
+                completed_at=row.get("completed_at") or datetime.now(UTC).isoformat(),
+                provider_metadata=provider_metadata,
+                error_summary=str(row.get("error") or "")[:500] or None,
+                active_provider_job_id=job_id or active_job or None,
+            )
+            updated_any = True
+            break
+    return updated_any
 
 
 async def _refresh_stale_gcp_rows_from_vertex(
