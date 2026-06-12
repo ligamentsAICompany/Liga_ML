@@ -83,6 +83,44 @@ COMPLIANCE_TERMS = {
     "bank",
     "contract",
 }
+GST_TAX_DOMAIN_TOKENS = {
+    "gst",
+    "tax",
+    "tax-support",
+    "tax support",
+    "india gst",
+    "vat",
+}
+CURATED_METADATA_CANDIDATES: dict[str, list[dict[str, Any]]] = {
+    "gst_tax_support": [
+        {
+            "dataset_id": "transitionGap/gst-india-preference-dataset-prep-small",
+            "repo_id": "transitionGap/gst-india-preference-dataset-prep-small",
+            "source": "huggingface",
+            "title": "GST India Preference Dataset Prep Small",
+            "description": "Metadata-only GST/tax-support candidate for India preference-style SFT.",
+            "license": "unknown",
+            "columns": ["prompt", "chosen", "rejected"],
+            "metadata_only": True,
+            "reasons": [
+                "Curated metadata-only GST India tax-support candidate; verify schema and license on Hub before training."
+            ],
+        },
+        {
+            "dataset_id": "Kahrhoff/openfinancial-chatbot-dataset",
+            "repo_id": "Kahrhoff/openfinancial-chatbot-dataset",
+            "source": "huggingface",
+            "title": "Open Financial Chatbot Dataset",
+            "description": "Metadata-only finance/tax-adjacent Q&A candidate for smoke planning.",
+            "license": "unknown",
+            "columns": ["question", "answer"],
+            "metadata_only": True,
+            "reasons": [
+                "Curated metadata-only finance chatbot candidate; verify GST/tax fit and license before training."
+            ],
+        },
+    ],
+}
 SHORT_SECRET_RE = re.compile(
     r"\b(?:sk-[A-Za-z0-9_-]{6,}|[A-Za-z0-9_-]*secret[A-Za-z0-9_-]*)\b",
     re.I,
@@ -361,6 +399,9 @@ def extract_dataset_intent(
     elif "house price" in text or "real estate" in text or "property" in text:
         domain, task_type, modality = "real_estate", "regression", "tabular"
         columns_needed = ["price", "features", "text"]
+    elif any(token in text for token in GST_TAX_DOMAIN_TOKENS):
+        domain = "gst_tax_support"
+        columns_needed = ["question", "answer", "instruction", "output", "prompt"]
     elif any(token in text for token in COMPLIANCE_TERMS):
         domain, privacy = (
             "finance" if "finance" in text or "credit" in text else "legal",
@@ -596,7 +637,12 @@ def normalize_candidate(
     title = _text(candidate.get("title") or candidate.get("name"), dataset_id)
     description = _text(candidate.get("description")) or None
     columns = _normalize_list(candidate.get("columns") or candidate.get("schema_hint"))
-    row_count = _row_count(candidate.get("row_count") or candidate.get("rows"))
+    metadata_only = candidate.get("metadata_only") is True
+    row_count = (
+        None
+        if metadata_only
+        else _row_count(candidate.get("row_count") or candidate.get("rows"))
+    )
     license_summary = _license_summary(candidate.get("license"))
     schema_summary = _schema_summary(
         columns, str(candidate.get("task_type") or intent.task_type)
@@ -606,6 +652,10 @@ def normalize_candidate(
     excluded = source == "kaggle"
     exclusion_reason = "Kaggle is future work only." if excluded else None
     warnings = _normalize_list(candidate.get("warnings"))
+    if metadata_only:
+        warnings.append(
+            "Metadata-only candidate; row counts and schema must be verified on Hub before training."
+        )
     risks: list[DatasetRisk | str] = [*privacy_risks]
     risks.extend(_normalize_list(candidate.get("risks")))
     if license_summary.status != "clear":
@@ -699,6 +749,47 @@ def normalize_candidate(
     )
 
 
+def curated_metadata_candidates_for_intent(
+    intent: DatasetIntent,
+) -> list[dict[str, Any]]:
+    """Return safe metadata-only curated candidates for known domains."""
+    domain = _normalize_domain(intent.domain)
+    query = str(intent.query or "").lower()
+    if domain == "gst_tax_support" or any(
+        token in query for token in GST_TAX_DOMAIN_TOKENS
+    ):
+        return [dict(item) for item in CURATED_METADATA_CANDIDATES["gst_tax_support"]]
+    return []
+
+
+def merge_candidate_payloads(
+    *sources: list[DatasetCandidate | dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Merge candidate payloads while preserving first-seen order and dataset_id."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in sources:
+        if not source:
+            continue
+        for candidate in source:
+            payload = (
+                candidate.to_dict()
+                if isinstance(candidate, DatasetCandidate)
+                else dict(candidate)
+            )
+            dataset_id = _text(
+                payload.get("dataset_id")
+                or payload.get("repo_id")
+                or payload.get("name"),
+                "",
+            )
+            if not dataset_id or dataset_id in seen:
+                continue
+            seen.add(dataset_id)
+            merged.append(payload)
+    return merged
+
+
 def rank_candidates(candidates: list[DatasetCandidate]) -> list[DatasetCandidate]:
     return sorted(
         candidates,
@@ -749,9 +840,12 @@ def build_dataset_discovery_result(
     excluded = _normalize_sources(excluded_sources, DEFAULT_EXCLUDED_SOURCES)
     if "kaggle" not in excluded:
         excluded.append("kaggle")
+    merged_candidates = merge_candidate_payloads(
+        candidates,
+        curated_metadata_candidates_for_intent(intent),
+    )
     normalized = [
-        normalize_candidate(candidate, intent=intent)
-        for candidate in (candidates or [])
+        normalize_candidate(candidate, intent=intent) for candidate in merged_candidates
     ]
     ranked = rank_candidates(normalized)
     warnings = ["User selection required before training."]

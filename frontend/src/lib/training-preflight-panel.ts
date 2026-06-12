@@ -133,13 +133,23 @@ function metadataBool(metadata: TrainingPreflightResult['metadata'], key: 'provi
 function safetyLines(result: TrainingPreflightResult): string[] {
   const providerJobsLaunched = metadataBool(result.metadata, 'provider_jobs_launched');
   const resourcesCreated = metadataBool(result.metadata, 'resources_created');
-  return [
+  const manualAllowed = result.manual_approval_allowed === true;
+  const lines = [
     'This result is a preflight check, not a training launch.',
     `No provider jobs were launched: ${String(!providerJobsLaunched)}`,
     `No resources were created: ${String(!resourcesCreated)}`,
     'Launch still requires explicit approval.',
     'Unknown does not mean passed.',
   ];
+  if (manualAllowed) {
+    lines.push(
+      'Preflight has unknowns; bounded smoke can proceed only with explicit approval.',
+    );
+    if (result.manual_approval_reason) {
+      lines.push(cleanText(result.manual_approval_reason) ?? result.manual_approval_reason);
+    }
+  }
+  return lines;
 }
 
 function cacheLines(result: TrainingPreflightResult): string[] {
@@ -204,6 +214,9 @@ function normalizeResult(input: unknown): TrainingPreflightResult {
     warning_reasons: [],
     unknown_reasons: [],
     safe_summary: cleanText(record.safe_summary) ?? 'Preflight not run.',
+    manual_approval_allowed: record.manual_approval_allowed === true,
+    manual_approval_reason: cleanText(record.manual_approval_reason),
+    approval_required: record.approval_required === true,
     cache: { hit: false },
     metadata: {
       provider_jobs_launched: false,
@@ -217,6 +230,7 @@ export function createTrainingPreflightPanel(input: unknown): TrainingPreflightP
   const result = normalizeResult(input);
   const status = cleanText(result.status) ?? 'unknown';
   const launchReady = result.launch_ready === true;
+  const manualAllowed = result.manual_approval_allowed === true;
   const primaryChecks = result.primary?.checks ?? [];
   const summary = cleanText(result.safe_summary) ?? statusDescription(status, launchReady);
 
@@ -231,7 +245,15 @@ export function createTrainingPreflightPanel(input: unknown): TrainingPreflightP
   appendSection(lines, 'Launch Readiness', [
     launchReady
       ? 'Launch ready: yes, pending explicit user approval.'
-      : 'Launch ready: no. Local/static checks are not enough to prove provider readiness.',
+      : manualAllowed
+        ? 'Launch ready: no. Only quota/accelerator or safe GCS write-readiness checks are unknown; bounded smoke may proceed with explicit approval.'
+        : 'Launch ready: no. Local/static checks are not enough to prove provider readiness.',
+    manualAllowed
+      ? 'Preflight has unknowns; bounded smoke can proceed only with explicit approval.'
+      : null,
+    manualAllowed && result.manual_approval_reason
+      ? cleanText(result.manual_approval_reason)
+      : null,
     status === 'unknown' ? 'Unknown checks are not treated as passed.' : null,
     status === 'checking' ? 'Preflight is checking; do not treat this as final approval.' : null,
     status === 'not_run' ? 'Preflight not run for this session or run.' : null,

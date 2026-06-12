@@ -1541,6 +1541,25 @@ def _should_emit_hf_planner_fallback(session: Session, text: str | None) -> bool
     return _latest_uploaded_dataset(session) is not None
 
 
+def _latest_training_preflight(session: Session) -> dict[str, Any] | None:
+    preflight = getattr(session, "latest_training_preflight", None)
+    return preflight if isinstance(preflight, dict) else None
+
+
+def _should_emit_vertex_smoke_fallback(session: Session, text: str | None) -> bool:
+    if getattr(session, "cloud_provider", "hf-jobs") != "gcp-vertex":
+        return False
+    if not _has_training_intent(text):
+        return False
+    preflight = _latest_training_preflight(session)
+    if not isinstance(preflight, dict):
+        return False
+    if preflight.get("manual_approval_allowed") is True:
+        return True
+    last_tool = _last_tool_name(session)
+    return last_tool in {"training_planner", "training_preflight"}
+
+
 def _hf_planner_fallback_message(session: Session) -> str:
     upload = _latest_uploaded_dataset(session) or {}
     dataset_parts = []
@@ -1560,6 +1579,34 @@ def _hf_planner_fallback_message(session: Session) -> str:
         f"`{getattr(session, 'output_policy', 'cloud-and-hf-hub')}`. The next "
         "approval-gated step is `hf_jobs`; before any job launches, I will show "
         "the `hf_jobs` approval card and wait for explicit approval."
+    )
+
+
+def _vertex_smoke_fallback_message(session: Session) -> str:
+    preflight = _latest_training_preflight(session) or {}
+    manual_allowed = preflight.get("manual_approval_allowed") is True
+    manual_reason = str(preflight.get("manual_approval_reason") or "").strip()
+    preflight_note = (
+        f"{manual_reason} "
+        if manual_reason
+        else "Live preflight kept quota/accelerator unknown. "
+    )
+    approval_note = (
+        "Preflight has unknowns; bounded smoke can proceed only with explicit approval. "
+        if manual_allowed
+        else "Run live preflight first, then proceed only if bounded smoke approval is allowed. "
+    )
+    return (
+        "I prepared the Google Vertex AI training plan"
+        + (" and live preflight" if preflight else "")
+        + ", but the model stopped before launching the approval-gated Vertex job. "
+        f"{preflight_note}{approval_note}"
+        f"Preflight context: provider `gcp-vertex`, training goal "
+        f"`{getattr(session, 'training_goal', 'agent-decide')}`, output policy "
+        f"`{getattr(session, 'output_policy', 'cloud-and-hf-hub')}`. "
+        "The next approval-gated step is `gcp_vertex_jobs` run; I will show the "
+        "Vertex pricing/provider approval card and wait for explicit approval before "
+        "launching any job."
     )
 
 
@@ -2436,6 +2483,11 @@ class Handlers:
                     if not content:
                         if _should_emit_hf_planner_fallback(session, text):
                             fallback_msg = _hf_planner_fallback_message(session)
+                            await _emit_visible_assistant_message(session, fallback_msg)
+                            final_response = fallback_msg
+                            break
+                        if _should_emit_vertex_smoke_fallback(session, text):
+                            fallback_msg = _vertex_smoke_fallback_message(session)
                             await _emit_visible_assistant_message(session, fallback_msg)
                             final_response = fallback_msg
                             break
@@ -3345,7 +3397,13 @@ async def process_submission(session: Session, submission) -> bool:
                     "company data), recommend cloud-private unless user explicitly "
                     "chooses otherwise. gcp_vertex_jobs run and cancel operations "
                     "are approval-gated and billable; do not launch them without "
-                    "approval. After a Vertex AI job is launched, monitor only "
+                    "approval. When live training preflight returns "
+                    "manual_approval_allowed=true for a bounded smoke-test, "
+                    "launch_ready remains false and unknown quota/accelerator checks "
+                    "stay unknown, but you may proceed to call gcp_vertex_jobs run "
+                    "so the user can explicitly approve the bounded smoke launch. "
+                    "Do not treat launch_ready=false as a hard stop in that case. "
+                    "After a Vertex AI job is launched, monitor only "
                     "with gcp_vertex_jobs inspect/logs/ps, or cancel if the user "
                     "approves cancellation. Do not use sandbox_create, bash, "
                     "hf_jobs, or aws_sagemaker_jobs for Vertex job cooldown, "

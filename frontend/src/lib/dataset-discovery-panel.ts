@@ -28,6 +28,7 @@ interface CandidateRecord {
   schemaHint: string[];
   qualityNotes: string[];
   risks: string[];
+  metadataOnly: boolean;
 }
 
 export interface DatasetDiscoveryPanel {
@@ -139,6 +140,7 @@ function normalizeCandidate(value: unknown): CandidateRecord | null {
   const datasetId = getString(value, ['dataset_id', 'datasetId']);
   const title = getString(value, ['title', 'name']) ?? datasetId ?? 'Unnamed dataset';
   const rowCount = getNumber(value, ['row_count', 'rowCount']);
+  const metadataOnly = getValue(value, ['metadata_only', 'metadataOnly']) === true;
   return {
     datasetId,
     title,
@@ -155,7 +157,7 @@ function normalizeCandidate(value: unknown): CandidateRecord | null {
     licenseStatus: getString(value, ['license_status', 'licenseStatus']),
     privacyStatus: getString(value, ['privacy_status', 'privacyStatus']),
     schemaStatus: getString(value, ['schema_status', 'schemaStatus']),
-    rowCount,
+    rowCount: metadataOnly ? null : rowCount,
     columns: stringList(getValue(value, ['columns'])),
     textColumns: stringList(getValue(value, ['text_columns', 'textColumns'])),
     labelColumns: stringList(getValue(value, ['label_columns', 'labelColumns'])),
@@ -167,6 +169,7 @@ function normalizeCandidate(value: unknown): CandidateRecord | null {
     schemaHint: stringList(getValue(value, ['schemaHint', 'schema_hint'])),
     qualityNotes: stringList(getValue(value, ['qualityNotes', 'quality_notes'])),
     risks: riskList(getValue(value, ['risks'])),
+    metadataOnly,
   };
 }
 
@@ -240,7 +243,10 @@ function candidateSummary(candidate: CandidateRecord): string {
     ].filter(Boolean);
     parts.push(`Scores: ${scoreParts.join(', ')}`);
   }
-  if (candidate.rowCount !== null) parts.push(`Rows: ${candidate.rowCount.toLocaleString('en-US')}`);
+  if (candidate.rowCount !== null && !candidate.metadataOnly) {
+    parts.push(`Rows: ${candidate.rowCount.toLocaleString('en-US')}`);
+  }
+  if (candidate.metadataOnly) parts.push('Metadata-only candidate; verify on Hub before training.');
   if (candidate.columns.length) parts.push(`Columns: ${candidate.columns.join(', ')}`);
   if (candidate.size) parts.push(`Size: ${candidate.size}`);
   if (candidate.schemaHint.length) parts.push(`Schema: ${candidate.schemaHint.join(', ')}`);

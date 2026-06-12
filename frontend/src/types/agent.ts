@@ -137,6 +137,9 @@ export interface TrainingPreflightResult {
   warning_reasons: string[];
   unknown_reasons: string[];
   safe_summary: string;
+  manual_approval_allowed?: boolean;
+  manual_approval_reason?: string | null;
+  approval_required?: boolean;
   cache: TrainingPreflightCacheInfo;
   metadata: Record<string, unknown> & {
     provider_jobs_launched?: false;

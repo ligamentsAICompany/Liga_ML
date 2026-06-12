@@ -198,8 +198,21 @@ def test_discovery_result_redacts_secret_like_candidate_text():
     assert "[REDACTED]" in str(payload)
 
 
-def test_no_candidate_result_includes_explicit_reason():
+def test_gst_tax_prompt_returns_curated_metadata_candidates():
     result = build_dataset_discovery_result(query="Find GST tax support data")
+    payload = result.to_dict()
+
+    assert len(payload["candidates"]) >= 1
+    assert payload["no_candidates_reason"] is None
+    assert all(
+        candidate.get("row_count") is None for candidate in payload["candidates"]
+    )
+    dataset_ids = [candidate["dataset_id"] for candidate in payload["candidates"]]
+    assert "transitionGap/gst-india-preference-dataset-prep-small" in dataset_ids
+
+
+def test_no_candidate_result_includes_explicit_reason_for_unmatched_domain():
+    result = build_dataset_discovery_result(query="Find obscure widget support data")
     payload = result.to_dict()
 
     assert payload["candidates"] == []

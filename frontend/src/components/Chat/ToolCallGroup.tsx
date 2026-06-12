@@ -1832,6 +1832,15 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
                           sx={{ display: 'block', color: preflightState.result.launch_ready ? 'var(--accent-green)' : 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.5 }}
                         >
                           Latest preflight: {String(preflightState.result.status)} · launch_ready={String(preflightState.result.launch_ready)}
+                          {preflightState.result.manual_approval_allowed ? ' · bounded smoke approval allowed' : ''}
+                        </Typography>
+                      )}
+                      {preflightState.status === 'success' && preflightState.result?.manual_approval_allowed && (
+                        <Typography
+                          variant="caption"
+                          sx={{ display: 'block', color: 'var(--accent-yellow)', fontSize: '0.67rem', mt: 0.25 }}
+                        >
+                          Preflight has unknowns; bounded smoke can proceed only with explicit approval.
                         </Typography>
                       )}
                       {preflightState.status === 'success' && preflightState.result && (

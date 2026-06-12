@@ -8,7 +8,9 @@ from agent.core.dataset_discovery import (
     DEFAULT_ALLOWED_SOURCES,
     DEFAULT_EXCLUDED_SOURCES,
     build_dataset_discovery_result,
+    extract_hf_dataset_candidates_from_text,
     format_dataset_discovery_plan,
+    merge_candidate_payloads,
 )
 from agent.tools.types import ToolResult
 
@@ -16,7 +18,7 @@ from agent.tools.types import ToolResult
 class DatasetDiscoveryTool:
     """Plan dataset discovery when no uploaded dataset is available."""
 
-    async def execute(self, params: dict[str, Any]) -> ToolResult:
+    async def execute(self, params: dict[str, Any], session: Any = None) -> ToolResult:
         operation = str(params.get("operation", "")).strip().lower()
         if operation != "plan":
             return {
@@ -43,9 +45,16 @@ class DatasetDiscoveryTool:
                 "isError": False,
             }
 
-        candidates = params.get("candidates")
         domain = params.get("domain")
         task_type = params.get("task_type")
+        candidates = params.get("candidates")
+        candidate_sources: list[list[dict[str, Any]] | None] = []
+        if isinstance(candidates, list) and candidates:
+            candidate_sources.append(candidates)
+        session_candidates = _session_discovery_candidates(session)
+        if session_candidates:
+            candidate_sources.append(session_candidates)
+        merged_candidates = merge_candidate_payloads(*candidate_sources) or None
         plan = build_dataset_discovery_result(
             query=str(params.get("query") or params.get("user_goal") or ""),
             domain=domain if isinstance(domain, str) and domain.strip() else None,
@@ -62,7 +71,7 @@ class DatasetDiscoveryTool:
             excluded_sources=params.get("excluded_sources")
             if isinstance(params.get("excluded_sources"), list)
             else None,
-            candidates=candidates if isinstance(candidates, list) else None,
+            candidates=merged_candidates,
         )
         return {
             "formatted": format_dataset_discovery_plan(plan),
@@ -180,13 +189,44 @@ DATASET_DISCOVERY_TOOL_SPEC = {
 }
 
 
+def _session_discovery_candidates(session: Any | None) -> list[dict[str, Any]]:
+    if session is None:
+        return []
+    discovery = getattr(session, "latest_dataset_discovery", None)
+    if isinstance(discovery, dict):
+        existing = discovery.get("candidates")
+        if isinstance(existing, list) and existing:
+            return [dict(item) for item in existing if isinstance(item, dict)]
+    outputs = getattr(session, "_structured_tool_outputs", None)
+    if not isinstance(outputs, dict):
+        return []
+    extracted: list[dict[str, Any]] = []
+    for payload in outputs.values():
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("kind") == "dataset_discovery":
+            candidates = payload.get("candidates")
+            if isinstance(candidates, list):
+                extracted.extend(
+                    dict(item) for item in candidates if isinstance(item, dict)
+                )
+    if extracted:
+        return extracted
+    for payload in outputs.values():
+        if isinstance(payload, dict) and isinstance(payload.get("content"), str):
+            extracted.extend(
+                extract_hf_dataset_candidates_from_text(payload["content"])
+            )
+    return extracted
+
+
 async def dataset_discovery_handler(
     arguments: dict[str, Any],
     session: Any = None,
     tool_call_id: str | None = None,
 ) -> tuple[str, bool]:
     tool = DatasetDiscoveryTool()
-    result = await tool.execute(arguments)
+    result = await tool.execute(arguments, session=session)
     structured = result.get("structured")
     if session is not None and isinstance(structured, dict):
         outputs = getattr(session, "_structured_tool_outputs", None)

@@ -158,12 +158,17 @@ def _recommendation(
     model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
     hardware_id: str = "gcp-vertex:n1-standard-8-t4",
     output_policy: str = "cloud-private",
+    training_goal: str = "smoke-test",
+    estimated_cost_usd: float = 1.1,
 ) -> dict[str, Any]:
     return {
         "provider": provider,
+        "training_goal": training_goal,
         "recommended_model": model_id,
         "output_policy": output_policy,
         "recommendation": {
+            "training_goal": training_goal,
+            "estimated_cost_usd": estimated_cost_usd,
             "selected_provider": {"provider_id": provider},
             "selected_model": {"model_id": model_id},
             "selected_hardware": {"hardware_id": hardware_id},
@@ -274,6 +279,8 @@ async def test_mocked_refresh_vertex_api_bucket_and_write_permission_checks():
     assert checks["gcp.vertex.hardware_catalog"].status == PreflightStatus.PASSED
     assert checks["gcp.vertex.quota_availability"].status == PreflightStatus.UNKNOWN
     assert result.launch_ready is False
+    assert result.manual_approval_allowed is True
+    assert result.approval_required is True
     assert ("get_bucket", {"bucket_name": "bucket"}) in fake_client.calls
 
 

@@ -233,6 +233,7 @@ def training_preflight_audit_events(
     provider = str(preflight.get("provider") or "unknown")
     status = str(preflight.get("status") or "unknown")
     launch_ready = preflight.get("launch_ready") is True
+    manual_approval_allowed = preflight.get("manual_approval_allowed") is True
     blocking = preflight.get("blocking_reasons")
     unknowns = preflight.get("unknown_reasons")
     warnings = preflight.get("warning_reasons")
@@ -243,6 +244,8 @@ def training_preflight_audit_events(
         "blocking_reasons": blocking if isinstance(blocking, list) else [],
         "unknown_reasons": unknowns if isinstance(unknowns, list) else [],
         "warning_reasons": warnings if isinstance(warnings, list) else [],
+        "manual_approval_allowed": manual_approval_allowed,
+        "manual_approval_reason": preflight.get("manual_approval_reason"),
         "metadata": preflight.get("metadata")
         if isinstance(preflight.get("metadata"), dict)
         else {},
@@ -322,10 +325,26 @@ def training_preflight_audit_events(
             message=(
                 "Training preflight marked the plan launch-ready."
                 if launch_ready
-                else "Training preflight did not mark the plan launch-ready."
+                else (
+                    "Training preflight allows bounded smoke launch with explicit approval."
+                    if manual_approval_allowed
+                    else "Training preflight did not mark the plan launch-ready."
+                )
             ),
         )
     )
+    if manual_approval_allowed and not launch_ready:
+        events.append(
+            build_audit_event(
+                **common,
+                event_type="training_preflight_manual_approval_allowed",
+                status="approval_required",
+                severity="warning",
+                title="Bounded smoke manual approval allowed",
+                message=preflight.get("manual_approval_reason")
+                or "Only non-critical unknown checks remain; bounded smoke requires explicit approval.",
+            )
+        )
     return events
 
 

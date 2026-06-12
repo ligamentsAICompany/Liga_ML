@@ -33,7 +33,7 @@ async def test_dataset_discovery_plan_returns_no_upload_guidance():
 
 
 @pytest.mark.asyncio
-async def test_dataset_discovery_plan_persists_explicit_no_candidate_reason():
+async def test_dataset_discovery_plan_persists_gst_tax_metadata_candidates():
     class FakeSession:
         latest_dataset_discovery = None
 
@@ -50,9 +50,9 @@ async def test_dataset_discovery_plan_persists_explicit_no_candidate_reason():
     )
 
     assert ok is True
-    assert "No candidate datasets supplied yet" in output
-    assert session.latest_dataset_discovery["candidates"] == []
-    assert session.latest_dataset_discovery["no_candidates_reason"]
+    assert "transitionGap/gst-india-preference-dataset-prep-small" in output
+    assert len(session.latest_dataset_discovery["candidates"]) >= 1
+    assert session.latest_dataset_discovery["no_candidates_reason"] is None
 
 
 @pytest.mark.asyncio
