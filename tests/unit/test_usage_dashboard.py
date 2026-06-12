@@ -349,3 +349,61 @@ async def test_usage_api_response_omits_secrets(monkeypatch):
 
     assert response
     assert "secret" not in str([item.model_dump() for item in response]).lower()
+
+
+@pytest.mark.asyncio
+async def test_preflight_record_creates_usage_estimate():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s-preflight", provider="gcp-vertex")
+    run_id = run["run_id"]
+    await store.record_training_preflight(
+        session_id="s-preflight",
+        run_id=run_id,
+        preflight={
+            "provider": "gcp-vertex",
+            "training_goal": "smoke-test",
+            "manual_approval_allowed": True,
+            "launch_ready": False,
+            "verified_recommendation": {
+                "provider": "gcp-vertex",
+                "training_goal": "smoke-test",
+                "recommendation": {
+                    "estimated_cost_usd": 1.1,
+                    "selected_hardware": {
+                        "display_name": "n1-standard-8 + NVIDIA_TESLA_T4",
+                        "hardware_args": {
+                            "machine_type": "n1-standard-8",
+                            "accelerator_type": "NVIDIA_TESLA_T4",
+                            "max_run_hours": 1,
+                        },
+                    },
+                    "selected_model": {"model_id": "google/gemma-2-2b"},
+                },
+            },
+        },
+    )
+
+    entries = await store.list_usage_entries(run_id=run_id)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["estimated_cost_usd"] == 1.1
+    assert entry.get("known_cost_usd") in (None, 0)
+    assert entry["provider"] == "gcp-vertex"
+
+    await store.record_training_preflight(
+        session_id="s-preflight",
+        run_id=run_id,
+        preflight={
+            "provider": "gcp-vertex",
+            "training_goal": "smoke-test",
+            "manual_approval_allowed": True,
+            "launch_ready": False,
+            "verified_recommendation": {
+                "provider": "gcp-vertex",
+                "recommendation": {"estimated_cost_usd": 1.1},
+            },
+        },
+        include_started_audit=False,
+    )
+    entries_after = await store.list_usage_entries(run_id=run_id)
+    assert len(entries_after) == 1

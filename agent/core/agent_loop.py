@@ -47,6 +47,7 @@ ToolCall = ChatCompletionMessageToolCall
 _MALFORMED_TOOL_PREFIX = "ERROR: Tool call to '"
 _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
 _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT = 2
+_VERTEX_SMOKE_CONTINUATION_RETRY_LIMIT = 2
 _ACTIVE_CLOUD_JOB_STATES = {
     "created",
     "creating",
@@ -399,6 +400,12 @@ def _provider_tool_policy_violation(
         "gcp_vertex_jobs",
         "aws_sagemaker_jobs",
     }:
+        if (
+            tool_name == "gcp_vertex_jobs"
+            and _operation(tool_args) == "run"
+            and _should_continue_vertex_smoke_launch(session)
+        ):
+            return None
         return (
             "The user explicitly requested planning/discovery only and forbade "
             "sandbox, provider jobs, downloads, uploads, and resource creation. "
@@ -442,7 +449,57 @@ def _provider_tool_policy_violation(
     return None
 
 
+def _user_explicitly_requests_bounded_provider_launch(text: str) -> bool:
+    normalized = str(text or "").lower()
+    vertex_requested = any(
+        marker in normalized
+        for marker in (
+            "google vertex ai",
+            "google cloud vertex",
+            "gcp vertex",
+            "gcp-vertex",
+            "vertex ai",
+        )
+    )
+    if not vertex_requested:
+        return False
+    if any(
+        marker in normalized
+        for marker in (
+            "do not run google vertex",
+            "do not use google vertex",
+            "do not run vertex",
+        )
+    ):
+        return False
+    bounded_smoke = any(
+        marker in normalized
+        for marker in (
+            "smoke-test",
+            "smoke test",
+            "bounded vertex",
+            "bounded google vertex",
+            "quick smoke",
+            "smallest safe runtime",
+        )
+    )
+    launch_intent = any(
+        marker in normalized
+        for marker in (
+            "approve it and continue",
+            "pricing/provider approval",
+            "before launch",
+            "run one bounded",
+            "fine-tuning workflow",
+            "gcp_vertex_jobs",
+        )
+    )
+    return bounded_smoke and launch_intent
+
+
 def _user_requested_no_compute_tools(text: str) -> bool:
+    if _user_explicitly_requests_bounded_provider_launch(text):
+        return False
     normalized = str(text or "").lower()
     sandbox_blocked = any(
         marker in normalized
@@ -1546,6 +1603,87 @@ def _latest_training_preflight(session: Session) -> dict[str, Any] | None:
     return preflight if isinstance(preflight, dict) else None
 
 
+def _bounded_vertex_smoke_workflow_active(session: Session) -> bool:
+    if getattr(session, "cloud_provider", "hf-jobs") != "gcp-vertex":
+        return False
+    if getattr(session, "training_goal", "agent-decide") != "smoke-test":
+        return False
+    if not getattr(session, "bounded_vertex_smoke_for_turn", False):
+        return False
+    if _has_active_provider_job(
+        session, "gcp_vertex_jobs"
+    ) or _has_terminal_provider_job(session, "gcp_vertex_jobs"):
+        return False
+    discovery = getattr(session, "latest_dataset_discovery", None)
+    recommendation = getattr(session, "latest_training_recommendation", None)
+    return (
+        isinstance(discovery, dict)
+        and bool(discovery)
+        and isinstance(recommendation, dict)
+        and bool(recommendation)
+    )
+
+
+def _should_continue_vertex_smoke_launch(session: Session) -> bool:
+    if getattr(session, "cloud_provider", "hf-jobs") != "gcp-vertex":
+        return False
+    if getattr(session, "training_goal", "agent-decide") != "smoke-test":
+        return False
+    preflight = _latest_training_preflight(session)
+    if not isinstance(preflight, dict):
+        return False
+    if preflight.get("manual_approval_allowed") is not True:
+        return False
+    if preflight.get("launch_ready") is True:
+        return False
+    blocking = preflight.get("blocking_reasons")
+    if isinstance(blocking, list) and blocking:
+        return False
+    if _has_active_provider_job(
+        session, "gcp_vertex_jobs"
+    ) or _has_terminal_provider_job(session, "gcp_vertex_jobs"):
+        return False
+    return True
+
+
+def _should_avoid_planning_only_stop(session: Session) -> bool:
+    return _bounded_vertex_smoke_workflow_active(
+        session
+    ) or _should_continue_vertex_smoke_launch(session)
+
+
+def _vertex_smoke_continuation_prompt(session: Session) -> str:
+    preflight = _latest_training_preflight(session) or {}
+    manual_reason = str(preflight.get("manual_approval_reason") or "").strip()
+    reason_text = f"{manual_reason} " if manual_reason else ""
+    return (
+        "[SYSTEM: VERTEX SMOKE CONTINUATION] Live preflight returned "
+        "manual_approval_allowed=true with launch_ready=false because "
+        "quota/accelerator checks remain unknown. "
+        f"{reason_text}"
+        "Preflight has unknown quota/accelerator checks, so launch is not "
+        "automatically ready. Because this is a bounded smoke test with "
+        "cost/runtime guardrails, proceed now by calling gcp_vertex_jobs with "
+        "operation=run using the verified training recommendation. Do not "
+        "auto-launch; the approval card must appear for explicit user approval. "
+        "Do not return a planning-only summary."
+    )
+
+
+def _vertex_smoke_after_planner_prompt(session: Session) -> str:
+    if _should_continue_vertex_smoke_launch(session):
+        return _vertex_smoke_continuation_prompt(session)
+    return (
+        "[SYSTEM: VERTEX SMOKE CONTINUATION] Dataset discovery and training "
+        "planner are complete for the bounded Google Vertex AI smoke workflow. "
+        "Continue toward the approval-gated launch: once live preflight shows "
+        "manual_approval_allowed=true with bounded cost/runtime, call "
+        "gcp_vertex_jobs with operation=run immediately so the user can approve "
+        "the bounded launch. Do not treat unknown quota/accelerator as passed "
+        "and do not set launch_ready=true."
+    )
+
+
 def _should_emit_vertex_smoke_fallback(session: Session, text: str | None) -> bool:
     if getattr(session, "cloud_provider", "hf-jobs") != "gcp-vertex":
         return False
@@ -1651,6 +1789,8 @@ async def _emit_visible_assistant_message(session: Session, message: str) -> Non
 
 
 def _planning_only_completion_message(session: Session) -> str | None:
+    if _should_avoid_planning_only_stop(session):
+        return None
     if not getattr(session, "compute_tools_blocked_for_turn", False):
         return None
 
@@ -2329,6 +2469,7 @@ class Handlers:
         errored = False
         max_iterations = session.config.max_iterations
         no_tool_incomplete_plan_retries = 0
+        vertex_smoke_continuation_retries = 0
 
         while max_iterations == -1 or iteration < max_iterations:
             # ── Cancellation check: before LLM call ──
@@ -2549,6 +2690,49 @@ class Handlers:
                         iteration += 1
                         continue
 
+                    if (
+                        _should_continue_vertex_smoke_launch(session)
+                        and vertex_smoke_continuation_retries
+                        < _VERTEX_SMOKE_CONTINUATION_RETRY_LIMIT
+                    ):
+                        logger.info(
+                            "No tool calls after bounded Vertex smoke preflight; "
+                            "retrying with launch continuation prompt "
+                            "(attempt %d/%d)",
+                            vertex_smoke_continuation_retries + 1,
+                            _VERTEX_SMOKE_CONTINUATION_RETRY_LIMIT,
+                        )
+                        if content:
+                            assistant_msg = _assistant_message_from_result(
+                                llm_result,
+                                model_name=llm_params.get("model"),
+                            )
+                            session.context_manager.add_message(
+                                assistant_msg, token_count
+                            )
+                        session.context_manager.add_message(
+                            Message(
+                                role="user",
+                                content=_vertex_smoke_continuation_prompt(session),
+                            )
+                        )
+                        vertex_smoke_continuation_retries += 1
+                        await session.send_event(
+                            Event(
+                                event_type="tool_log",
+                                data={
+                                    "tool": "system",
+                                    "log": (
+                                        "Bounded Vertex smoke preflight allows "
+                                        "manual approval — retrying to request "
+                                        "gcp_vertex_jobs run."
+                                    ),
+                                },
+                            )
+                        )
+                        iteration += 1
+                        continue
+
                     logger.debug(
                         "Agent loop ending: no tool calls. "
                         "finish_reason=%s, token_count=%d, "
@@ -2573,6 +2757,7 @@ class Handlers:
                     break
 
                 no_tool_incomplete_plan_retries = 0
+                vertex_smoke_continuation_retries = 0
 
                 # Validate tool call args (one json.loads per call, once)
                 # and split into good vs bad
@@ -2860,6 +3045,31 @@ class Handlers:
                     if terminal_provider_output is not None:
                         final_response = terminal_provider_output
                         break
+
+                    if _should_avoid_planning_only_stop(session):
+                        last_tool = _last_tool_name(session)
+                        if last_tool in {"training_planner", "training_preflight"}:
+                            session.context_manager.add_message(
+                                Message(
+                                    role="user",
+                                    content=_vertex_smoke_after_planner_prompt(session),
+                                )
+                            )
+                            await session.send_event(
+                                Event(
+                                    event_type="tool_log",
+                                    data={
+                                        "tool": "system",
+                                        "log": (
+                                            "Bounded Vertex smoke workflow active "
+                                            "— continuing toward gcp_vertex_jobs "
+                                            "approval instead of planning-only stop."
+                                        ),
+                                    },
+                                )
+                            )
+                            iteration += 1
+                            continue
 
                     planning_only_summary = _planning_only_completion_message(session)
                     if planning_only_summary is not None:
@@ -3361,6 +3571,9 @@ async def process_submission(session: Session, submission) -> bool:
     if op.op_type == OpType.USER_INPUT:
         text = op.data.get("text", "") if op.data else ""
         session.compute_tools_blocked_for_turn = _user_requested_no_compute_tools(text)
+        session.bounded_vertex_smoke_for_turn = (
+            _user_explicitly_requests_bounded_provider_launch(text)
+        )
         session.training_planner_only_for_turn = _user_requested_training_planner_only(
             text
         )
@@ -3461,25 +3674,40 @@ async def process_submission(session: Session, submission) -> bool:
                 )
             )
         if getattr(session, "compute_tools_blocked_for_turn", False):
-            planning_tool_instruction = (
-                "training_planner only. Do not call dataset_discovery for this "
-                "turn; mention that dataset discovery requires a separate user "
-                "request if needed."
-                if getattr(session, "training_planner_only_for_turn", False)
-                else "dataset_discovery/training_planner"
-            )
-            session.context_manager.add_message(
-                Message(
-                    role="user",
-                    content=(
-                        "[SYSTEM: This turn is planning/discovery only. Do not "
-                        "call sandbox_create, bash, read, write, edit, hf_jobs, "
-                        "gcp_vertex_jobs, or aws_sagemaker_jobs. Use "
-                        f"{planning_tool_instruction} and explain what "
-                        "approval would be required before any launch.]"
-                    ),
+            if getattr(session, "bounded_vertex_smoke_for_turn", False):
+                session.context_manager.add_message(
+                    Message(
+                        role="user",
+                        content=(
+                            "[SYSTEM: This turn is a bounded Google Vertex AI "
+                            "smoke workflow. Do not create sandbox or use "
+                            "hf_jobs/aws_sagemaker_jobs. After dataset_discovery "
+                            "and training_planner, continue to gcp_vertex_jobs run "
+                            "when live preflight allows bounded manual approval. "
+                            "Do not stop with a planning-only summary.]"
+                        ),
+                    )
                 )
-            )
+            else:
+                planning_tool_instruction = (
+                    "training_planner only. Do not call dataset_discovery for this "
+                    "turn; mention that dataset discovery requires a separate user "
+                    "request if needed."
+                    if getattr(session, "training_planner_only_for_turn", False)
+                    else "dataset_discovery/training_planner"
+                )
+                session.context_manager.add_message(
+                    Message(
+                        role="user",
+                        content=(
+                            "[SYSTEM: This turn is planning/discovery only. Do not "
+                            "call sandbox_create, bash, read, write, edit, hf_jobs, "
+                            "gcp_vertex_jobs, or aws_sagemaker_jobs. Use "
+                            f"{planning_tool_instruction} and explain what "
+                            "approval would be required before any launch.]"
+                        ),
+                    )
+                )
         upload_instruction = _uploaded_dataset_instruction(session)
         if upload_instruction:
             session.context_manager.add_message(
