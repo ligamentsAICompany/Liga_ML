@@ -352,3 +352,102 @@ def test_planning_only_completion_waits_for_training_recommendation():
     session.latest_training_recommendation = None
 
     assert agent_loop._planning_only_completion_message(session) is None
+
+
+OPTION_B_PROMPT = (
+    "Run one bounded Google Vertex AI smoke-test fine-tuning workflow for GST tax "
+    "support questions. First use the no-upload dataset discovery system to find a "
+    "suitable small public GST or tax-support dataset without manually uploading or "
+    "downloading data. Then use the training planner to select a small Hugging "
+    "Face-compatible model, Google Vertex AI as the provider, Vertex-compatible "
+    "hardware, and Google Cloud Storage / cloud-private output. Run the live "
+    "read-only preflight check before launch. Do not use Hugging Face Jobs. Do not "
+    "use AWS SageMaker. Do not create sandbox. Use only a quick smoke-test "
+    "configuration with the smallest safe runtime."
+)
+
+
+def test_bounded_vertex_smoke_prompt_does_not_block_compute_tools():
+    assert agent_loop._user_explicitly_requests_bounded_provider_launch(OPTION_B_PROMPT)
+    assert agent_loop._user_requested_no_compute_tools(OPTION_B_PROMPT) is False
+
+
+def test_no_compute_prompt_detection_still_blocks_phase6_planning_only():
+    text = (
+        "Do not upload any dataset. Do not download any dataset. "
+        "Do not launch training. Do not use sandbox. "
+        "Do not run Hugging Face Jobs, Google Vertex AI, or AWS SageMaker. "
+        "Only use the application's no-upload dataset discovery and planning tools."
+    )
+
+    assert agent_loop._user_requested_no_compute_tools(text) is True
+
+
+def test_manual_approval_allowed_vertex_smoke_allows_gcp_vertex_run():
+    session = _session(provider="gcp-vertex")
+    session.training_goal = "smoke-test"
+    session.bounded_vertex_smoke_for_turn = True
+    session.latest_training_preflight = {
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+        "approval_required": True,
+        "blocking_reasons": [],
+    }
+    session.compute_tools_blocked_for_turn = True
+
+    violation = agent_loop._provider_tool_policy_violation(
+        session,
+        "gcp_vertex_jobs",
+        {"operation": "run"},
+    )
+
+    assert violation is None
+
+
+def test_manual_approval_allowed_does_not_set_launch_ready():
+    session = _session(provider="gcp-vertex")
+    session.training_goal = "smoke-test"
+    session.latest_training_preflight = {
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+        "approval_required": True,
+        "blocking_reasons": [],
+    }
+
+    assert agent_loop._should_continue_vertex_smoke_launch(session) is True
+    assert session.latest_training_preflight["launch_ready"] is False
+
+
+def test_preflight_blocking_reasons_do_not_continue_vertex_smoke():
+    session = _session(provider="gcp-vertex")
+    session.training_goal = "smoke-test"
+    session.latest_training_preflight = {
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+        "blocking_reasons": ["Missing GCS bucket"],
+    }
+
+    assert agent_loop._should_continue_vertex_smoke_launch(session) is False
+
+
+def test_bounded_vertex_smoke_skips_planning_only_completion():
+    session = _session(provider="gcp-vertex")
+    session.training_goal = "smoke-test"
+    session.bounded_vertex_smoke_for_turn = True
+    session.compute_tools_blocked_for_turn = False
+    session.latest_dataset_discovery = {"candidates": [{"dataset_id": "gst"}]}
+    session.latest_training_recommendation = {"provider": "gcp-vertex"}
+
+    assert agent_loop._planning_only_completion_message(session) is None
+
+
+def test_production_vertex_smoke_does_not_continue_without_manual_approval():
+    session = _session(provider="gcp-vertex")
+    session.training_goal = "production"
+    session.latest_training_preflight = {
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+        "blocking_reasons": [],
+    }
+
+    assert agent_loop._should_continue_vertex_smoke_launch(session) is False

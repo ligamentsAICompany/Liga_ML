@@ -502,6 +502,8 @@ def usage_from_training_recommendation(
     structured = recommendation if isinstance(recommendation, dict) else {}
     details = structured.get("recommendation")
     if not isinstance(details, dict):
+        details = structured
+    if not isinstance(details, dict):
         return None
     provider = normalize_provider(structured.get("provider"))
     usage_id = f"{run_id}:planner:training_recommendation"
@@ -511,6 +513,18 @@ def usage_from_training_recommendation(
     hardware_args = hardware_args if isinstance(hardware_args, dict) else {}
     selected_model = details.get("selected_model")
     selected_model = selected_model if isinstance(selected_model, dict) else {}
+    nested_recommendation = (
+        details.get("recommendation")
+        if isinstance(details.get("recommendation"), dict)
+        else details
+    )
+    estimated_cost = _float_or_none(
+        nested_recommendation.get("estimated_cost_usd")
+        if isinstance(nested_recommendation, dict)
+        else None
+    )
+    if estimated_cost is None:
+        estimated_cost = _float_or_none(details.get("estimated_cost_usd"))
     entry = base_usage_entry(
         session_id=session_id,
         run_id=run_id,
@@ -522,7 +536,7 @@ def usage_from_training_recommendation(
     entry.update(
         {
             "status": "estimated",
-            "estimated_cost_usd": _float_or_none(details.get("estimated_cost_usd")),
+            "estimated_cost_usd": estimated_cost,
             "cost_source": "static_estimate",
             "cost_confidence": "estimated",
             "instance_type": selected_hardware.get("display_name")
@@ -532,14 +546,27 @@ def usage_from_training_recommendation(
             "model_name": selected_model.get("model_id")
             or structured.get("recommended_model"),
             "output_policy": structured.get("output_policy"),
-            "budget_cap_usd": _float_or_none(details.get("budget_cap_usd")),
+            "budget_cap_usd": _float_or_none(
+                nested_recommendation.get("budget_cap_usd")
+                if isinstance(nested_recommendation, dict)
+                else details.get("budget_cap_usd")
+            ),
             "quota_status": "warning"
-            if details.get("quota_warning_recorded")
+            if (
+                isinstance(nested_recommendation, dict)
+                and nested_recommendation.get("quota_warning_recorded")
+            )
+            or details.get("quota_warning_recorded")
             else "unknown",
             "warning": next(
                 (
                     str(warning.get("message"))
-                    for warning in details.get("warnings") or []
+                    for warning in (
+                        nested_recommendation.get("warnings")
+                        if isinstance(nested_recommendation, dict)
+                        else details.get("warnings")
+                    )
+                    or []
                     if isinstance(warning, dict) and warning.get("message")
                 ),
                 None,
@@ -547,6 +574,51 @@ def usage_from_training_recommendation(
             "metadata": sanitize_metadata(structured),
         }
     )
+    return usage_id, entry
+
+
+def _planner_structured_from_preflight(
+    preflight: dict[str, Any],
+) -> dict[str, Any] | None:
+    verified = preflight.get("verified_recommendation")
+    if not isinstance(verified, dict):
+        return None
+    provider = normalize_provider(preflight.get("provider") or verified.get("provider"))
+    training_goal = (
+        preflight.get("training_goal") or verified.get("training_goal") or "smoke-test"
+    )
+    if isinstance(verified.get("recommendation"), dict):
+        return {
+            "provider": provider,
+            "training_goal": training_goal,
+            "recommendation": verified["recommendation"],
+        }
+    return {
+        "provider": provider,
+        "training_goal": training_goal,
+        "recommendation": verified,
+    }
+
+
+def usage_from_training_preflight(
+    *,
+    session_id: str,
+    run_id: str,
+    preflight: dict[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    structured = _planner_structured_from_preflight(preflight)
+    if not structured:
+        return None
+    usage_update = usage_from_training_recommendation(
+        session_id=session_id,
+        run_id=run_id,
+        recommendation=structured,
+    )
+    if not usage_update:
+        return None
+    usage_id, entry = usage_update
+    entry["tool_name"] = "training_preflight"
+    entry["operation"] = "preflight"
     return usage_id, entry
 
 

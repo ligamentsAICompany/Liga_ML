@@ -39,6 +39,7 @@ from agent.core.post_training_evaluation import (
 from agent.core.usage import (
     summarize_usage,
     usage_from_training_recommendation,
+    usage_from_training_preflight,
     usage_from_approval_tool,
     usage_from_run_terminal,
     usage_from_tool_state,
@@ -432,6 +433,15 @@ class NoopSessionStore:
             clean, include_started=include_started_audit
         ):
             await self.record_audit_event(event)
+        if run_id:
+            usage_update = usage_from_training_preflight(
+                session_id=session_id,
+                run_id=run_id,
+                preflight=clean,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
         return dict(clean)
 
     async def get_latest_training_preflight(
@@ -1408,6 +1418,15 @@ class MongoSessionStore(NoopSessionStore):
             clean, include_started=include_started_audit
         ):
             await self.record_audit_event(event)
+        if run_id:
+            usage_update = usage_from_training_preflight(
+                session_id=session_id,
+                run_id=run_id,
+                preflight=clean,
+            )
+            if usage_update:
+                usage_id, entry = usage_update
+                await self.upsert_usage_entry(usage_id, entry)
         return dict(clean)
 
     async def get_latest_training_preflight(
@@ -1531,6 +1550,7 @@ class MongoSessionStore(NoopSessionStore):
         cleaned = sanitize_for_persistence(
             {key: value for key, value in fields.items() if value is not None}
         )
+        cleaned.pop("_id", None)
         cleaned["usage_id"] = usage_id
         cleaned["updated_at"] = now
         doc = await self.db.usage_entries.find_one_and_update(
