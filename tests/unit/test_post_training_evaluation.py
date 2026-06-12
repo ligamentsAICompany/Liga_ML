@@ -199,6 +199,34 @@ def test_failed_vertex_response_row_builds_failed_job_static_evaluation():
     assert evaluation["metadata"]["paid_judge_used"] is False
 
 
+def test_blocked_vertex_response_row_without_job_id_builds_failed_stub():
+    context = evaluation_context_from_response_row(
+        {
+            "id": "row-vertex-blocked",
+            "session_id": "s-vertex",
+            "platform": "gcp-vertex",
+            "progress": "blocked",
+            "job_id": None,
+            "final_artifact_or_result": None,
+            "result_storage": "cloud-private",
+            "run_type": "smoke-test",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "completed_at": "2026-06-12T00:00:00+00:00",
+            "error": "Dataset staging failed before provider launch.",
+        }
+    )
+
+    assert context is not None
+    assert context["training_status"] == "failed"
+    assert context["job_id"] is None
+
+    evaluation = build_post_training_evaluation(context)
+
+    assert evaluation["status"] == "failed"
+    assert "provider job failed" in evaluation["failure_summary"].lower()
+    assert evaluation["metadata"]["provider_jobs_launched"] is False
+
+
 @pytest.mark.asyncio
 async def test_store_upserts_evaluation_idempotently_and_updates_run_summary(
     monkeypatch,

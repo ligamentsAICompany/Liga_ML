@@ -53,7 +53,14 @@ RESPONSE_ROW_LIMITATION = (
     "Derived from response log row; durable run record unavailable."
 )
 COMPLETED_RESPONSE_PROGRESS = {"completed", "succeeded", "success"}
-FAILED_RESPONSE_PROGRESS = {"failed", "error", "cancelled", "canceled", "expired"}
+FAILED_RESPONSE_PROGRESS = {
+    "failed",
+    "error",
+    "cancelled",
+    "canceled",
+    "expired",
+    "blocked",
+}
 
 
 def _now() -> datetime:

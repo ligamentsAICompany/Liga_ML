@@ -887,3 +887,49 @@ def test_registered_tool_is_available():
     tool_names = {tool.name for tool in create_builtin_tools(local_mode=True)}
 
     assert "gcp_vertex_jobs" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_run_sft_template_staging_failure_emits_blocked_state(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    FakeCustomJob.instances = []
+
+    async def failing_stage(**kwargs):
+        raise RuntimeError(
+            "Dataset staging failed before provider launch. "
+            "Schema normalization failed: Unsupported dataset schema."
+        )
+
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool.stage_hf_dataset_to_gcs",
+        failing_stage,
+    )
+
+    session = FakeSession()
+    tool = GcpVertexJobsTool(
+        session=session,
+        tool_call_id="call-staging-fail",
+        custom_job_cls=FakeCustomJob,
+    )
+
+    result = await tool.execute(
+        {
+            "operation": "run",
+            "template": "sft",
+            "display_name": "gst-smoke",
+            "dataset_name": "transitionGap/gst-india-preference-dataset-prep-small",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "output_policy": "cloud-private",
+            "training_goal": "smoke-test",
+            "max_run_hours": 1,
+        }
+    )
+
+    assert result.get("isError") is True
+    assert "Dataset staging failed before provider launch" in result["formatted"]
+    assert session.events
+    assert session.events[0].data["state"] == "blocked"
+    assert session.events[0].data["tool"] == "gcp_vertex_jobs"
+    assert FakeCustomJob.instances == []

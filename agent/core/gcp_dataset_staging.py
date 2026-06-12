@@ -17,6 +17,23 @@ DEFAULT_HF_LOAD_RETRY_SECONDS = 2.0
 DEFAULT_HF_LOAD_TIMEOUT_SECONDS = 45.0
 DEFAULT_BOUNDED_STAGING_ROWS = 100
 
+METADATA_COLUMN_NAMES = frozenset(
+    {
+        "coherence",
+        "complexity",
+        "correctness",
+        "helpfulness",
+        "verbosity",
+        "rating",
+        "score",
+    }
+)
+
+SUPPORTED_SCHEMA_LABELS = (
+    "messages, text, prompt+completion, prompt+chosen(+rejected), "
+    "instruction/output, question/answer, question/response, user/assistant"
+)
+
 
 @dataclass(frozen=True)
 class GcpDatasetStagingResult:
@@ -90,8 +107,50 @@ def _messages_from_pair(
     }
 
 
-def detect_dataset_schema(row: dict[str, Any]) -> str | None:
+def _assistant_columns_from_mapping(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if value in (None, ""):
+        return []
+    return [str(value).strip()]
+
+
+def resolve_mapping_source_columns(
+    row: dict[str, Any], column_mapping: dict[str, Any] | None
+) -> tuple[str, list[str]] | None:
+    """Resolve role-style column_mapping to actual dataset columns when possible."""
+    if not isinstance(column_mapping, dict) or not column_mapping:
+        return None
+    user_column = column_mapping.get("user") or column_mapping.get("question")
+    assistant_columns = _assistant_columns_from_mapping(
+        column_mapping.get("assistant") or column_mapping.get("response")
+    )
+    if not user_column or not assistant_columns:
+        return None
+    user_name = str(user_column).strip()
+    if user_name not in row:
+        return None
+    resolved_assistant = [
+        column
+        for column in assistant_columns
+        if column in row and _string_value(row.get(column))
+    ]
+    if not _string_value(row.get(user_name)) or not resolved_assistant:
+        return None
+    return user_name, resolved_assistant
+
+
+def detect_dataset_schema(
+    row: dict[str, Any],
+    *,
+    column_mapping: dict[str, Any] | None = None,
+) -> str | None:
     """Return a supported schema label for a dataset row, or None if unsupported."""
+    mapped = resolve_mapping_source_columns(row, column_mapping)
+    if mapped is not None:
+        user_column, assistant_columns = mapped
+        return f"{user_column}_{assistant_columns[0]}"
+
     if _messages_have_user_and_assistant(row.get("messages")):
         return "messages"
     if _string_value(row.get("text")):
@@ -105,6 +164,7 @@ def detect_dataset_schema(row: dict[str, Any]) -> str | None:
         ("instruction", "response"),
         ("input", "output"),
         ("input", "response"),
+        ("question", "response"),
         ("question", "answer"),
         ("user", "assistant"),
         ("prompt", "response"),
@@ -117,15 +177,23 @@ def detect_dataset_schema(row: dict[str, Any]) -> str | None:
     return None
 
 
-def normalize_row_to_sft(row: dict[str, Any]) -> tuple[dict[str, Any], str]:
+def normalize_row_to_sft(
+    row: dict[str, Any],
+    *,
+    column_mapping: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
     """Normalize one dataset row to SFT JSONL shape and return schema label."""
-    schema = detect_dataset_schema(row)
+    schema = detect_dataset_schema(row, column_mapping=column_mapping)
     if schema is None:
-        keys = ", ".join(sorted(str(key) for key in row.keys()))
+        content_keys = sorted(
+            str(key)
+            for key in row.keys()
+            if str(key).lower() not in METADATA_COLUMN_NAMES
+        )
+        keys = ", ".join(content_keys)
         raise ValueError(
-            "Unsupported dataset schema. Expected one of: messages, text, "
-            "prompt+completion, prompt+chosen(+rejected), instruction/output, "
-            f"question/answer, user/assistant. Found columns: {keys}"
+            "Unsupported dataset schema. Expected one of: "
+            f"{SUPPORTED_SCHEMA_LABELS}. Found columns: {keys}"
         )
     if schema == "messages":
         return {"messages": row["messages"]}, schema
@@ -145,10 +213,16 @@ def normalize_row_to_sft(row: dict[str, Any]) -> tuple[dict[str, Any], str]:
         return _messages_from_pair(row, "input", ["response"]), schema
     if schema == "question_answer":
         return _messages_from_pair(row, "question", ["answer"]), schema
+    if schema == "question_response":
+        return _messages_from_pair(row, "question", ["response"]), schema
     if schema == "user_assistant":
         return _messages_from_pair(row, "user", ["assistant"]), schema
     if schema == "prompt_response":
         return _messages_from_pair(row, "prompt", ["response"]), schema
+    mapped = resolve_mapping_source_columns(row, column_mapping)
+    if mapped is not None:
+        user_column, assistant_columns = mapped
+        return _messages_from_pair(row, user_column, assistant_columns), schema
     raise ValueError(f"Unsupported dataset schema: {schema}")
 
 
@@ -175,12 +249,14 @@ def _bounded_rows(
 
 def _rows_to_normalized_jsonl_bytes(
     rows: list[dict[str, Any]],
+    *,
+    column_mapping: dict[str, Any] | None = None,
 ) -> tuple[bytes, int, str, str]:
     normalized_rows: list[dict[str, Any]] = []
     detected_schema = ""
     source_format = ""
     for row_index, row in enumerate(rows, start=1):
-        normalized, schema = normalize_row_to_sft(row)
+        normalized, schema = normalize_row_to_sft(row, column_mapping=column_mapping)
         normalized_rows.append(normalized)
         if not detected_schema:
             detected_schema = schema
@@ -254,6 +330,7 @@ async def stage_hf_dataset_to_gcs(
     max_rows: int = DEFAULT_BOUNDED_STAGING_ROWS,
     upload_file: Callable[[str, str], None] | None = None,
     loader: Callable[..., Any] | None = None,
+    column_mapping: dict[str, Any] | None = None,
 ) -> GcpDatasetStagingResult:
     """Load a bounded Hub split, normalize to SFT JSONL, and upload to GCS."""
 
@@ -282,7 +359,7 @@ async def stage_hf_dataset_to_gcs(
     try:
         raw_rows = _bounded_rows(dataset, max_rows=bounded_rows)
         payload, row_count, source_format, detected_schema = (
-            _rows_to_normalized_jsonl_bytes(raw_rows)
+            _rows_to_normalized_jsonl_bytes(raw_rows, column_mapping=column_mapping)
         )
     except ValueError as exc:
         raise RuntimeError(

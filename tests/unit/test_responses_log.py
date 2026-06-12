@@ -592,6 +592,32 @@ async def test_gcp_fake_internal_ids_do_not_become_job_ids(fake_id):
 
 
 @pytest.mark.asyncio
+async def test_gcp_blocked_without_job_id_records_prelaunch_failure_row():
+    events = [
+        _event(
+            "gcp_vertex_jobs",
+            "blocked",
+            tool_call_id="functions.gcp_vertex_jobs:5",
+            reason="Dataset staging failed before provider launch.",
+            training_goal="smoke-test",
+            outputPolicy="cloud-private",
+        )
+    ]
+
+    result = await build_responses_log(
+        [_session("s1", provider="gcp-vertex", goal="smoke-test", events=events)],
+        load_events=lambda _sid: events,
+    )
+
+    row = result["rows"][0]
+    assert row["platform"] == "gcp-vertex"
+    assert row["progress"] == "blocked"
+    assert row["job_id"] in {"", None}
+    assert row["run_type"] == "smoke-test"
+    assert row["error"] == "Dataset staging failed before provider launch."
+
+
+@pytest.mark.asyncio
 async def test_failed_row_extracts_failure_reason_and_redacts_secrets():
     sample_token_value = "hf_fake_token_123456789"
     events = [

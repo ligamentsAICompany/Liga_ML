@@ -127,9 +127,17 @@ def run_status_from_event(
             return "running"
         if state in {"failed", "error", "billing_required"}:
             return "failed" if state != "billing_required" else "waiting_approval"
+        if state in {"blocked", "launch_blocked"}:
+            return "failed"
         if state in {"cancelled", "rejected", "abandoned"}:
             return "cancelled"
     if event_type == "turn_complete":
+        if str(data.get("run_outcome") or "").lower() in {
+            "failed",
+            "blocked",
+            "provider_launch_blocked",
+        }:
+            return "failed"
         if str(data.get("waiting_for_tool_approval") or "").lower() in {
             "1",
             "true",
@@ -168,6 +176,7 @@ def provider_metadata_from_event(
         "outputPolicy": "provider_output_policy",
         "state": "provider_status",
         "tool": "active_tool",
+        "reason": "provider_error",
     }
     for source, target in field_map.items():
         value = data.get(source)

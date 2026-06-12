@@ -234,6 +234,7 @@ def _failure_reason(data: dict[str, Any]) -> str | None:
     return _as_str(
         data.get("failureReason")
         or data.get("failure_reason")
+        or data.get("reason")
         or data.get("error")
         or data.get("message")
     )
@@ -580,7 +581,11 @@ async def build_responses_log(
             key_id = real_job_id or _as_str(data.get("tool_call_id")) or ""
             if not key_id:
                 continue
-            if platform == "gcp-vertex" and real_job_id is None:
+            if (
+                platform == "gcp-vertex"
+                and real_job_id is None
+                and progress not in {"blocked", "failed", "error", "cancelled"}
+            ):
                 continue
             if event.get("event_type") == "tool_output" and real_job_id is None:
                 continue

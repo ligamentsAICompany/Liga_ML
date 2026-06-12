@@ -452,3 +452,36 @@ def test_production_vertex_smoke_does_not_continue_without_manual_approval():
     }
 
     assert agent_loop._should_continue_vertex_smoke_launch(session) is False
+
+
+def test_bounded_vertex_run_without_preflight_is_blocked_from_approval():
+    session = _session(provider="gcp-vertex")
+    session.bounded_vertex_smoke_for_turn = True
+
+    violation = agent_loop._provider_launch_missing_live_preflight(
+        session,
+        "gcp_vertex_jobs",
+        {"operation": "run"},
+    )
+
+    assert violation is not None
+    assert "training preflight must complete" in violation.lower()
+
+
+def test_bounded_vertex_run_with_preflight_allows_approval():
+    session = _session(provider="gcp-vertex")
+    session.bounded_vertex_smoke_for_turn = True
+    session.latest_training_preflight = {
+        "preflight_id": "pf-1",
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+    }
+
+    assert (
+        agent_loop._provider_launch_missing_live_preflight(
+            session,
+            "gcp_vertex_jobs",
+            {"operation": "run"},
+        )
+        is None
+    )

@@ -899,6 +899,27 @@ def _is_immediate_cloud_job_run(tool_name: str, tool_args: dict) -> bool:
     )
 
 
+def _bounded_vertex_smoke_requires_live_preflight(session: Session) -> bool:
+    return bool(getattr(session, "bounded_vertex_smoke_for_turn", False))
+
+
+def _provider_launch_missing_live_preflight(
+    session: Session, tool_name: str, tool_args: dict[str, Any]
+) -> str | None:
+    if not _is_immediate_gcp_vertex_job_run(tool_name, tool_args):
+        return None
+    if not _bounded_vertex_smoke_requires_live_preflight(session):
+        return None
+    preflight = _latest_training_preflight(session)
+    if isinstance(preflight, dict) and preflight.get("preflight_id"):
+        return None
+    return (
+        "Live read-only training preflight must complete before the bounded "
+        "Google Vertex AI approval card can be shown. Run training_preflight "
+        "with the verified recommendation first."
+    )
+
+
 def _is_scheduled_hf_job_run(tool_name: str, tool_args: dict) -> bool:
     return tool_name == "hf_jobs" and is_scheduled_operation(_operation(tool_args))
 
@@ -1246,6 +1267,14 @@ def _approval_metadata(
         metadata.setdefault("dataset", upload.get("repo_id"))
         metadata.setdefault("dataset_config", upload.get("config_name"))
         metadata.setdefault("dataset_rows", upload.get("normalized_row_count"))
+    preflight = _latest_training_preflight(session)
+    if isinstance(preflight, dict) and preflight.get("preflight_id"):
+        metadata["training_preflight"] = {
+            "preflight_id": preflight.get("preflight_id"),
+            "status": preflight.get("status"),
+            "manual_approval_allowed": preflight.get("manual_approval_allowed"),
+            "launch_ready": preflight.get("launch_ready"),
+        }
     return {key: value for key, value in metadata.items() if value not in {None, ""}}
 
 
@@ -2980,6 +3009,53 @@ class Handlers:
                 ] = []
                 reserved_auto_spend_usd = 0.0
                 for tc, tool_name, tool_args in good_tools:
+                    preflight_violation = _provider_launch_missing_live_preflight(
+                        session, tool_name, tool_args
+                    )
+                    if preflight_violation is not None:
+                        error_msg = f"ERROR: {preflight_violation}"
+                        session.context_manager.add_message(
+                            Message(
+                                role="tool",
+                                content=error_msg,
+                                tool_call_id=tc.id,
+                                name=tool_name,
+                            )
+                        )
+                        await session.send_event(
+                            Event(
+                                event_type="tool_call",
+                                data={
+                                    "tool": tool_name,
+                                    "arguments": tool_args,
+                                    "tool_call_id": tc.id,
+                                },
+                            )
+                        )
+                        await session.send_event(
+                            Event(
+                                event_type="tool_output",
+                                data={
+                                    "tool": tool_name,
+                                    "tool_call_id": tc.id,
+                                    "output": error_msg,
+                                    "success": False,
+                                },
+                            )
+                        )
+                        await session.send_event(
+                            Event(
+                                event_type="tool_state_change",
+                                data={
+                                    "tool_call_id": tc.id,
+                                    "tool": tool_name,
+                                    "provider": "gcp-vertex",
+                                    "state": "blocked",
+                                    "reason": preflight_violation,
+                                },
+                            )
+                        )
+                        continue
                     decision = await _approval_decision(
                         tool_name,
                         tool_args,
@@ -3302,6 +3378,9 @@ class Handlers:
             await _cleanup_on_cancel(session)
             await session.send_event(Event(event_type="interrupted"))
         elif not errored and not getattr(session, "waiting_for_tool_approval", False):
+            run_outcome = None
+            if getattr(session, "provider_launch_blocked_for_turn", False):
+                run_outcome = "provider_launch_blocked"
             await session.send_event(
                 Event(
                     event_type="turn_complete",
@@ -3310,9 +3389,11 @@ class Handlers:
                         "final_response": final_response
                         if isinstance(final_response, str)
                         else None,
+                        "run_outcome": run_outcome,
                     },
                 )
             )
+            session.provider_launch_blocked_for_turn = False
 
         # Increment turn counter and check for auto-save
         if not getattr(session, "waiting_for_tool_approval", False):
@@ -3544,7 +3625,7 @@ class Handlers:
                 tool_name, tool_args, session=session, tool_call_id=tc.id
             )
 
-            return (tc, tool_name, output, success, was_edited)
+            return (tc, tool_name, tool_args, output, success, was_edited)
 
         # Execute all approved tools concurrently (cancellable)
         if approved_tasks:
@@ -3598,7 +3679,7 @@ class Handlers:
                     logger.error(f"Tool execution error: {result}")
                     continue
 
-                tc, tool_name, output, success, was_edited = result
+                tc, tool_name, tool_args, output, success, was_edited = result
 
                 if was_edited:
                     output = f"[Note: The user edited the script before execution. The output below reflects the user-modified version, not your original script.]\n\n{output}"
@@ -3624,6 +3705,8 @@ class Handlers:
                         },
                     )
                 )
+                if not success and _is_immediate_cloud_job_run(tool_name, tool_args):
+                    session.provider_launch_blocked_for_turn = True
 
         # Process rejected tools
         for tc, tool_name, approval_decision in rejected_tasks:

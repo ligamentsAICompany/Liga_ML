@@ -198,3 +198,22 @@ def test_turn_complete_does_not_mark_waiting_approval_run_succeeded():
         "turn_complete", {"waiting_for_tool_approval": True}
     ) == ("waiting_approval")
     assert run_status_from_event("turn_complete", {}) == "succeeded"
+
+
+def test_turn_complete_marks_provider_launch_blocked_run_failed():
+    assert (
+        run_status_from_event(
+            "turn_complete", {"run_outcome": "provider_launch_blocked"}
+        )
+        == "failed"
+    )
+
+
+def test_tool_state_change_blocked_marks_run_failed():
+    assert (
+        run_status_from_event(
+            "tool_state_change",
+            {"tool": "gcp_vertex_jobs", "state": "blocked"},
+        )
+        == "failed"
+    )
