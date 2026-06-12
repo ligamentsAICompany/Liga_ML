@@ -210,6 +210,9 @@ class TrainingPreflightResult:
     warning_reasons: list[str] = field(default_factory=list)
     unknown_reasons: list[str] = field(default_factory=list)
     safe_summary: str = ""
+    manual_approval_allowed: bool = False
+    manual_approval_reason: str | None = None
+    approval_required: bool = False
     cache: TrainingPreflightCacheInfo = field(
         default_factory=TrainingPreflightCacheInfo
     )
@@ -249,6 +252,9 @@ class TrainingPreflightResult:
                 "warning_reasons": list(self.warning_reasons),
                 "unknown_reasons": list(self.unknown_reasons),
                 "safe_summary": self.safe_summary,
+                "manual_approval_allowed": self.manual_approval_allowed,
+                "manual_approval_reason": self.manual_approval_reason,
+                "approval_required": self.approval_required,
                 "cache": self.cache.to_dict(),
                 "metadata": self.metadata,
             }
@@ -286,6 +292,105 @@ def derive_launch_ready(
         allow_unknown_override or not unknown_reasons
     )
     return launch_ready, blocking_reasons, warning_reasons, unknown_reasons
+
+
+MANUAL_APPROVAL_UNKNOWN_CHECK_IDS = frozenset(
+    {
+        "gcp.vertex.quota_availability",
+        "gcp.gcs.write_permission",
+    }
+)
+
+
+def _training_goal_from_recommendation(
+    recommendation: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
+) -> str:
+    sources: list[Any] = []
+    if isinstance(recommendation, dict):
+        sources.extend(
+            [
+                recommendation.get("training_goal"),
+                _recommendation_body(recommendation).get("training_goal"),
+            ]
+        )
+    if isinstance(metadata, dict):
+        sources.append(metadata.get("training_goal"))
+    for value in sources:
+        goal = str(value or "").strip().lower().replace("_", "-")
+        if goal in {"smoke-test", "smoke"}:
+            return "smoke-test"
+        if goal:
+            return goal
+    return ""
+
+
+def _estimated_cost_from_recommendation(
+    recommendation: dict[str, Any] | None,
+) -> float | None:
+    if not isinstance(recommendation, dict):
+        return None
+    body = _recommendation_body(recommendation)
+    for key in ("estimated_cost_usd", "estimated_cost"):
+        value = body.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            return float(value)
+    top_level = recommendation.get("estimated_cost_usd")
+    if isinstance(top_level, int | float) and not isinstance(top_level, bool):
+        return float(top_level)
+    return None
+
+
+def derive_manual_approval_policy(
+    checks: list[TrainingPreflightCheck],
+    *,
+    provider: str,
+    blocking_reasons: list[str],
+    unknown_reasons: list[str],
+    recommendation: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[bool, bool, str | None]:
+    """Return manual_approval_allowed, approval_required, manual_approval_reason."""
+
+    if provider != "gcp-vertex" or blocking_reasons:
+        return False, False, None
+    if _training_goal_from_recommendation(recommendation, metadata) != "smoke-test":
+        return False, False, None
+    if _estimated_cost_from_recommendation(recommendation) is None:
+        return False, False, None
+    if not unknown_reasons:
+        return False, False, None
+
+    active_unknown_checks = [
+        check
+        for check in checks
+        if check.status == PreflightStatus.UNKNOWN
+        and not _is_non_applicable_skip(check)
+    ]
+    if not active_unknown_checks:
+        return False, False, None
+
+    for check in checks:
+        if check.status == PreflightStatus.FAILED and check.severity in {
+            PreflightSeverity.ERROR,
+            PreflightSeverity.BLOCKING,
+        }:
+            return False, False, None
+
+    for check in active_unknown_checks:
+        if check.check_id not in MANUAL_APPROVAL_UNKNOWN_CHECK_IDS:
+            return False, False, None
+        if check.severity in {
+            PreflightSeverity.ERROR,
+            PreflightSeverity.BLOCKING,
+        }:
+            return False, False, None
+
+    reason = (
+        "Only Vertex quota/accelerator or safe GCS write-readiness checks are unknown; "
+        "bounded smoke launch requires explicit approval. launch_ready remains false."
+    )
+    return True, True, reason
 
 
 def _derive_status(
@@ -707,11 +812,20 @@ def build_training_preflight_result(
     created_at: str | None = None,
     updated_at: str | None = None,
     allow_unknown_override: bool = False,
+    recommendation: dict[str, Any] | None = None,
 ) -> TrainingPreflightResult:
     all_checks = list(checks or [])
     launch_ready, blocking, warnings, unknowns = derive_launch_ready(
         all_checks,
         allow_unknown_override=allow_unknown_override,
+    )
+    manual_allowed, approval_required, manual_reason = derive_manual_approval_policy(
+        all_checks,
+        provider=provider,
+        blocking_reasons=blocking,
+        unknown_reasons=unknowns,
+        recommendation=recommendation,
+        metadata=metadata,
     )
     status = _derive_status(
         all_checks,
@@ -724,6 +838,8 @@ def build_training_preflight_result(
         "provider_jobs_launched": False,
         "resources_created": False,
         "live_checks_optional": True,
+        "manual_approval_allowed": manual_allowed,
+        "approval_required": approval_required,
         **(metadata or {}),
     }
     primary = TrainingPreflightProviderResult(
@@ -735,7 +851,7 @@ def build_training_preflight_result(
         warning_reasons=warnings,
         unknown_reasons=unknowns,
     )
-    return TrainingPreflightResult(
+    result = TrainingPreflightResult(
         preflight_id=preflight_id or f"preflight_{uuid4().hex}",
         session_id=session_id,
         run_id=run_id,
@@ -761,9 +877,19 @@ def build_training_preflight_result(
             warning_reasons=warnings,
             unknown_reasons=unknowns,
         ),
+        manual_approval_allowed=manual_allowed,
+        manual_approval_reason=manual_reason,
+        approval_required=approval_required,
         cache=cache or TrainingPreflightCacheInfo(),
         metadata=safe_metadata,
     )
+    if manual_allowed and manual_reason:
+        summary = (
+            f"{result.safe_summary} {manual_reason} "
+            "Preflight has unknowns; bounded smoke can proceed only with explicit approval."
+        )
+        object.__setattr__(result, "safe_summary", str(sanitize_for_frontend(summary)))
+    return result
 
 
 def run_local_training_preflight(
@@ -1078,8 +1204,9 @@ def run_local_training_preflight(
         else None,
         metadata=result_metadata,
         allow_unknown_override=allow_unknown_override,
+        recommendation=recommendation,
     )
-    if result.status == PreflightStatus.UNKNOWN:
+    if result.status == PreflightStatus.UNKNOWN and not result.manual_approval_allowed:
         summary = (
             f"{result.safe_summary} Live provider probes are not implemented in this slice, "
             "so launch_ready remains false until a later live preflight passes."
@@ -1308,5 +1435,6 @@ async def run_training_preflight(
         preflight_id=local.preflight_id,
         created_at=local.created_at,
         allow_unknown_override=allow_unknown_override,
+        recommendation=recommendation,
     )
     return result

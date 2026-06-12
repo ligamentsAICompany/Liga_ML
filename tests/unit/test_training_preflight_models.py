@@ -10,6 +10,7 @@ from agent.core.training_preflight import (
     TrainingPreflightCheck,
     build_training_preflight_result,
     derive_launch_ready,
+    derive_manual_approval_policy,
     run_local_training_preflight,
 )
 
@@ -311,3 +312,109 @@ def test_local_preflight_model_hardware_incompatibility_blocks_launch():
     assert result.status == PreflightStatus.FAILED
     assert result.launch_ready is False
     assert any("memory" in reason.lower() for reason in result.blocking_reasons)
+
+
+def _smoke_recommendation(*, training_goal: str = "smoke-test") -> dict:
+    return {
+        "provider": "gcp-vertex",
+        "training_goal": training_goal,
+        "output_policy": "cloud-private",
+        "recommendation": {
+            "training_goal": training_goal,
+            "estimated_cost_usd": 1.1,
+            "selected_provider": {"provider_id": "gcp-vertex"},
+            "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+            "selected_hardware": {"hardware_id": "gcp-vertex:n1-standard-8-t4"},
+        },
+    }
+
+
+def test_manual_approval_allowed_for_vertex_smoke_with_only_quota_unknown():
+    checks = [
+        TrainingPreflightCheck(
+            check_id="gcp.vertex.quota_availability",
+            provider="gcp-vertex",
+            category=PreflightCheckCategory.QUOTA,
+            label="Vertex quota",
+            status=PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.WARNING,
+            message="Quota unknown.",
+            details={"required": True},
+        )
+    ]
+    launch_ready, blocking, warnings, unknowns = derive_launch_ready(checks)
+    allowed, approval_required, reason = derive_manual_approval_policy(
+        checks,
+        provider="gcp-vertex",
+        blocking_reasons=blocking,
+        unknown_reasons=unknowns,
+        recommendation=_smoke_recommendation(),
+    )
+
+    assert launch_ready is False
+    assert allowed is True
+    assert approval_required is True
+    assert reason
+    assert "launch_ready remains false" in reason
+
+
+def test_manual_approval_disallowed_for_production_run():
+    checks = [
+        TrainingPreflightCheck(
+            check_id="gcp.vertex.quota_availability",
+            provider="gcp-vertex",
+            category=PreflightCheckCategory.QUOTA,
+            label="Vertex quota",
+            status=PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.WARNING,
+            message="Quota unknown.",
+            details={"required": True},
+        )
+    ]
+    _, blocking, _, unknowns = derive_launch_ready(checks)
+    allowed, approval_required, reason = derive_manual_approval_policy(
+        checks,
+        provider="gcp-vertex",
+        blocking_reasons=blocking,
+        unknown_reasons=unknowns,
+        recommendation=_smoke_recommendation(training_goal="production"),
+    )
+
+    assert allowed is False
+    assert approval_required is False
+    assert reason is None
+
+
+def test_manual_approval_disallowed_when_bucket_check_failed():
+    checks = [
+        TrainingPreflightCheck(
+            check_id="gcp.gcs.bucket_read",
+            provider="gcp-vertex",
+            category=PreflightCheckCategory.STORAGE,
+            label="GCS bucket",
+            status=PreflightStatus.FAILED,
+            severity=PreflightSeverity.BLOCKING,
+            message="Bucket missing.",
+            details={"required": True},
+        ),
+        TrainingPreflightCheck(
+            check_id="gcp.vertex.quota_availability",
+            provider="gcp-vertex",
+            category=PreflightCheckCategory.QUOTA,
+            label="Vertex quota",
+            status=PreflightStatus.UNKNOWN,
+            severity=PreflightSeverity.WARNING,
+            message="Quota unknown.",
+            details={"required": True},
+        ),
+    ]
+    _, blocking, _, unknowns = derive_launch_ready(checks)
+    allowed, _, _ = derive_manual_approval_policy(
+        checks,
+        provider="gcp-vertex",
+        blocking_reasons=blocking,
+        unknown_reasons=unknowns,
+        recommendation=_smoke_recommendation(),
+    )
+
+    assert allowed is False

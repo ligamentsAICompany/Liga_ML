@@ -260,6 +260,9 @@ class TrainingPreflightResultModel(BaseModel):
     warning_reasons: list[str] = Field(default_factory=list)
     unknown_reasons: list[str] = Field(default_factory=list)
     safe_summary: str = ""
+    manual_approval_allowed: bool = False
+    manual_approval_reason: str | None = None
+    approval_required: bool = False
     cache: TrainingPreflightCacheInfoModel = Field(
         default_factory=TrainingPreflightCacheInfoModel
     )

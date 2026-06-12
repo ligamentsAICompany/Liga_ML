@@ -220,6 +220,25 @@ test('preflight panel redacts secrets and signed URLs', () => {
   assert.match(panel.markdown, /\[REDACTED\]/);
 });
 
+test('preflight panel renders bounded smoke manual approval guidance', () => {
+  const panel = createTrainingPreflightPanel(result({
+    provider: 'gcp-vertex',
+    status: 'unknown',
+    launch_ready: false,
+    manual_approval_allowed: true,
+    approval_required: true,
+    manual_approval_reason:
+      'Only Vertex quota/accelerator or safe GCS write-readiness checks are unknown; bounded smoke launch requires explicit approval. launch_ready remains false.',
+    safe_summary:
+      'Training preflight unknown; launch_ready=false. Vertex accelerator availability and quota were not checked.',
+  }));
+
+  assert.match(panel.markdown, /Launch ready: no/);
+  assert.match(panel.markdown, /bounded smoke can proceed only with explicit approval/);
+  assert.match(panel.markdown, /Unknown checks are not treated as passed/);
+  assert.doesNotMatch(panel.markdown, /Launch ready: yes, pending explicit user approval/);
+});
+
 test('tool panel source recognizes training preflight without auto-running it', () => {
   assert.match(toolCallGroupSource, /training_preflight/);
   assert.doesNotMatch(toolCallGroupSource, /useEffect\([\s\S]{0,240}runTrainingPreflight/);
