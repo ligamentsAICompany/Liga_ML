@@ -242,7 +242,21 @@ def test_sft_template_loads_uploaded_gcs_jsonl_without_hf_dataset_repo():
     assert "LIGA_STAGED_TRAIN_URI={TRAIN_GCS_URI}" in script
 
 
-def test_sft_template_defaults_trackio_disabled_and_non_fatal():
+def test_sft_template_supports_prompt_chosen_rejected_auto_mapping():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="transitionGap/gst-india-preference-dataset-prep-small",
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            hub_model_id="",
+            output_policy="cloud-private",
+            dataset_source="gcs_jsonl",
+            train_gcs_uri="gs://liga-training/vertex-inputs/gst-smoke/train.jsonl",
+        )
+    )
+
+    assert '"prompt"' in script
+    assert '"chosen"' in script
+    assert '_messages_from_pair(example, "prompt", ["chosen"])' in script
     script = build_sft_training_script(
         SftTemplateConfig(
             dataset_name="example/dataset",

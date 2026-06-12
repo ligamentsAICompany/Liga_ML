@@ -847,16 +847,46 @@ class SessionManager:
         except Exception as e:
             logger.debug("Failed to derive evaluations from response rows: %s", e)
             return []
+        linked_run_id = run_id
+        linked_job_id = ""
+        if run_id and session_id:
+            run = await store.get_run(run_id)
+            if isinstance(run, dict) and str(run.get("session_id")) == session_id:
+                linked_job_id = str(run.get("active_provider_job_id") or "")
         evaluations: list[dict[str, Any]] = []
         for row in response_page.get("rows", []):
             if not isinstance(row, dict):
                 continue
+            row_run_id = str(row.get("run_id") or "")
+            row_job_id = str(row.get("job_id") or "")
+            if linked_run_id:
+                matches_run = row_run_id == linked_run_id
+                matches_job = bool(
+                    linked_job_id
+                    and row_job_id
+                    and (
+                        linked_job_id == row_job_id
+                        or linked_job_id.endswith(row_job_id)
+                        or row_job_id.endswith(linked_job_id)
+                    )
+                )
+                if not matches_run and not matches_job:
+                    continue
             context = evaluation_context_from_response_row(row)
             if not context:
                 continue
+            if linked_run_id:
+                context = {
+                    **context,
+                    "run_id": linked_run_id,
+                    "metadata": {
+                        **dict(context.get("metadata") or {}),
+                        "linked_run_id": linked_run_id,
+                        "durable_run_record_available": True,
+                        "source_limitation": "",
+                    },
+                }
             evaluation = build_post_training_evaluation(context)
-            if run_id and evaluation.get("run_id") != run_id:
-                continue
             if status and evaluation.get("status") != status:
                 continue
             evaluations.append(evaluation)
@@ -1176,6 +1206,7 @@ class SessionManager:
                 latest_training_preflight=self._serialize_training_preflight(
                     agent_session.session
                 ),
+                current_run_id=getattr(agent_session.session, "current_run_id", None),
             )
         except Exception as e:
             logger.warning(
@@ -1303,6 +1334,21 @@ class SessionManager:
             )
         if isinstance(meta.get("latest_training_preflight"), dict):
             session.latest_training_preflight = dict(meta["latest_training_preflight"])
+        restored_run_id = meta.get("current_run_id")
+        if isinstance(restored_run_id, str) and restored_run_id.strip():
+            session.current_run_id = restored_run_id.strip()
+        else:
+            try:
+                attachable = await self.latest_attachable_run(session_id)
+            except Exception as e:
+                logger.debug(
+                    "Could not resolve attachable run while restoring %s: %s",
+                    session_id,
+                    e,
+                )
+                attachable = None
+            if attachable:
+                session.current_run_id = str(attachable.get("run_id") or "")
         session.sandbox_space_id = meta.get("sandbox_space_id")
         session.sandbox_status = meta.get("sandbox_status")
 

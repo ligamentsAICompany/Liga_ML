@@ -405,21 +405,34 @@ def build_post_training_evaluation(context: dict[str, Any]) -> dict[str, Any]:
     artifact_ref = safe_context.get("artifact_ref") or safe_context.get("model_ref")
     status = "succeeded"
     failure_summary = ""
-    if training_status not in {"succeeded", "completed", "success"}:
+    if training_status in {"failed", "error", "cancelled", "canceled", "expired"}:
+        status = "failed"
+        failure_summary = (
+            "The provider job failed, so quality evaluation is unavailable "
+            "because training did not complete."
+        )
+        recommendation = (
+            "Do not use this run for demo or client-facing workflows until the "
+            "provider failure is reviewed and a successful training run exists."
+        )
+    elif training_status not in {"succeeded", "completed", "success"}:
         status = "skipped"
         failure_summary = (
             "Training did not succeed, so post-training evaluation was skipped."
         )
+        recommendation = "Do not use for client demos until a human reviews outputs and missing signals."
     elif not artifact_ref:
         status = "unavailable"
         failure_summary = (
             "No model or artifact reference was available; live inference was not run."
         )
-    recommendation = (
-        "Use for controlled demo with human review."
-        if status == "succeeded" and scores["overall_score"] >= 0.65
-        else "Do not use for client demos until a human reviews outputs and missing signals."
-    )
+        recommendation = "Do not use for client demos until a human reviews outputs and missing signals."
+    else:
+        recommendation = (
+            "Use for controlled demo with human review."
+            if scores["overall_score"] >= 0.65
+            else "Do not use for client demos until a human reviews outputs and missing signals."
+        )
     context_metadata = (
         dict(safe_context.get("metadata"))
         if isinstance(safe_context.get("metadata"), dict)
@@ -496,7 +509,12 @@ def evaluation_context_from_response_row(row: dict[str, Any]) -> dict[str, Any] 
         artifact_ref = _row_text(row.get("error"))
     provider = _row_text(row.get("platform")) or "unknown"
     job_id = _row_text(row.get("job_id")) or None
-    run_id = f"response_row:{row_id}"
+    linked_run_id = _row_text(row.get("run_id")) or None
+    run_id = linked_run_id or f"response_row:{row_id}"
+    error_reason = _row_text(row.get("error"))
+    gcs_path = _row_text(row.get("final_artifact_or_result"))
+    if gcs_path.startswith("https://console.cloud.google.com"):
+        gcs_path = ""
     return redact_json_like(
         {
             "session_id": session_id,
@@ -514,11 +532,16 @@ def evaluation_context_from_response_row(row: dict[str, Any]) -> dict[str, Any] 
             "metadata": {
                 "source": "response_row",
                 "response_row_id": row_id,
-                "source_limitation": RESPONSE_ROW_LIMITATION,
-                "durable_run_record_available": False,
+                "linked_run_id": linked_run_id,
+                "source_limitation": RESPONSE_ROW_LIMITATION
+                if not linked_run_id
+                else "",
+                "durable_run_record_available": bool(linked_run_id),
                 "result_storage": row.get("result_storage"),
                 "run_type": row.get("run_type"),
                 "terminal_progress": progress,
+                "failure_reason": error_reason or None,
+                "gcs_output_path": gcs_path or None,
                 "live_inference_used": False,
                 "paid_judge_used": False,
                 "provider_jobs_launched": False,

@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from huggingface_hub import hf_hub_download
 
+from agent.core.gcp_dataset_staging import stage_hf_dataset_to_gcs
 from agent.core.hf_tokens import resolve_hf_token
 from agent.core.redact import SECRET_KEY_RE, redact_text
 from agent.core.session import Event
@@ -426,6 +427,48 @@ class GcpVertexJobsTool:
             "source_format": str(upload.get("source_format") or ""),
         }
 
+    async def _stage_hf_dataset_for_vertex(
+        self,
+        *,
+        args: dict[str, Any],
+        display_name: str,
+        bucket: str,
+    ) -> dict[str, Any]:
+        dataset_name = str(args.get("dataset_name") or "").strip()
+        if not dataset_name:
+            raise ValueError("dataset_name is required for Hub dataset staging.")
+        max_rows = (
+            _optional_int(args.get("max_train_samples"))
+            or DEFAULT_PILOT_MAX_TRAIN_SAMPLES
+        )
+        token = (
+            getattr(self.session, "hf_token", None)
+            if self.session is not None
+            else None
+        )
+        staged = await stage_hf_dataset_to_gcs(
+            dataset_name=dataset_name,
+            dataset_config=str(args.get("dataset_config") or "").strip() or None,
+            dataset_split=str(args.get("dataset_split") or "train"),
+            gcs_bucket=bucket,
+            display_name=display_name,
+            hf_token=token,
+            max_rows=max_rows,
+            upload_file=lambda local_path, gcs_uri: self._upload_file_to_gcs(
+                local_path, gcs_uri
+            ),
+        )
+        return {
+            "dataset_source": GCS_JSONL_DATASET_SOURCE,
+            "display_dataset_source": "staged-gcs-jsonl",
+            "train_gcs_uri": staged.train_gcs_uri,
+            "staged_train_uri": staged.train_gcs_uri,
+            "train_rows": staged.row_count,
+            "source_format": staged.source_format,
+            "detected_schema": staged.detected_schema,
+            "staged_dataset_uri": staged.train_gcs_uri,
+        }
+
     def _preflight_hf_dataset(self, args: dict[str, Any]) -> None:
         # Unit tests inject fake Vertex classes and should not call live Hub APIs.
         if self.custom_job_cls is not None:
@@ -534,8 +577,20 @@ class GcpVertexJobsTool:
                         "train_rows": staged_dataset["train_rows"],
                         "source_format": staged_dataset["source_format"],
                     }
-                else:
-                    self._preflight_hf_dataset(args)
+                elif str(args.get("dataset_name") or "").strip():
+                    staged_dataset = await self._stage_hf_dataset_for_vertex(
+                        args=args,
+                        display_name=display_name,
+                        bucket=config["bucket"],
+                    )
+                    args = {
+                        **args,
+                        "dataset_source": GCS_JSONL_DATASET_SOURCE,
+                        "train_gcs_uri": staged_dataset["train_gcs_uri"],
+                        "staged_train_uri": staged_dataset["staged_train_uri"],
+                        "train_rows": staged_dataset["train_rows"],
+                        "source_format": staged_dataset["source_format"],
+                    }
                 template_config = SftTemplateConfig(
                     dataset_name=str(args.get("dataset_name") or ""),
                     dataset_config=args.get("dataset_config"),

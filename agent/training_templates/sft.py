@@ -349,6 +349,13 @@ def format_example(example):
         return {{"messages": example["messages"]}}
     if "text" in example:
         return {{"text": _string_value(example, "text")}}
+    if (
+        "prompt" in example
+        and "chosen" in example
+        and _string_value(example, "prompt")
+        and _string_value(example, "chosen")
+    ):
+        return _messages_from_pair(example, "prompt", ["chosen"])
     for user_column, assistant_column in (
         ("prompt", "completion"),
         ("instruction", "output"),
@@ -356,6 +363,8 @@ def format_example(example):
         ("input", "output"),
         ("input", "response"),
         ("question", "answer"),
+        ("user", "assistant"),
+        ("prompt", "response"),
     ):
         if user_column in example and assistant_column in example:
             return _messages_from_pair(example, user_column, [assistant_column])

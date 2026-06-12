@@ -8,6 +8,32 @@ import pytest
 from agent.tools.gcp_vertex_jobs_tool import GcpVertexJobsTool, gcp_vertex_jobs_handler
 
 
+@pytest.fixture(autouse=True)
+def _mock_hub_dataset_staging_for_vertex_tests(monkeypatch):
+    from agent.core.gcp_dataset_staging import GcpDatasetStagingResult
+
+    async def fake_stage_hf_dataset_to_gcs(**kwargs):
+        display_name = str(kwargs.get("display_name") or "vertex-job")
+        bucket = str(kwargs.get("gcs_bucket") or "liga-training")
+        train_uri = f"gs://{bucket}/vertex-inputs/{display_name}/train.jsonl"
+        return GcpDatasetStagingResult(
+            train_gcs_uri=train_uri,
+            gcs_prefix_uri=f"gs://{bucket}/vertex-inputs/{display_name}/",
+            row_count=int(kwargs.get("max_rows") or 3),
+            bytes_uploaded=256,
+            dataset_name=str(kwargs.get("dataset_name") or "test/dataset"),
+            dataset_config=kwargs.get("dataset_config"),
+            dataset_split=str(kwargs.get("dataset_split") or "train"),
+            source_format="messages",
+            detected_schema="messages",
+        )
+
+    monkeypatch.setattr(
+        "agent.tools.gcp_vertex_jobs_tool.stage_hf_dataset_to_gcs",
+        fake_stage_hf_dataset_to_gcs,
+    )
+
+
 class FakeCustomJob:
     instances = []
 
