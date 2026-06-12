@@ -130,6 +130,12 @@ def run_status_from_event(
         if state in {"cancelled", "rejected", "abandoned"}:
             return "cancelled"
     if event_type == "turn_complete":
+        if str(data.get("waiting_for_tool_approval") or "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            return "waiting_approval"
         return "succeeded"
     if event_type in {"error", "stream_error"}:
         return "failed"

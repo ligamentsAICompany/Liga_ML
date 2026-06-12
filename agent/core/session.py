@@ -129,6 +129,11 @@ class Session:
         self.current_plan: list[dict[str, str]] = []
         self._cancelled = asyncio.Event()
         self.pending_approval: Optional[dict[str, Any]] = None
+        self.pending_approval_snapshot: Optional[dict[str, Any]] = None
+        self.waiting_for_tool_approval: bool = False
+        self.skip_sandbox_preload: bool = False
+        self.consumed_approval_tool_call_ids: set[str] = set()
+        self.latest_user_prompt: str = ""
         self.current_run_id: str | None = None
         self.sandbox = None
         self.sandbox_hardware: Optional[str] = None
@@ -438,6 +443,10 @@ class Session:
         self._local_save_path = None
         self._last_heartbeat_ts = None
         self.pending_approval = None
+        self.pending_approval_snapshot = None
+        self.waiting_for_tool_approval = False
+        self.skip_sandbox_preload = False
+        self.consumed_approval_tool_call_ids = set()
         self.auto_approval_estimated_spend_usd = 0.0
         self.reset_cancel()
 
