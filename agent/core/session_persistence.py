@@ -1589,6 +1589,11 @@ class MongoSessionStore(NoopSessionStore):
         cleaned.pop("_id", None)
         cleaned["usage_id"] = usage_id
         cleaned["updated_at"] = now
+        set_fields = {
+            key: value
+            for key, value in cleaned.items()
+            if key not in {"usage_id", "created_at", "schema_version"}
+        }
         doc = await self.db.usage_entries.find_one_and_update(
             {"usage_id": usage_id},
             {
@@ -1598,7 +1603,7 @@ class MongoSessionStore(NoopSessionStore):
                     "created_at": cleaned.get("created_at") or now,
                     "schema_version": SCHEMA_VERSION,
                 },
-                "$set": cleaned,
+                "$set": set_fields,
             },
             upsert=True,
             return_document=ReturnDocument.AFTER,
