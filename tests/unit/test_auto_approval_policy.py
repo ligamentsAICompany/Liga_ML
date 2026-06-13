@@ -245,6 +245,38 @@ def test_aws_sagemaker_approval_metadata_includes_provider_dataset_and_runtime()
     }
 
 
+def test_gcp_vertex_approval_metadata_includes_preflight_summary():
+    session = SimpleNamespace(
+        training_goal="smoke-test",
+        output_policy="cloud-private",
+        uploaded_datasets=[],
+        latest_training_preflight={
+            "preflight_id": "pf-1",
+            "status": "unknown",
+            "manual_approval_allowed": True,
+            "launch_ready": False,
+        },
+    )
+
+    metadata = agent_loop._approval_metadata(
+        session,
+        "gcp_vertex_jobs",
+        {
+            "operation": "run",
+            "model_name": "Qwen/Qwen2.5-0.5B-Instruct",
+            "column_mapping": {"question": "question", "response": "response"},
+        },
+    )
+
+    assert metadata["provider"] == "gcp-vertex"
+    assert metadata["training_preflight"] == {
+        "preflight_id": "pf-1",
+        "status": "unknown",
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+    }
+
+
 def test_approval_record_adds_recoverable_identity_and_expiry():
     tc = ToolCall(
         id="call-gcp-1",
