@@ -407,3 +407,62 @@ async def test_preflight_record_creates_usage_estimate():
     )
     entries_after = await store.list_usage_entries(run_id=run_id)
     assert len(entries_after) == 1
+
+
+@pytest.mark.asyncio
+async def test_planner_handler_persists_usage_estimate():
+    from agent.tools.training_planner_tool import training_planner_handler
+
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s-planner", provider="gcp-vertex")
+    session = SimpleNamespace(
+        session_id="s-planner",
+        current_run_id=run["run_id"],
+        persistence_store=store,
+        latest_training_recommendation=None,
+        _structured_tool_outputs={},
+        cloud_provider="gcp-vertex",
+        training_goal="smoke-test",
+        output_policy="cloud-private",
+    )
+
+    async def fake_execute(self, params):
+        return {
+            "formatted": "plan ready",
+            "structured": {
+                "provider": "gcp-vertex",
+                "training_goal": "smoke-test",
+                "recommendation": {
+                    "estimated_cost_usd": 1.1,
+                    "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+                    "selected_hardware": {
+                        "display_name": "n1-standard-8 + NVIDIA_TESLA_T4",
+                        "hardware_args": {
+                            "machine_type": "n1-standard-8",
+                            "accelerator_type": "NVIDIA_TESLA_T4",
+                            "max_run_hours": 1,
+                        },
+                    },
+                },
+            },
+            "isError": False,
+        }
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "agent.tools.training_planner_tool.TrainingPlannerTool.execute",
+        fake_execute,
+    )
+    try:
+        await training_planner_handler(
+            {"operation": "recommend", "provider": "gcp-vertex"},
+            session=session,
+            tool_call_id="planner-1",
+        )
+    finally:
+        monkeypatch.undo()
+
+    entries = await store.list_usage_entries(run_id=run["run_id"])
+    assert len(entries) == 1
+    assert entries[0]["estimated_cost_usd"] == 1.1
+    assert entries[0]["tool_name"] == "training_planner"

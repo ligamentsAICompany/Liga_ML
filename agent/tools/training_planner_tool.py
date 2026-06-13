@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from agent.core.training_planner import recommend_training_plan
+from agent.core.usage import usage_from_training_recommendation
 from agent.tools.types import ToolResult
 
 
@@ -297,6 +298,22 @@ TRAINING_PLANNER_TOOL_SPEC = {
 }
 
 
+async def _persist_planner_usage(session: Any, structured: dict[str, Any]) -> None:
+    store = getattr(session, "persistence_store", None)
+    run_id = getattr(session, "current_run_id", None)
+    session_id = getattr(session, "session_id", None)
+    if store is None or not run_id or not session_id:
+        return
+    usage_update = usage_from_training_recommendation(
+        session_id=str(session_id),
+        run_id=str(run_id),
+        recommendation=structured,
+    )
+    if usage_update:
+        usage_id, entry = usage_update
+        await store.upsert_usage_entry(usage_id, entry)
+
+
 async def training_planner_handler(
     arguments: dict[str, Any],
     session: Any = None,
@@ -313,4 +330,5 @@ async def training_planner_handler(
         if tool_call_id:
             outputs[tool_call_id] = structured
         setattr(session, "latest_training_recommendation", structured)
+        await _persist_planner_usage(session, structured)
     return result["formatted"], not result.get("isError", False)

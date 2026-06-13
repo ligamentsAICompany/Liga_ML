@@ -135,6 +135,7 @@ class Session:
         self.consumed_approval_tool_call_ids: set[str] = set()
         self.latest_user_prompt: str = ""
         self.current_run_id: str | None = None
+        self.current_turn_provider_job_id: str | None = None
         self.sandbox = None
         self.sandbox_hardware: Optional[str] = None
         self.sandbox_preload_task: Optional[asyncio.Task] = None

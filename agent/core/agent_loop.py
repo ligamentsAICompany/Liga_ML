@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -253,9 +254,12 @@ def _normalized_cloud_job_state(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
-def _latest_cloud_job_state(session: Session, tool_name: str) -> str | None:
+def _latest_cloud_job_state(
+    session: Session, tool_name: str, *, job_id: str | None = None
+) -> str | None:
     """Return the latest observed state for a provider job tool in this session."""
 
+    scoped_job_id = job_id or getattr(session, "current_turn_provider_job_id", None)
     for event in reversed(getattr(session, "logged_events", []) or []):
         if not isinstance(event, dict):
             continue
@@ -263,6 +267,9 @@ def _latest_cloud_job_state(session: Session, tool_name: str) -> str | None:
             continue
         data = event.get("data") or {}
         if not isinstance(data, dict) or data.get("tool") != tool_name:
+            continue
+        event_job_id = str(data.get("jobName") or data.get("job_id") or "").strip()
+        if scoped_job_id and event_job_id and event_job_id != scoped_job_id:
             continue
         state = _normalized_cloud_job_state(data.get("state"))
         if state:
@@ -287,6 +294,9 @@ def _latest_cloud_job_state(session: Session, tool_name: str) -> str | None:
             else getattr(message, "content", "")
         )
         text = str(content or "").lower()
+        if scoped_job_id and scoped_job_id.lower() not in text:
+            if "vertex ai job submitted" not in text and "job submitted" not in text:
+                continue
         if any(
             marker in text
             for marker in (
@@ -328,18 +338,32 @@ def _latest_cloud_job_state(session: Session, tool_name: str) -> str | None:
 
 
 def _has_active_provider_job(session: Session, tool_name: str) -> bool:
-    state = _latest_cloud_job_state(session, tool_name)
+    if tool_name == "gcp_vertex_jobs":
+        job_id = getattr(session, "current_turn_provider_job_id", None)
+        if not job_id:
+            return False
+        state = _latest_cloud_job_state(session, tool_name, job_id=str(job_id))
+    else:
+        state = _latest_cloud_job_state(session, tool_name)
     if not state or state in _TERMINAL_CLOUD_JOB_STATES:
         return False
     return state in _ACTIVE_CLOUD_JOB_STATES or bool(state)
 
 
 def _has_provider_job(session: Session, tool_name: str) -> bool:
+    if tool_name == "gcp_vertex_jobs":
+        return bool(getattr(session, "current_turn_provider_job_id", None))
     return _latest_cloud_job_state(session, tool_name) is not None
 
 
 def _has_terminal_provider_job(session: Session, tool_name: str) -> bool:
-    state = _latest_cloud_job_state(session, tool_name)
+    if tool_name == "gcp_vertex_jobs":
+        job_id = getattr(session, "current_turn_provider_job_id", None)
+        if not job_id:
+            return False
+        state = _latest_cloud_job_state(session, tool_name, job_id=str(job_id))
+    else:
+        state = _latest_cloud_job_state(session, tool_name)
     return bool(state and state in _TERMINAL_CLOUD_JOB_STATES)
 
 
@@ -1729,9 +1753,7 @@ def _bounded_vertex_smoke_workflow_active(session: Session) -> bool:
         return False
     if not getattr(session, "bounded_vertex_smoke_for_turn", False):
         return False
-    if _has_active_provider_job(
-        session, "gcp_vertex_jobs"
-    ) or _has_terminal_provider_job(session, "gcp_vertex_jobs"):
+    if _has_active_provider_job(session, "gcp_vertex_jobs"):
         return False
     discovery = getattr(session, "latest_dataset_discovery", None)
     recommendation = getattr(session, "latest_training_recommendation", None)
@@ -1758,9 +1780,7 @@ def _should_continue_vertex_smoke_launch(session: Session) -> bool:
     blocking = preflight.get("blocking_reasons")
     if isinstance(blocking, list) and blocking:
         return False
-    if _has_active_provider_job(
-        session, "gcp_vertex_jobs"
-    ) or _has_terminal_provider_job(session, "gcp_vertex_jobs"):
+    if _has_active_provider_job(session, "gcp_vertex_jobs"):
         return False
     return True
 
@@ -1792,10 +1812,18 @@ def _vertex_smoke_continuation_prompt(session: Session) -> str:
 def _vertex_smoke_after_planner_prompt(session: Session) -> str:
     if _should_continue_vertex_smoke_launch(session):
         return _vertex_smoke_continuation_prompt(session)
+    preflight = _latest_training_preflight(session)
+    if not isinstance(preflight, dict) or not preflight.get("preflight_id"):
+        return (
+            "[SYSTEM: VERTEX SMOKE CONTINUATION] Dataset discovery and training "
+            "planner are complete for the bounded Google Vertex AI smoke workflow. "
+            "Call training_preflight with operation=run now using the verified "
+            "training recommendation. Do not call gcp_vertex_jobs run until live "
+            "read-only preflight completes."
+        )
     return (
-        "[SYSTEM: VERTEX SMOKE CONTINUATION] Dataset discovery and training "
-        "planner are complete for the bounded Google Vertex AI smoke workflow. "
-        "Continue toward the approval-gated launch: once live preflight shows "
+        "[SYSTEM: VERTEX SMOKE CONTINUATION] Live training preflight is complete "
+        "for the bounded Google Vertex AI smoke workflow. When "
         "manual_approval_allowed=true with bounded cost/runtime, call "
         "gcp_vertex_jobs with operation=run immediately so the user can approve "
         "the bounded launch. Do not treat unknown quota/accelerator as passed "
@@ -1865,6 +1893,60 @@ def _vertex_smoke_fallback_message(session: Session) -> str:
         "Vertex pricing/provider approval card and wait for explicit approval before "
         "launching any job."
     )
+
+
+async def _auto_run_bounded_vertex_preflight(session: Session) -> bool:
+    """Deterministically run training_preflight after planner for bounded Vertex smoke."""
+
+    if not _bounded_vertex_smoke_requires_live_preflight(session):
+        return False
+    if _latest_training_preflight(session):
+        return False
+    if _last_tool_name(session) != "training_planner":
+        return False
+    recommendation = getattr(session, "latest_training_recommendation", None)
+    if not isinstance(recommendation, dict) or not recommendation:
+        return False
+
+    from agent.tools.training_preflight_tool import (
+        execute_training_preflight_for_session,
+    )
+
+    tool_call_id = f"auto-preflight-{uuid.uuid4().hex[:8]}"
+    await session.send_event(
+        Event(
+            event_type="tool_call",
+            data={
+                "tool": "training_preflight",
+                "arguments": {"operation": "run"},
+                "tool_call_id": tool_call_id,
+            },
+        )
+    )
+    output, success, structured = await execute_training_preflight_for_session(session)
+    session.context_manager.add_message(
+        Message(
+            role="tool",
+            content=output,
+            tool_call_id=tool_call_id,
+            name="training_preflight",
+        )
+    )
+    await session.send_event(
+        Event(
+            event_type="tool_output",
+            data={
+                "tool": "training_preflight",
+                "tool_call_id": tool_call_id,
+                "output": output,
+                "success": success,
+                "structured": structured,
+            },
+        )
+    )
+    if not success:
+        session.provider_launch_blocked_for_turn = True
+    return True
 
 
 async def _emit_visible_error(
@@ -3055,6 +3137,7 @@ class Handlers:
                                 },
                             )
                         )
+                        session.provider_launch_blocked_for_turn = True
                         continue
                     decision = await _approval_decision(
                         tool_name,
@@ -3212,6 +3295,24 @@ class Handlers:
                         final_response = terminal_provider_output
                         break
 
+                    if await _auto_run_bounded_vertex_preflight(session):
+                        preflight = _latest_training_preflight(session) or {}
+                        blocking = preflight.get("blocking_reasons")
+                        if isinstance(blocking, list) and blocking:
+                            blocked_message = (
+                                "Live training preflight completed with blocking "
+                                "failures, so the bounded Google Vertex AI job was "
+                                "not launched.\n\n"
+                                + "\n".join(f"- {item}" for item in blocking)
+                            )
+                            await _emit_visible_assistant_message(
+                                session, blocked_message
+                            )
+                            final_response = blocked_message
+                            break
+                        iteration += 1
+                        continue
+
                     if _should_avoid_planning_only_stop(session):
                         last_tool = _last_tool_name(session)
                         if last_tool in {"training_planner", "training_preflight"}:
@@ -3335,6 +3436,20 @@ class Handlers:
 
                     # Return early - wait for EXEC_APPROVAL operation
                     return None
+
+                if (
+                    getattr(session, "provider_launch_blocked_for_turn", False)
+                    and not approval_required_tools
+                    and not non_approval_tools
+                ):
+                    blocked_message = (
+                        "The bounded provider job was not launched because live "
+                        "training preflight must complete before the approval "
+                        "card can be shown."
+                    )
+                    await _emit_visible_assistant_message(session, blocked_message)
+                    final_response = blocked_message
+                    break
 
                 iteration += 1
 
@@ -3779,6 +3894,7 @@ async def process_submission(session: Session, submission) -> bool:
         session.bounded_vertex_smoke_for_turn = (
             _user_explicitly_requests_bounded_provider_launch(text)
         )
+        session.current_turn_provider_job_id = None
         session.skip_sandbox_preload = (
             _user_requested_no_sandbox(text) or session.bounded_vertex_smoke_for_turn
         )
@@ -3811,6 +3927,9 @@ async def process_submission(session: Session, submission) -> bool:
                     "dataset context and normalized dataset config if present. "
                     "Before launch, respect "
                     f"training_goal={training_goal} and output_policy={output_policy}. "
+                    "For bounded smoke workflows that request live preflight, call "
+                    "training_preflight with operation=run after training_planner and "
+                    "before gcp_vertex_jobs run. "
                     "If output_policy=cloud-private, do not push final model to "
                     "Hugging Face Hub. If output_policy=hf-hub, push final model "
                     "to Hugging Face Hub. If output_policy=cloud-and-hf-hub, save "
@@ -3891,8 +4010,8 @@ async def process_submission(session: Session, submission) -> bool:
                             "[SYSTEM: This turn is a bounded Google Vertex AI "
                             "smoke workflow. Do not create sandbox or use "
                             "hf_jobs/aws_sagemaker_jobs. After dataset_discovery "
-                            "and training_planner, continue to gcp_vertex_jobs run "
-                            "when live preflight allows bounded manual approval. "
+                            "and training_planner, call training_preflight before "
+                            "gcp_vertex_jobs run when live preflight is requested. "
                             "Do not stop with a planning-only summary.]"
                         ),
                     )

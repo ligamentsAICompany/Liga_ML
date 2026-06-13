@@ -65,6 +65,10 @@ from agent.tools.training_planner_tool import (
     TRAINING_PLANNER_TOOL_SPEC,
     training_planner_handler,
 )
+from agent.tools.training_preflight_tool import (
+    TRAINING_PREFLIGHT_TOOL_SPEC,
+    training_preflight_handler,
+)
 from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC, web_search_handler
 
 # NOTE: Private HF repo tool disabled - replaced by hf_repo_files and hf_repo_git
@@ -368,6 +372,12 @@ def create_builtin_tools(local_mode: bool = False) -> list[ToolSpec]:
             description=TRAINING_PLANNER_TOOL_SPEC["description"],
             parameters=TRAINING_PLANNER_TOOL_SPEC["parameters"],
             handler=training_planner_handler,
+        ),
+        ToolSpec(
+            name=TRAINING_PREFLIGHT_TOOL_SPEC["name"],
+            description=TRAINING_PREFLIGHT_TOOL_SPEC["description"],
+            parameters=TRAINING_PREFLIGHT_TOOL_SPEC["parameters"],
+            handler=training_preflight_handler,
         ),
         ToolSpec(
             name=NOTIFY_TOOL_SPEC["name"],
