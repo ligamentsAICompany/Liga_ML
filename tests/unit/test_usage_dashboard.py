@@ -410,6 +410,50 @@ async def test_preflight_record_creates_usage_estimate():
 
 
 @pytest.mark.asyncio
+async def test_planner_then_preflight_share_one_usage_entry():
+    store = NoopSessionStore()
+    run = await store.create_run(session_id="s-shared", provider="gcp-vertex")
+    run_id = run["run_id"]
+    recommendation = {
+        "provider": "gcp-vertex",
+        "training_goal": "smoke-test",
+        "recommendation": {
+            "estimated_cost_usd": 1.1,
+            "selected_model": {"model_id": "Qwen/Qwen2.5-0.5B-Instruct"},
+            "selected_hardware": {
+                "display_name": "n1-standard-8 + NVIDIA_TESLA_T4",
+                "hardware_args": {"max_run_hours": 1},
+            },
+        },
+    }
+    await store.append_run_event(
+        run_id=run_id,
+        session_id="s-shared",
+        event_type="tool_output",
+        payload={
+            "tool": "training_planner",
+            "structured": recommendation,
+        },
+    )
+    await store.record_training_preflight(
+        session_id="s-shared",
+        run_id=run_id,
+        preflight={
+            "provider": "gcp-vertex",
+            "training_goal": "smoke-test",
+            "manual_approval_allowed": True,
+            "launch_ready": False,
+            "verified_recommendation": recommendation,
+        },
+        include_started_audit=False,
+    )
+    entries = await store.list_usage_entries(run_id=run_id)
+    assert len(entries) == 1
+    assert entries[0]["estimated_cost_usd"] == 1.1
+    assert entries[0]["tool_name"] == "training_preflight"
+
+
+@pytest.mark.asyncio
 async def test_planner_handler_persists_usage_estimate():
     from agent.tools.training_planner_tool import training_planner_handler
 
