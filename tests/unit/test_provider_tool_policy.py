@@ -3,11 +3,14 @@ from types import SimpleNamespace
 from agent.core import agent_loop
 
 
-def _session(provider="aws-sagemaker", events=None):
+def _session(
+    provider="aws-sagemaker", events=None, *, current_turn_provider_job_id=None
+):
     return SimpleNamespace(
         cloud_provider=provider,
         logged_events=events or [],
         context_manager=SimpleNamespace(items=[]),
+        current_turn_provider_job_id=current_turn_provider_job_id,
     )
 
 
@@ -144,6 +147,7 @@ def test_gcp_active_job_blocks_cross_provider_compute_tools():
                 "gcp_vertex_jobs", job_name="projects/p/locations/r/customJobs/1"
             )
         ],
+        current_turn_provider_job_id="projects/p/locations/r/customJobs/1",
     )
 
     for tool_name in ["sandbox_create", "bash", "hf_jobs", "aws_sagemaker_jobs"]:
@@ -162,6 +166,7 @@ def test_gcp_active_job_allows_vertex_monitoring_and_cancel():
                 "gcp_vertex_jobs", job_name="projects/p/locations/r/customJobs/1"
             )
         ],
+        current_turn_provider_job_id="projects/p/locations/r/customJobs/1",
     )
 
     for operation in ["inspect", "logs", "ps", "cancel"]:
@@ -180,6 +185,7 @@ def test_gcp_active_job_allows_vertex_monitoring_and_cancel():
 
 def test_gcp_active_job_can_be_inferred_from_recent_run_tool_result():
     session = _session(provider="gcp-vertex")
+    session.current_turn_provider_job_id = "projects/p/locations/r/customJobs/1"
     session.context_manager.items = [
         _tool_message(
             "gcp_vertex_jobs",
@@ -485,3 +491,70 @@ def test_bounded_vertex_run_with_preflight_allows_approval():
         )
         is None
     )
+
+
+def test_historical_vertex_ps_does_not_block_fresh_bounded_smoke_launch():
+    session = _session(
+        provider="gcp-vertex",
+        events=[
+            _tool_state(
+                "gcp_vertex_jobs",
+                state="succeeded",
+                job_name="projects/p/locations/r/customJobs/old",
+            )
+        ],
+    )
+    session.bounded_vertex_smoke_for_turn = True
+    session.training_goal = "smoke-test"
+    session.latest_dataset_discovery = {"candidates": [{"dataset_id": "ds"}]}
+    session.latest_training_recommendation = {"provider": "gcp-vertex"}
+    session.latest_training_preflight = {
+        "preflight_id": "pf-1",
+        "manual_approval_allowed": True,
+        "launch_ready": False,
+        "blocking_reasons": [],
+    }
+
+    assert agent_loop._bounded_vertex_smoke_workflow_active(session) is True
+    assert agent_loop._should_continue_vertex_smoke_launch(session) is True
+    assert (
+        agent_loop._provider_tool_policy_violation(
+            session,
+            "gcp_vertex_jobs",
+            {"operation": "run"},
+        )
+        is None
+    )
+
+
+def test_active_current_turn_vertex_job_blocks_duplicate_launch():
+    session = _session(
+        provider="gcp-vertex",
+        events=[
+            _tool_state(
+                "gcp_vertex_jobs",
+                state="running",
+                job_name="projects/p/locations/r/customJobs/current",
+            )
+        ],
+        current_turn_provider_job_id="projects/p/locations/r/customJobs/current",
+    )
+
+    violation = agent_loop._provider_tool_policy_violation(
+        session,
+        "gcp_vertex_jobs",
+        {"operation": "run"},
+    )
+
+    assert violation is not None
+    assert "Provider is Google Cloud Vertex AI" in violation
+
+
+def test_vertex_smoke_after_planner_prompt_requires_preflight_first():
+    session = _session(provider="gcp-vertex")
+    session.latest_training_recommendation = {"provider": "gcp-vertex"}
+
+    prompt = agent_loop._vertex_smoke_after_planner_prompt(session)
+
+    assert "training_preflight" in prompt
+    assert "Do not call gcp_vertex_jobs run until" in prompt

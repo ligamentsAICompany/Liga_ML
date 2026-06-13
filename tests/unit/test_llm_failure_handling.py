@@ -375,6 +375,58 @@ async def test_vertex_terminal_failure_ends_turn_without_extra_llm_retry(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_bounded_vertex_run_without_preflight_marks_run_blocked(monkeypatch):
+    session = _session()
+    session.cloud_provider = "gcp-vertex"
+    session.training_goal = "smoke-test"
+    session.bounded_vertex_smoke_for_turn = True
+    calls = 0
+
+    async def fake_call_llm_non_streaming(session, messages, tools, llm_params):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise AssertionError("blocked provider launch should end the turn")
+        return LLMResult(
+            content=None,
+            tool_calls_acc={
+                0: {
+                    "id": "call_vertex_run",
+                    "function": {
+                        "name": "gcp_vertex_jobs",
+                        "arguments": json.dumps({"operation": "run"}),
+                    },
+                }
+            },
+            token_count=10,
+            finish_reason="tool_calls",
+        )
+
+    monkeypatch.setattr(
+        agent_loop, "_resolve_llm_params", lambda *_, **__: {"model": "openai/test"}
+    )
+    monkeypatch.setattr(
+        agent_loop, "_call_llm_non_streaming", fake_call_llm_non_streaming
+    )
+
+    await Handlers.run_agent(session, "launch bounded vertex smoke")
+
+    events = await _drain_events(session)
+    assert calls == 1
+    assert any(
+        event.event_type == "tool_state_change"
+        and (event.data or {}).get("state") == "blocked"
+        for event in events
+    )
+    assert any(
+        event.event_type == "turn_complete"
+        and (event.data or {}).get("run_outcome") == "provider_launch_blocked"
+        for event in events
+    )
+    assert session.provider_launch_blocked_for_turn is False
+
+
+@pytest.mark.asyncio
 async def test_gcp_provider_note_strongly_routes_training_to_vertex(monkeypatch):
     session = _session()
     seen_messages = []

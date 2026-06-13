@@ -731,6 +731,8 @@ class GcpVertexJobsTool:
             config["project"], config["region"], resource_name
         )
         if self.session and self.tool_call_id:
+            if hasattr(self.session, "current_turn_provider_job_id"):
+                self.session.current_turn_provider_job_id = resource_name
             await self.session.send_event(
                 Event(
                     event_type="tool_state_change",
