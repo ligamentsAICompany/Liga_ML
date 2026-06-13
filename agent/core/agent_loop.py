@@ -1299,7 +1299,11 @@ def _approval_metadata(
             "manual_approval_allowed": preflight.get("manual_approval_allowed"),
             "launch_ready": preflight.get("launch_ready"),
         }
-    return {key: value for key, value in metadata.items() if value not in {None, ""}}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if value is not None and (not isinstance(value, str) or value.strip())
+    }
 
 
 def _approval_record(
