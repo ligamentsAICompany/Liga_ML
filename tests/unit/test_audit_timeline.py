@@ -9,6 +9,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from agent.core.audit import (  # noqa: E402
+    audit_events_from_terminal_response_row,
     audit_timeline_enabled,
     build_audit_event,
     event_from_run_event,
@@ -380,3 +381,71 @@ def test_sanitize_audit_metadata_redacts_secret_like_values():
         "safe_url": "https://huggingface.co/jobs/1",
         "message": "AWS_SECRET_ACCESS_KEY=[REDACTED]",
     }
+
+
+def test_terminal_response_row_emits_provider_job_completed_once():
+    job_id = "projects/demo/locations/us-central1/customJobs/456"
+    row = {
+        "platform": "gcp-vertex",
+        "job_id": job_id,
+        "progress": "completed",
+        "completed_at": "2026-06-17T15:34:34+00:00",
+        "final_artifact_or_result": "gs://liga-ml/vertex-outputs/smoke",
+        "provider_metadata": {
+            "state": "JOB_STATE_SUCCEEDED",
+            "jobUrl": "https://console.cloud.google.com/vertex-ai/jobs/456",
+        },
+    }
+    events = audit_events_from_terminal_response_row(
+        session_id="s1",
+        run_id="r1",
+        row=row,
+    )
+    assert len(events) == 1
+    assert events[0]["event_type"] == "provider_job_completed"
+    assert events[0]["job_id"] == job_id
+    assert events[0]["artifact_url"] == "gs://liga-ml/vertex-outputs/smoke"
+    assert "sk-" not in str(events[0]).lower()
+
+
+def test_terminal_response_row_emits_provider_job_failed():
+    events = audit_events_from_terminal_response_row(
+        session_id="s1",
+        run_id="r1",
+        row={
+            "platform": "gcp-vertex",
+            "job_id": "projects/demo/locations/us-central1/customJobs/789",
+            "progress": "failed",
+            "error": "worker crashed",
+            "provider_metadata": {"state": "JOB_STATE_FAILED"},
+        },
+    )
+    assert events[0]["event_type"] == "provider_job_failed"
+    assert events[0]["error_summary"] == "worker crashed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_response_row_audit_sync_is_idempotent(monkeypatch):
+    monkeypatch.setenv("AUDIT_TIMELINE_ENABLED", "true")
+    store = NoopSessionStore()
+    store.enabled = True
+    run = await store.create_run(session_id="s-audit", provider="gcp-vertex")
+    run_id = run["run_id"]
+    job_id = "projects/demo/locations/us-central1/customJobs/456"
+    await store.update_run(run_id, active_provider_job_id=job_id)
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+    row = {
+        "session_id": "s-audit",
+        "job_id": job_id,
+        "platform": "gcp-vertex",
+        "progress": "completed",
+        "final_artifact_or_result": "gs://liga-ml/vertex-outputs/smoke",
+        "provider_metadata": {"state": "JOB_STATE_SUCCEEDED"},
+    }
+    assert await agent._sync_usage_and_audit_from_terminal_response_rows([row]) is True
+    assert await agent._sync_usage_and_audit_from_terminal_response_rows([row]) is False
+    events = await store.list_audit_events(session_id="s-audit")
+    completed = [
+        event for event in events if event["event_type"] == "provider_job_completed"
+    ]
+    assert len(completed) == 1
