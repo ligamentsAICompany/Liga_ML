@@ -80,6 +80,7 @@ import user_quotas
 
 from agent.core.aws_readiness import build_aws_sagemaker_readiness_snapshot
 from agent.core.audit import (
+    audit_events_from_terminal_response_row,
     audit_store_status,
     audit_timeline_enabled,
     build_audit_event,
@@ -105,7 +106,10 @@ from agent.core.session_persistence import session_store_status
 from agent.core.training_preflight import (
     run_training_preflight as execute_training_preflight,
 )
-from agent.core.usage import usage_dashboard_enabled
+from agent.core.usage import (
+    usage_dashboard_enabled,
+    usage_updates_from_terminal_response_row,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1900,6 +1904,87 @@ def _provider_state_from_response_row(row: dict[str, Any]) -> str:
     return ""
 
 
+async def _resolve_run_id_for_terminal_row(
+    store: Any,
+    *,
+    session_id: str,
+    job_id: str,
+) -> str | None:
+    if not job_id or not hasattr(store, "list_runs"):
+        return None
+    runs = await store.list_runs(session_id)
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        active_job = str(run.get("active_provider_job_id") or "")
+        if active_job and (
+            active_job == job_id
+            or active_job.endswith(job_id)
+            or job_id.endswith(active_job)
+        ):
+            return str(run.get("run_id") or run.get("_id") or "") or None
+    return None
+
+
+async def _sync_usage_and_audit_from_terminal_response_rows(
+    rows: list[dict[str, Any]],
+) -> bool:
+    """Update provider usage entries and audit events for terminal response rows."""
+    store = session_manager.persistence_store
+    if not getattr(store, "enabled", False):
+        return False
+    updated_any = False
+    for row in rows:
+        progress = str(row.get("progress") or "").lower()
+        if progress not in TERMINAL_RESPONSE_PROGRESS:
+            continue
+        session_id = str(row.get("session_id") or "")
+        job_id = str(row.get("job_id") or "")
+        if not session_id:
+            continue
+        run_id = await _resolve_run_id_for_terminal_row(
+            store, session_id=session_id, job_id=job_id
+        )
+        if hasattr(store, "list_usage_entries"):
+            existing = await store.list_usage_entries(
+                session_id=session_id,
+                run_id=run_id,
+                limit=50,
+            )
+            for usage_id, fields in usage_updates_from_terminal_response_row(
+                session_id=session_id,
+                run_id=run_id,
+                row=row,
+                existing=existing,
+            ):
+                await store.upsert_usage_entry(usage_id, fields)
+                updated_any = True
+        if audit_timeline_enabled() and hasattr(store, "record_audit_event"):
+            events = audit_events_from_terminal_response_row(
+                session_id=session_id,
+                run_id=run_id,
+                row=row,
+            )
+            if events:
+                existing_audit = await store.list_audit_events(
+                    session_id=session_id, limit=500
+                )
+                existing_keys = {
+                    str(item.get("idempotency_key") or item.get("audit_id") or "")
+                    for item in existing_audit
+                }
+                for event in events:
+                    key = str(
+                        event.get("idempotency_key") or event.get("audit_id") or ""
+                    )
+                    if key in existing_keys:
+                        continue
+                    await store.record_audit_event(event)
+                    existing_keys.add(key)
+                    updated_any = True
+    return updated_any
+
+
 async def _sync_runs_from_terminal_response_rows(
     rows: list[dict[str, Any]],
 ) -> bool:
@@ -1994,7 +2079,8 @@ async def _sync_runs_from_terminal_response_rows(
             )
             updated_any = True
             break
-    return updated_any
+    usage_audit_updated = await _sync_usage_and_audit_from_terminal_response_rows(rows)
+    return updated_any or usage_audit_updated
 
 
 async def _refresh_stale_gcp_rows_from_vertex(

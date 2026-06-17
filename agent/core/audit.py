@@ -1052,6 +1052,104 @@ def _provider_job_events(
     return events
 
 
+def audit_events_from_terminal_response_row(
+    *,
+    session_id: str,
+    run_id: str | None,
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Emit terminal provider audit events when response refresh observes completion."""
+    progress = str(row.get("progress") or "").lower()
+    row_metadata = dict(row.get("provider_metadata") or {})
+    provider_state = str(
+        row_metadata.get("state") or row_metadata.get("provider_state") or ""
+    )
+    provider = normalize_provider(row.get("platform"))
+    job_id = str(row.get("job_id") or "")
+    if provider == "unknown" or not job_id:
+        return []
+    artifact_url = row.get("final_artifact_or_result") or row_metadata.get("outputDir")
+    job_url = row_metadata.get("jobUrl")
+    error_summary = row.get("error") or row_metadata.get("failureReason")
+    completed_at_raw = row.get("completed_at")
+    timestamp = None
+    if isinstance(completed_at_raw, str) and completed_at_raw.strip():
+        try:
+            timestamp = datetime.fromisoformat(completed_at_raw.replace("Z", "+00:00"))
+        except ValueError:
+            timestamp = None
+
+    if progress in {"completed", "succeeded", "success"} or provider_state in {
+        "JOB_STATE_SUCCEEDED",
+        "SUCCEEDED",
+    }:
+        event_type = "provider_job_completed"
+        status = "completed"
+        severity = "info"
+        title = f"{provider} job completed"
+        message = f"{provider} job {job_id} completed successfully."
+    elif progress in {"failed", "error", "blocked"} or provider_state in {
+        "JOB_STATE_FAILED",
+        "FAILED",
+        "JOB_STATE_EXPIRED",
+        "EXPIRED",
+    }:
+        event_type = "provider_job_failed"
+        status = "failed"
+        severity = "error"
+        title = f"{provider} job failed"
+        message = _safe_text(error_summary, 500) or f"{provider} job {job_id} failed."
+    elif (
+        progress in {"cancelled", "canceled", "interrupted"}
+        or "CANCEL" in provider_state
+    ):
+        event_type = "provider_job_cancelled"
+        status = "cancelled"
+        severity = "warning"
+        title = f"{provider} job cancelled"
+        message = f"{provider} job {job_id} was cancelled."
+    else:
+        return []
+
+    safe_metadata = sanitize_metadata(
+        {
+            "provider": provider,
+            "job_id": job_id,
+            "provider_state": provider_state or None,
+            "status": progress or status,
+            "session_id": session_id,
+            "run_id": run_id,
+            "gcs_output_path": artifact_url,
+            "completed_at": completed_at_raw,
+            "refreshed_from": row_metadata.get("refreshed_from"),
+        }
+    )
+    return [
+        build_audit_event(
+            session_id=session_id,
+            run_id=run_id,
+            event_type=event_type,
+            category="provider_job",
+            severity=severity,
+            status=status,
+            actor="provider",
+            title=title,
+            message=message,
+            provider=provider,
+            entity_type="provider_job",
+            entity_id=job_id,
+            tool_name=row_metadata.get("tool"),
+            job_id=job_id,
+            job_url=job_url,
+            artifact_url=artifact_url,
+            error_summary=error_summary,
+            safe_metadata=safe_metadata,
+            timestamp=timestamp,
+            idempotency_key=f"{session_id}:{run_id or ''}:{event_type}:{job_id}",
+        )
+    ]
+
+
 def summarize_audit_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     by_category: dict[str, int] = {}
     by_severity: dict[str, int] = {}

@@ -622,6 +622,99 @@ def usage_from_training_preflight(
     return usage_id, entry
 
 
+def _job_ids_match(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    return left == right or left.endswith(right) or right.endswith(left)
+
+
+def terminal_usage_status_from_response_progress(progress: str) -> str | None:
+    return {
+        "completed": "succeeded",
+        "succeeded": "succeeded",
+        "success": "succeeded",
+        "failed": "failed",
+        "error": "failed",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+        "interrupted": "cancelled",
+        "blocked": "failed",
+    }.get(str(progress or "").lower())
+
+
+def usage_updates_from_terminal_response_row(
+    *,
+    session_id: str,
+    run_id: str | None,
+    row: dict[str, Any],
+    existing: Iterable[dict[str, Any]] = (),
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return usage upserts when a durable response row reaches terminal state."""
+    terminal_status = terminal_usage_status_from_response_progress(
+        str(row.get("progress") or "")
+    )
+    if not terminal_status:
+        return []
+    provider = normalize_provider(row.get("platform"))
+    if provider == "unknown":
+        return []
+    job_id = str(row.get("job_id") or "")
+    row_metadata = dict(row.get("provider_metadata") or {})
+    artifact = row.get("final_artifact_or_result") or row_metadata.get("outputDir")
+    job_url = row_metadata.get("jobUrl")
+    completed_at = row.get("completed_at") or utc_now()
+    updates: list[tuple[str, dict[str, Any]]] = []
+    for entry in existing:
+        if str(entry.get("session_id") or "") != session_id:
+            continue
+        if run_id and str(entry.get("run_id") or "") != run_id:
+            continue
+        entry_provider = normalize_provider(
+            entry.get("provider"), entry.get("tool_name")
+        )
+        if entry_provider != provider:
+            continue
+        if entry.get("tool_name") in {"training_planner", "training_preflight"}:
+            continue
+        operation = str(entry.get("operation") or "")
+        if (
+            operation not in {"run", ""}
+            and entry.get("tool_name") not in PROVIDER_BY_TOOL
+        ):
+            continue
+        entry_job = str(entry.get("job_id") or "")
+        if job_id and entry_job and not _job_ids_match(entry_job, job_id):
+            continue
+        if (
+            job_id
+            and not entry_job
+            and str(entry.get("status") or "")
+            not in {"running", "approved", "approval_required"}
+        ):
+            continue
+        current_status = str(entry.get("status") or "")
+        if current_status in TERMINAL_STATES and current_status == terminal_status:
+            continue
+        usage_id = str(entry.get("usage_id") or "")
+        if not usage_id:
+            continue
+        fields: dict[str, Any] = {
+            "status": terminal_status,
+            "updated_at": utc_now(),
+            "completed_at": completed_at,
+        }
+        if job_id:
+            fields["job_id"] = job_id
+        if job_url:
+            fields["job_url"] = job_url
+        if artifact:
+            fields["artifact_url"] = artifact
+        if row.get("error"):
+            fields["error_summary"] = str(row.get("error"))[:500]
+        updates.append((usage_id, fields))
+    return updates
+
+
 def usage_from_run_terminal(
     *,
     run_id: str,

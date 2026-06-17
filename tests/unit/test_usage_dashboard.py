@@ -510,3 +510,164 @@ async def test_planner_handler_persists_usage_estimate():
     assert len(entries) == 1
     assert entries[0]["estimated_cost_usd"] == 1.1
     assert entries[0]["tool_name"] == "training_planner"
+
+
+def test_terminal_response_row_updates_running_usage_to_succeeded():
+    from agent.core.usage import usage_updates_from_terminal_response_row
+
+    job_id = "projects/demo/locations/us-central1/customJobs/456"
+    existing = [
+        {
+            "usage_id": "run-1:approval:tc1",
+            "session_id": "s1",
+            "run_id": "run-1",
+            "provider": "gcp-vertex",
+            "tool_name": "gcp_vertex_jobs",
+            "operation": "run",
+            "job_id": job_id,
+            "status": "running",
+            "estimated_cost_usd": 1.1,
+            "known_cost_usd": None,
+        }
+    ]
+    updates = usage_updates_from_terminal_response_row(
+        session_id="s1",
+        run_id="run-1",
+        row={
+            "platform": "gcp-vertex",
+            "job_id": job_id,
+            "progress": "completed",
+            "completed_at": "2026-06-17T15:34:34+00:00",
+            "final_artifact_or_result": "gs://liga-ml/vertex-outputs/smoke",
+            "provider_metadata": {
+                "state": "JOB_STATE_SUCCEEDED",
+                "jobUrl": "https://console.cloud.google.com/vertex-ai/jobs/456",
+            },
+        },
+        existing=existing,
+    )
+    assert len(updates) == 1
+    usage_id, fields = updates[0]
+    assert usage_id == "run-1:approval:tc1"
+    assert fields["status"] == "succeeded"
+    assert fields["artifact_url"] == "gs://liga-ml/vertex-outputs/smoke"
+    assert "estimated_cost_usd" not in fields
+
+
+def test_terminal_response_row_updates_running_usage_to_failed():
+    from agent.core.usage import usage_updates_from_terminal_response_row
+
+    job_id = "projects/demo/locations/us-central1/customJobs/789"
+    existing = [
+        {
+            "usage_id": "run-2:approval:tc2",
+            "session_id": "s2",
+            "run_id": "run-2",
+            "provider": "gcp-vertex",
+            "tool_name": "gcp_vertex_jobs",
+            "operation": "run",
+            "job_id": job_id,
+            "status": "running",
+            "estimated_cost_usd": 1.1,
+        }
+    ]
+    updates = usage_updates_from_terminal_response_row(
+        session_id="s2",
+        run_id="run-2",
+        row={
+            "platform": "gcp-vertex",
+            "job_id": job_id,
+            "progress": "failed",
+            "error": "worker crashed",
+            "provider_metadata": {"state": "JOB_STATE_FAILED"},
+        },
+        existing=existing,
+    )
+    assert updates[0][1]["status"] == "failed"
+    assert updates[0][1]["error_summary"] == "worker crashed"
+
+
+def test_terminal_response_row_usage_update_is_idempotent():
+    from agent.core.usage import usage_updates_from_terminal_response_row
+
+    job_id = "projects/demo/locations/us-central1/customJobs/456"
+    existing = [
+        {
+            "usage_id": "run-1:approval:tc1",
+            "session_id": "s1",
+            "run_id": "run-1",
+            "provider": "gcp-vertex",
+            "operation": "run",
+            "job_id": job_id,
+            "status": "succeeded",
+        }
+    ]
+    row = {
+        "platform": "gcp-vertex",
+        "job_id": job_id,
+        "progress": "completed",
+        "provider_metadata": {"state": "JOB_STATE_SUCCEEDED"},
+    }
+    assert (
+        usage_updates_from_terminal_response_row(
+            session_id="s1",
+            run_id="run-1",
+            row=row,
+            existing=existing,
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_response_row_sync_updates_usage_entry(monkeypatch):
+    from agent.core.usage import usage_from_approval_tool
+
+    monkeypatch.setenv("AUDIT_TIMELINE_ENABLED", "true")
+    store = NoopSessionStore()
+    store.enabled = True
+    run = await store.create_run(session_id="s-terminal", provider="gcp-vertex")
+    run_id = run["run_id"]
+    job_id = "projects/demo/locations/us-central1/customJobs/999"
+    usage_id, entry = usage_from_approval_tool(
+        session_id="s-terminal",
+        run_id=run_id,
+        tool_payload={
+            "tool": "gcp_vertex_jobs",
+            "provider": "gcp-vertex",
+            "tool_call_id": "tc9",
+            "estimated_cost_usd": 1.1,
+            "arguments": {
+                "operation": "run",
+                "machine_type": "n1-standard-8",
+                "accelerator_type": "NVIDIA_TESLA_T4",
+                "max_run_hours": 1,
+            },
+        },
+        event_payload={},
+    )
+    entry["status"] = "running"
+    entry["job_id"] = job_id
+    await store.upsert_usage_entry(usage_id, entry)
+    await store.update_run(run_id, active_provider_job_id=job_id)
+
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+    updated = await agent._sync_usage_and_audit_from_terminal_response_rows(
+        [
+            {
+                "session_id": "s-terminal",
+                "job_id": job_id,
+                "platform": "gcp-vertex",
+                "progress": "completed",
+                "completed_at": "2026-06-17T15:34:34+00:00",
+                "final_artifact_or_result": "gs://liga-ml/vertex-outputs/smoke",
+                "provider_metadata": {"state": "JOB_STATE_SUCCEEDED"},
+            }
+        ]
+    )
+    assert updated is True
+    synced = (await store.list_usage_entries(run_id=run_id))[0]
+    assert synced["status"] == "succeeded"
+    assert synced["estimated_cost_usd"] == 1.1
+    assert synced.get("known_cost_usd") in (None, 0)
+    assert synced["artifact_url"] == "gs://liga-ml/vertex-outputs/smoke"

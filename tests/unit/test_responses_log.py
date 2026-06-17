@@ -17,7 +17,7 @@ from responses_log import (  # noqa: E402
     paginate_response_rows,
     redact_response_value,
 )
-from agent.core.session_persistence import MongoSessionStore  # noqa: E402
+from agent.core.session_persistence import MongoSessionStore, NoopSessionStore  # noqa: E402
 from routes import agent  # noqa: E402
 
 
@@ -1110,6 +1110,32 @@ class _DurableResponseStore:
         )
 
 
+class _FullDurableStore(NoopSessionStore):
+    """Noop session store with durable response rows for route integration tests."""
+
+    enabled = True
+
+    def __init__(self):
+        super().__init__()
+        self.response_rows: list[dict[str, Any]] = []
+
+    async def upsert_response_rows(self, rows, **_kwargs):
+        if not rows:
+            return
+        self.response_rows = [dict(row) for row in rows]
+
+    async def list_response_rows(self, **kwargs):
+        filter_kwargs = {
+            key: value for key, value in kwargs.items() if key != "user_id"
+        }
+        rows = filter_response_rows(self.response_rows, **filter_kwargs)
+        return paginate_response_rows(
+            rows,
+            page=kwargs.get("page", 1),
+            page_size=kwargs.get("page_size", 50),
+        )
+
+
 class _StoreBackedManager:
     def __init__(self):
         self.persistence_store = _DurableResponseStore()
@@ -1612,3 +1638,86 @@ async def test_terminal_completed_vertex_response_row_syncs_run_to_succeeded(
     assert run["status"] == "succeeded"
     assert run["provider_metadata"]["provider_status"] == "completed"
     assert run["provider_metadata"]["provider_state"] == "JOB_STATE_SUCCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_vertex_refresh_syncs_usage_and_audit(monkeypatch):
+    from agent.core.usage import usage_from_approval_tool
+
+    monkeypatch.setenv("AUDIT_TIMELINE_ENABLED", "true")
+    manager = SimpleNamespace(persistence_store=_FullDurableStore())
+    job_name = "projects/p/locations/us/customJobs/456"
+    run = await manager.persistence_store.create_run(
+        session_id="persisted", provider="gcp-vertex"
+    )
+    run_id = run["run_id"]
+    usage_id, entry = usage_from_approval_tool(
+        session_id="persisted",
+        run_id=run_id,
+        tool_payload={
+            "tool": "gcp_vertex_jobs",
+            "provider": "gcp-vertex",
+            "tool_call_id": "tc-vertex",
+            "estimated_cost_usd": 1.1,
+            "arguments": {"operation": "run", "max_run_hours": 1},
+        },
+        event_payload={},
+    )
+    entry["status"] = "running"
+    entry["job_id"] = job_name
+    await manager.persistence_store.upsert_usage_entry(usage_id, entry)
+    await manager.persistence_store.update_run(run_id, active_provider_job_id=job_name)
+    await manager.persistence_store.upsert_response_rows(
+        [
+            {
+                "id": f"persisted:gcp-vertex:{job_name}",
+                "display_session_number": 13,
+                "actual_sequence_number": 13,
+                "batch_number": 1,
+                "session_id": "persisted",
+                "short_session_id": "persiste",
+                "session_title": "Persisted Vertex run",
+                "model_name": "moonshotai/Kimi-K2.6",
+                "platform": "gcp-vertex",
+                "run_type": "smoke-test",
+                "result_storage": "cloud-and-hf-hub",
+                "progress": "running",
+                "job_id": job_name,
+                "final_artifact_or_result": "gs://liga-output/job-456",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": None,
+                "provider_metadata": {"state": "JOB_STATE_RUNNING"},
+            }
+        ]
+    )
+    monkeypatch.setattr(agent, "session_manager", manager)
+
+    async def fake_describe_vertex(job_id):
+        return SimpleNamespace(
+            state="JOB_STATE_SUCCEEDED",
+            update_time=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+            end_time=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+            output_dir="gs://liga-output/job-456",
+            job_url="https://console.cloud.google.com/vertex-ai/jobs/456",
+        )
+
+    refreshed = await agent._refresh_stale_gcp_rows_from_vertex(
+        list(manager.persistence_store.response_rows),
+        user_id="dev",
+        describe_job=fake_describe_vertex,
+    )
+
+    assert refreshed is True
+    usage = (await manager.persistence_store.list_usage_entries(run_id=run_id))[0]
+    assert usage["status"] == "succeeded"
+    assert usage["estimated_cost_usd"] == 1.1
+    audit_events = await manager.persistence_store.list_audit_events(
+        session_id="persisted"
+    )
+    completed = [
+        event
+        for event in audit_events
+        if event["event_type"] == "provider_job_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["job_id"] == job_name
