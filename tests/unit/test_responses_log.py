@@ -2,6 +2,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1507,3 +1508,107 @@ async def test_responses_routes_refresh_stale_gcp_rows_from_vertex_describe(
     assert row["final_artifact_or_result"] == "gs://liga-output/job-456"
     assert row["provider_metadata"]["state"] == "JOB_STATE_SUCCEEDED"
     assert row["provider_metadata"]["refreshed_from"] == "gcp_vertex_describe"
+
+
+class _RunSyncStore:
+    enabled = True
+
+    def __init__(self):
+        self.runs: dict[str, dict[str, Any]] = {}
+
+    async def list_runs(self, session_id: str):
+        return [
+            dict(run)
+            for run in self.runs.values()
+            if str(run.get("session_id")) == session_id
+        ]
+
+    async def update_run(self, run_id: str, **fields):
+        run = dict(self.runs[run_id])
+        run.update(fields)
+        self.runs[run_id] = run
+        return run
+
+
+@pytest.mark.asyncio
+async def test_terminal_failed_vertex_response_row_syncs_run_to_failed(monkeypatch):
+    store = _RunSyncStore()
+    job_id = "projects/demo/locations/us-central1/customJobs/123"
+    store.runs["run-1"] = {
+        "_id": "run-1",
+        "run_id": "run-1",
+        "session_id": "session-1",
+        "status": "succeeded",
+        "completed_at": "2026-06-13T03:53:49+00:00",
+        "active_provider_job_id": job_id,
+        "provider_metadata": {
+            "provider": "gcp-vertex",
+            "provider_status": "running",
+            "status": "running",
+        },
+    }
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+
+    updated = await agent._sync_runs_from_terminal_response_rows(
+        [
+            {
+                "session_id": "session-1",
+                "job_id": job_id,
+                "progress": "failed",
+                "completed_at": "2026-06-13T03:55:34+00:00",
+                "final_artifact_or_result": "gs://liga-ml/vertex-staging/job",
+                "provider_metadata": {
+                    "state": "JOB_STATE_FAILED",
+                    "jobUrl": "https://console.cloud.google.com/vertex-ai/jobs/123",
+                },
+            }
+        ]
+    )
+
+    assert updated is True
+    run = store.runs["run-1"]
+    assert run["status"] == "failed"
+    assert run["completed_at"] == "2026-06-13T03:55:34+00:00"
+    assert run["provider_metadata"]["provider_status"] == "failed"
+    assert run["provider_metadata"]["status"] == "failed"
+    assert run["provider_metadata"]["provider_state"] == "JOB_STATE_FAILED"
+    assert run["result_summary"] == "provider_failed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_completed_vertex_response_row_syncs_run_to_succeeded(
+    monkeypatch,
+):
+    store = _RunSyncStore()
+    job_id = "projects/demo/locations/us-central1/customJobs/456"
+    store.runs["run-2"] = {
+        "_id": "run-2",
+        "run_id": "run-2",
+        "session_id": "session-2",
+        "status": "waiting_provider",
+        "active_provider_job_id": job_id,
+        "provider_metadata": {
+            "provider": "gcp-vertex",
+            "provider_status": "running",
+        },
+    }
+    monkeypatch.setattr(agent.session_manager, "persistence_store", store)
+
+    updated = await agent._sync_runs_from_terminal_response_rows(
+        [
+            {
+                "session_id": "session-2",
+                "job_id": job_id,
+                "progress": "completed",
+                "completed_at": "2026-06-13T04:00:00+00:00",
+                "final_artifact_or_result": "gs://liga-ml/vertex-outputs/model",
+                "provider_metadata": {"state": "JOB_STATE_SUCCEEDED"},
+            }
+        ]
+    )
+
+    assert updated is True
+    run = store.runs["run-2"]
+    assert run["status"] == "succeeded"
+    assert run["provider_metadata"]["provider_status"] == "completed"
+    assert run["provider_metadata"]["provider_state"] == "JOB_STATE_SUCCEEDED"

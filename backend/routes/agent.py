@@ -1630,6 +1630,7 @@ async def _sync_response_rows(
     store = session_manager.persistence_store
     if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
         await store.upsert_response_rows(response_log["rows"], user_id=user_id)
+        await _sync_runs_from_terminal_response_rows(response_log["rows"])
     return response_log["rows"]
 
 
@@ -1877,8 +1878,26 @@ async def _refresh_stale_hf_rows_from_hub(
     store = session_manager.persistence_store
     if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
         await store.upsert_response_rows(refreshed, user_id=user_id)
+        await _sync_runs_from_terminal_response_rows(refreshed)
         return True
     return False
+
+
+def _provider_state_from_response_row(row: dict[str, Any]) -> str:
+    row_metadata = dict(row.get("provider_metadata") or {})
+    state = str(row_metadata.get("state") or row_metadata.get("provider_state") or "")
+    if state:
+        return state
+    progress = str(row.get("progress") or "").lower()
+    if progress == "completed":
+        return "JOB_STATE_SUCCEEDED"
+    if progress in {"failed", "error"}:
+        return "JOB_STATE_FAILED"
+    if progress in {"cancelled", "canceled"}:
+        return "JOB_STATE_CANCELLED"
+    if progress == "interrupted":
+        return "JOB_STATE_CANCELLED"
+    return ""
 
 
 async def _sync_runs_from_terminal_response_rows(
@@ -1931,22 +1950,38 @@ async def _sync_runs_from_terminal_response_rows(
                 job_id and not active_job and run.get("status") in RUN_TERMINAL_STATUSES
             ):
                 continue
-            if str(run.get("status") or "") == target_status and run.get(
-                "completed_at"
+            provider_metadata = dict(run.get("provider_metadata") or {})
+            current_provider_status = str(
+                provider_metadata.get("provider_status")
+                or provider_metadata.get("status")
+                or ""
+            ).lower()
+            if (
+                str(run.get("status") or "") == target_status
+                and run.get("completed_at")
+                and current_provider_status == progress
             ):
                 continue
-            provider_metadata = dict(run.get("provider_metadata") or {})
+            provider_state = _provider_state_from_response_row(row)
+            row_metadata = dict(row.get("provider_metadata") or {})
             provider_metadata.update(
                 {
                     "provider_status": progress,
+                    "status": progress,
+                    "provider_state": provider_state or row_metadata.get("state"),
                     "active_provider_job_id": job_id or active_job or None,
                     "last_checked_at": datetime.now(UTC).isoformat(),
                     "refreshed_from": "response_row_terminal_sync",
                 }
             )
+            if row_metadata.get("jobUrl"):
+                provider_metadata["provider_console_url"] = row_metadata.get("jobUrl")
             if row.get("error"):
                 provider_metadata["failure_reason"] = row.get("error")
             if row.get("final_artifact_or_result"):
+                provider_metadata["provider_artifact_path"] = row.get(
+                    "final_artifact_or_result"
+                )
                 provider_metadata["artifact_path"] = row.get("final_artifact_or_result")
             await store.update_run(
                 run_id,
@@ -1955,6 +1990,7 @@ async def _sync_runs_from_terminal_response_rows(
                 provider_metadata=provider_metadata,
                 error_summary=str(row.get("error") or "")[:500] or None,
                 active_provider_job_id=job_id or active_job or None,
+                result_summary=f"provider_{progress}",
             )
             updated_any = True
             break
@@ -1997,6 +2033,7 @@ async def _refresh_stale_gcp_rows_from_vertex(
     store = session_manager.persistence_store
     if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
         await store.upsert_response_rows(refreshed, user_id=user_id)
+        await _sync_runs_from_terminal_response_rows(refreshed)
         return True
     return False
 
@@ -2033,7 +2070,14 @@ async def _refresh_response_rows_for_evaluations(user_id: str) -> None:
             page_size=200,
         )
         rows = response_page.get("rows", [])
-    await _refresh_stale_response_rows(rows, user_id=user_id)
+    if await _refresh_stale_response_rows(rows, user_id=user_id):
+        response_page = await store.list_response_rows(
+            user_id=user_id,
+            page=1,
+            page_size=200,
+        )
+        rows = response_page.get("rows", [])
+    await _sync_runs_from_terminal_response_rows(rows)
 
 
 async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
@@ -2054,6 +2098,7 @@ async def _sync_response_sessions(user_id: str, session_ids: set[str]) -> None:
     store = session_manager.persistence_store
     if getattr(store, "enabled", False) and hasattr(store, "upsert_response_rows"):
         await store.upsert_response_rows(response_log["rows"], user_id=user_id)
+        await _sync_runs_from_terminal_response_rows(response_log["rows"])
 
 
 def _schedule_response_sync(user_id: str) -> None:
@@ -2127,6 +2172,7 @@ async def get_responses(
                     response_page = await store.list_response_rows(
                         user_id=user["user_id"], **filters
                     )
+        await _sync_runs_from_terminal_response_rows(response_page.get("rows", []))
         return response_page
     return paginate_response_rows(
         filter_response_rows(rows, **filters),

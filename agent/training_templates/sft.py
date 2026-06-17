@@ -329,10 +329,29 @@ def _messages_from_pair(example, user_column, assistant_columns):
     }}
 
 
+def _messages_have_user_and_assistant(messages):
+    if not isinstance(messages, list):
+        return False
+    has_user = False
+    has_assistant = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        content = _string_value(message.get("content"))
+        if role == "user" and content:
+            has_user = True
+        if role == "assistant" and content:
+            has_assistant = True
+    return has_user and has_assistant
+
+
 def format_example(example):
     mapping = CONFIG.get("column_mapping") or {{}}
     if not isinstance(mapping, dict):
         raise TypeError("column_mapping must be an object")
+    if "messages" in example and _messages_have_user_and_assistant(example.get("messages")):
+        return {{"messages": example["messages"]}}
     if mapping.get("text"):
         text_column = mapping["text"]
         if text_column not in example:

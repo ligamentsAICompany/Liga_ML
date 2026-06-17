@@ -242,6 +242,30 @@ def test_sft_template_loads_uploaded_gcs_jsonl_without_hf_dataset_repo():
     assert "LIGA_STAGED_TRAIN_URI={TRAIN_GCS_URI}" in script
 
 
+def test_sft_template_prefers_staged_messages_over_column_mapping():
+    script = build_sft_training_script(
+        SftTemplateConfig(
+            dataset_name="transitionGap/gst-india-preference-dataset-prep-small",
+            model_name="Qwen/Qwen2.5-0.5B-Instruct",
+            hub_model_id="",
+            output_policy="cloud-private",
+            dataset_source="gcs_jsonl",
+            train_gcs_uri="gs://liga-ml/vertex-inputs/gst-smoke/train.jsonl",
+            source_format="question_response",
+            column_mapping={"user": "question", "assistant": "response"},
+        )
+    )
+
+    messages_index = script.index(
+        'if "messages" in example and _messages_have_user_and_assistant(example.get("messages")):'
+    )
+    column_mapping_index = script.index(
+        'if mapping.get("user") or mapping.get("assistant"):'
+    )
+    assert messages_index < column_mapping_index
+    assert "_messages_have_user_and_assistant" in script
+
+
 def test_sft_template_supports_prompt_chosen_rejected_auto_mapping():
     script = build_sft_training_script(
         SftTemplateConfig(
