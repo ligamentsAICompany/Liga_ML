@@ -338,7 +338,7 @@ def _messages_have_user_and_assistant(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "").strip().lower()
-        content = _string_value(message.get("content"))
+        content = _string_value(message, "content")
         if role == "user" and content:
             has_user = True
         if role == "assistant" and content:
