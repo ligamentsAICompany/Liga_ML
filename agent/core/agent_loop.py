@@ -128,30 +128,82 @@ def _find_checklist_item_to_complete(
     return None
 
 
-def _checklist_mark_progress(
+_VERIFICATION_TOOLS = frozenset(
+    {
+        "write",
+        "edit",
+        "bash",
+        "training_preflight",
+        "training_planner",
+        "plan_tool",
+        "gcp_vertex_jobs",
+        "aws_sagemaker_jobs",
+        "hf_jobs",
+    }
+)
+_VERIFICATION_DESCRIPTION_KEYWORDS = (
+    "code",
+    "script",
+    "config",
+    "preflight",
+    "setup",
+    "train",
+    "template",
+    "validation",
+    "lint",
+    "write",
+    "generate",
+)
+
+
+def _checklist_item_requires_verification(
+    item: dict[str, Any],
+    last_tool_name: str | None,
+) -> bool:
+    """Infer whether a checklist step needs deterministic verification."""
+    if last_tool_name and last_tool_name in _VERIFICATION_TOOLS:
+        return True
+    description = str(item.get("description") or "").lower()
+    return any(keyword in description for keyword in _VERIFICATION_DESCRIPTION_KEYWORDS)
+
+
+async def _checklist_mark_progress(
     session: Session,
     checklist_state: dict[str, Any],
     *,
     workspace_path: str | None = None,
+    last_tool_name: str | None = None,
 ) -> None:
     """Advance checklist after VERIFY gate passes deterministic checks."""
     item = _find_checklist_item_to_complete(checklist_state)
     if item is None:
         return
 
-    workspace = workspace_path or _resolve_checklist_workspace_path(session)
-    passed, message = run_deterministic_checks(workspace)
-    if not passed:
-        item["status"] = "blocked"
-        metadata = item.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        metadata["verification_error"] = message
-        metadata["verification_workspace"] = workspace
-        metadata["blocked_at"] = datetime.now(UTC).isoformat()
-        item["metadata"] = metadata
-        checklist_state["last_blocked_at"] = datetime.now(UTC).isoformat()
-        return
+    if _checklist_item_requires_verification(item, last_tool_name):
+        workspace = workspace_path or _resolve_checklist_workspace_path(session)
+        passed, message = await run_deterministic_checks(workspace)
+        if not passed:
+            item["status"] = "blocked"
+            metadata = item.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["verification_error"] = message
+            metadata["verification_workspace"] = workspace
+            metadata["blocked_at"] = datetime.now(UTC).isoformat()
+            metadata["last_tool_name"] = last_tool_name
+            item["metadata"] = metadata
+            checklist_state["last_blocked_at"] = datetime.now(UTC).isoformat()
+            session.context_manager.add_message(
+                Message(
+                    role="user",
+                    content=(
+                        f"[SYSTEM: Deterministic verification failed for checklist "
+                        f"item '{item.get('id', 'unknown')}'. The item is blocked "
+                        f"until the failures below are resolved:\n{message}]"
+                    ),
+                )
+            )
+            return
 
     item["status"] = "done"
     metadata = item.get("metadata")
@@ -2757,6 +2809,7 @@ class Handlers:
             session.session_id
         ) or {"items": []}
         micro_loop_tool_executed = False
+        micro_loop_last_tool_name: str | None = None
 
         # Agentic loop - Phase 1 micro-loop limits one LiteLLM turn per invocation
         iteration = 0
@@ -3362,6 +3415,7 @@ class Handlers:
                     for tc, tool_name, tool_args, output, success in results:
                         truncated_output = _truncate_tool_output(output)
                         micro_loop_tool_executed = True
+                        micro_loop_last_tool_name = tool_name
                         tool_msg = Message(
                             role="tool",
                             content=truncated_output,
@@ -3615,7 +3669,11 @@ class Handlers:
 
         # CHECKPOINT: persist checklist before yielding back to submission_queue
         if micro_loop_tool_executed:
-            _checklist_mark_progress(session, checklist_state)
+            await _checklist_mark_progress(
+                session,
+                checklist_state,
+                last_tool_name=micro_loop_last_tool_name,
+            )
             await persistence_store.save_checklist(session.session_id, checklist_state)
 
         return final_response

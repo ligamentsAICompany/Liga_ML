@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import subprocess
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,24 +18,29 @@ class ArtifactStatus:
 WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model", "vocab.json", "spiece.model")
 
-_DETERMINISTIC_STEPS: tuple[tuple[str, list[str]], ...] = (
-    ("ruff", ["ruff", "check"]),
-    ("mypy", ["mypy"]),
-    ("pytest", ["pytest"]),
+_DETERMINISTIC_SHELL_STEPS: tuple[tuple[str, str], ...] = (
+    ("ruff", "ruff check {target}"),
+    ("mypy", "mypy {target}"),
+    ("pytest", "pytest {target} -q"),
 )
 
 
-def _format_failure_trace(
-    step_name: str, result: subprocess.CompletedProcess[str]
-) -> str:
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
-    trace = stderr or stdout or f"{step_name} failed with exit code {result.returncode}"
-    return f"[{step_name}] {trace}"
+async def _run_shell_step(command: str) -> tuple[int, str, str]:
+    process = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_bytes, stderr_bytes = await process.communicate()
+    return (
+        process.returncode or 0,
+        stdout_bytes.decode(errors="replace"),
+        stderr_bytes.decode(errors="replace"),
+    )
 
 
-def run_deterministic_checks(workspace_path: str) -> tuple[bool, str]:
-    """Run ruff, mypy, and pytest against a workspace path via subprocess.
+async def run_deterministic_checks(workspace_path: str) -> tuple[bool, str]:
+    """Run ruff, mypy, and pytest against a workspace path via async subprocess.
 
     Returns:
         (True, success_message) when every step exits 0.
@@ -43,19 +48,22 @@ def run_deterministic_checks(workspace_path: str) -> tuple[bool, str]:
     """
     workspace = Path(workspace_path).resolve()
     if not workspace.exists():
-        return False, f"[workspace] Path does not exist: {workspace}"
+        return (
+            False,
+            f"Verification failed:\n[workspace] Path does not exist: {workspace}",
+        )
 
     target = str(workspace)
-    for step_name, command_prefix in _DETERMINISTIC_STEPS:
-        command = [*command_prefix, target]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            return False, _format_failure_trace(step_name, result)
+    for step_name, command_template in _DETERMINISTIC_SHELL_STEPS:
+        command = command_template.format(target=target)
+        returncode, stdout, stderr = await _run_shell_step(command)
+        if returncode != 0:
+            trace = (
+                stderr.strip()
+                or stdout.strip()
+                or f"{step_name} failed with exit code {returncode}"
+            )
+            return False, f"Verification failed:\n[{step_name}] {trace}"
 
     return True, _SUCCESS_MESSAGE
 
