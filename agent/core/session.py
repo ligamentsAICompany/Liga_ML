@@ -147,6 +147,7 @@ class Session:
         self.defer_turn_complete_notification = defer_turn_complete_notification
         self.auto_approval_enabled: bool = False
         self.auto_approval_cost_cap_usd: float | None = None
+        self.security_capability_flags: set[str] = set()
         self.auto_approval_estimated_spend_usd: float = 0.0
         self.uploaded_datasets: list[dict[str, Any]] = []
         self.latest_training_preflight: dict[str, Any] | None = None

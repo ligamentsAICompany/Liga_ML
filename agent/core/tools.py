@@ -8,6 +8,68 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
+logger = logging.getLogger(__name__)
+
+
+class SecurityPolicyViolation(Exception):
+    """Raised when a tool call violates the Rule of Two capability policy."""
+
+
+class AllowListDispatcher:
+    """Enforces the Rule of Two across dangerous tool capability classes."""
+
+    FLAG_UNTRUSTED_CONTENT = "untrusted_content"
+    FLAG_PRIVATE_DATA = "private_data"
+    FLAG_NETWORK = "network"
+
+    CAP_UNTRUSTED_CONTENT = frozenset(
+        {"bash", "read", "github_read_file", "dataset_discovery"}
+    )
+    CAP_PRIVATE_DATA = frozenset(
+        {
+            "aws_sagemaker_jobs",
+            "gcp_vertex_jobs",
+            "hf_jobs",
+            "private_hf_repo_tools",
+            "hf_private_repos",
+        }
+    )
+    CAP_NETWORK = frozenset(
+        {"web_search", "explore_hf_docs", "hf_docs_fetch"}
+    )
+
+    _TOOL_TO_CAPABILITY: dict[str, str] = {}
+
+    def __init__(self) -> None:
+        mapping: dict[str, str] = {}
+        for tool_name in self.CAP_UNTRUSTED_CONTENT:
+            mapping[tool_name] = self.FLAG_UNTRUSTED_CONTENT
+        for tool_name in self.CAP_PRIVATE_DATA:
+            mapping[tool_name] = self.FLAG_PRIVATE_DATA
+        for tool_name in self.CAP_NETWORK:
+            mapping[tool_name] = self.FLAG_NETWORK
+        self._TOOL_TO_CAPABILITY = mapping
+
+    def capability_for_tool(self, requested_tool: str) -> str | None:
+        return self._TOOL_TO_CAPABILITY.get(requested_tool)
+
+    def authorize(self, session_state_flags: set[str], requested_tool: str) -> bool:
+        """Authorize a tool if it does not activate all three capability classes."""
+        capability = self.capability_for_tool(requested_tool)
+        if capability is None:
+            return True
+
+        projected = set(session_state_flags) | {capability}
+        if len(projected) >= 3:
+            raise SecurityPolicyViolation(
+                "Rule of Two violated: cannot combine untrusted execution, "
+                "private cloud data access, and external network tools in one session."
+            )
+
+        session_state_flags.add(capability)
+        return True
+
+
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from mcp.types import EmbeddedResource, ImageContent, TextContent
@@ -81,8 +143,6 @@ from agent.tools.web_search_tool import WEB_SEARCH_TOOL_SPEC, web_search_handler
 warnings.filterwarnings(
     "ignore", category=DeprecationWarning, module="aiohttp.connector"
 )
-
-logger = logging.getLogger(__name__)
 
 NOT_ALLOWED_TOOL_NAMES = ["hf_jobs", "hf_doc_search", "hf_doc_fetch", "hf_whoami"]
 
@@ -159,6 +219,7 @@ class ToolRouter:
     ):
         self.tools: dict[str, ToolSpec] = {}
         self.mcp_servers: dict[str, dict[str, Any]] = {}
+        self.allow_list_dispatcher = AllowListDispatcher()
 
         for tool in create_builtin_tools(local_mode=local_mode):
             self.register_tool(tool)
@@ -275,6 +336,20 @@ class ToolRouter:
         For MCP tools, converts the CallToolResult content blocks to a string.
         For built-in tools, calls their handler directly.
         """
+        if session is not None:
+            flags = getattr(session, "security_capability_flags", None)
+            if flags is None:
+                flags = set()
+                session.security_capability_flags = flags
+            try:
+                self.allow_list_dispatcher.authorize(flags, tool_name)
+            except SecurityPolicyViolation:
+                return (
+                    "SECURITY BLOCK: The Rule of Two prevents combining untrusted "
+                    "execution with private cloud data in the same context. Split the task.",
+                    False,
+                )
+
         # Check if this is a built-in tool with a handler
         tool = self.tools.get(tool_name)
         if tool and tool.handler:

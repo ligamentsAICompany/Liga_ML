@@ -37,6 +37,7 @@ Tools: bash, read, write, edit, upload
 from __future__ import annotations
 
 import io
+import re
 import secrets as secrets_lib
 import sys
 import time
@@ -68,6 +69,7 @@ WAIT_TIMEOUT = 600
 WAIT_INTERVAL = 5
 API_WAIT_TIMEOUT = 180
 CPU_BASIC_HARDWARE = "cpu-basic"
+BLOCKED_COMMANDS = ["env", "printenv", "nc ", "curl ", "wget ", "export"]
 DANGEROUS_SANDBOX_SECRET_KEYS = {
     "HF_TOKEN",
     "HUGGINGFACE_HUB_TOKEN",
@@ -79,6 +81,19 @@ DANGEROUS_SANDBOX_SECRET_KEYS = {
     "GOOGLE_APPLICATION_CREDENTIALS",
     "MONGODB_URI",
 }
+
+
+def _is_blocked_shell_command(command: str) -> bool:
+    """Default-deny filter for credential dumping and outbound shell patterns."""
+    lowered = command.lower()
+    if re.search(r"\b(?:env|printenv)\b", lowered):
+        return True
+    for pattern in BLOCKED_COMMANDS:
+        if pattern in ("env", "printenv"):
+            continue
+        if pattern in lowered:
+            return True
+    return False
 
 
 def _is_transient_space_visibility_error(error: Exception) -> bool:
@@ -917,6 +932,11 @@ class Sandbox:
         timeout: int | None = None,
         description: str | None = None,
     ) -> ToolResult:
+        if _is_blocked_shell_command(command):
+            return ToolResult(
+                success=False,
+                error="SECURITY BLOCK: Unauthorized shell command pattern detected.",
+            )
         return self._call(
             "bash",
             {
