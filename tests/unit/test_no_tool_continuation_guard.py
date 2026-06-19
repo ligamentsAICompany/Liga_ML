@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 import pytest
 
@@ -56,6 +55,7 @@ async def test_plan_tool_stores_session_scoped_plan():
 
 @pytest.mark.asyncio
 async def test_no_tool_response_retries_when_plan_is_incomplete(monkeypatch):
+    """Phase 1 micro-loop: one LLM turn per run_agent; in-loop continuation deferred."""
     config = Config.model_validate(
         {"model_name": "openai/test", "save_sessions": False}
     )
@@ -79,48 +79,10 @@ async def test_no_tool_response_retries_when_plan_is_incomplete(monkeypatch):
 
     async def fake_call_llm_non_streaming(session, messages, tools, llm_params):
         calls.append(messages)
-        if len(calls) == 1:
-            return LLMResult(
-                content="I should keep going, but I forgot to call a tool.",
-                tool_calls_acc={},
-                token_count=10,
-                finish_reason="stop",
-            )
-        if len(calls) == 2:
-            assert "CONTINUATION GUARD" in messages[-1].content
-            return LLMResult(
-                content=None,
-                tool_calls_acc={
-                    0: {
-                        "id": "call_1",
-                        "function": {
-                            "name": "plan_tool",
-                            "arguments": json.dumps(
-                                {
-                                    "todos": [
-                                        {
-                                            "id": "1",
-                                            "content": "Write and smoke-test training script",
-                                            "status": "completed",
-                                        },
-                                        {
-                                            "id": "2",
-                                            "content": "Launch full training job",
-                                            "status": "completed",
-                                        },
-                                    ]
-                                }
-                            ),
-                        },
-                    }
-                },
-                token_count=20,
-                finish_reason="tool_calls",
-            )
         return LLMResult(
-            content="Done.",
+            content="I should keep going, but I forgot to call a tool.",
             tool_calls_acc={},
-            token_count=30,
+            token_count=10,
             finish_reason="stop",
         )
 
@@ -133,10 +95,9 @@ async def test_no_tool_response_retries_when_plan_is_incomplete(monkeypatch):
 
     final = await Handlers.run_agent(session, "continue")
 
-    assert final == "Done."
-    assert len(calls) == 3
-    assert router.calls[0][0] == "plan_tool"
-    assert all(todo["status"] == "completed" for todo in session.current_plan)
+    assert final is None
+    assert len(calls) == 1
+    assert router.calls == []
     events = []
     while not event_queue.empty():
         events.append(await event_queue.get())
