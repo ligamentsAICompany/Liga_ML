@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 CloudProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker"]
+TaskStatus = Literal["todo", "in_progress", "blocked", "done"]
 UsageProviderId = Literal["hf-jobs", "gcp-vertex", "aws-sagemaker", "llm", "unknown"]
 AuditCategory = Literal[
     "session",
@@ -633,3 +634,28 @@ class LLMHealthResponse(BaseModel):
     error_type: str | None = (
         None  # "quota" | "billing" | "auth" | "rate_limit" | "network" | "empty_response" | "unknown"
     )
+
+
+class ChecklistItem(BaseModel):
+    """Single item in the long-running agent checklist state machine."""
+
+    id: str
+    description: str
+    status: TaskStatus = "todo"
+    dependencies: list[str] = []
+
+
+class Checklist(BaseModel):
+    """Persistent checklist driving READ -> ACT -> VERIFY -> CHECKPOINT micro-loops."""
+
+    items: list[ChecklistItem] = []
+
+    def next_actionable(self) -> ChecklistItem | None:
+        """Return the first todo item whose dependencies are all done."""
+        done_ids = {item.id for item in self.items if item.status == "done"}
+        for item in self.items:
+            if item.status != "todo":
+                continue
+            if all(dep in done_ids for dep in item.dependencies):
+                return item
+        return None

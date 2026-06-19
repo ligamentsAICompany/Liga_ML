@@ -314,6 +314,7 @@ class NoopSessionStore:
         self._evaluations: dict[str, dict[str, Any]] = {}
         self._session_preflights: dict[str, dict[str, Any]] = {}
         self._run_preflights: dict[str, dict[str, Any]] = {}
+        self._checklists: dict[str, dict[str, Any]] = {}
 
     async def init(self) -> None:
         return None
@@ -338,6 +339,12 @@ class NoopSessionStore:
 
     async def update_session_fields(self, *_: Any, **__: Any) -> None:
         return None
+
+    async def save_checklist(self, session_id: str, checklist: dict) -> None:
+        self._checklists[session_id] = checklist
+
+    async def load_checklist(self, session_id: str) -> dict | None:
+        return self._checklists.get(session_id)
 
     async def append_event(
         self,
@@ -1287,6 +1294,32 @@ class MongoSessionStore(NoopSessionStore):
         fields = sanitize_for_persistence(fields)
         fields["updated_at"] = _now()
         await self.db.sessions.update_one({"_id": session_id}, {"$set": fields})
+
+    async def save_checklist(self, session_id: str, checklist: dict) -> None:
+        if not self._ready():
+            return
+        await self.db.sessions.update_one(
+            {"_id": session_id},
+            {
+                "$set": {
+                    "checklist": sanitize_for_persistence(checklist),
+                    "updated_at": _now(),
+                }
+            },
+            upsert=True,
+        )
+
+    async def load_checklist(self, session_id: str) -> dict | None:
+        if not self._ready():
+            return None
+        doc = await self.db.sessions.find_one(
+            {"_id": session_id},
+            {"checklist": 1},
+        )
+        if not doc:
+            return None
+        checklist = doc.get("checklist")
+        return checklist if isinstance(checklist, dict) else None
 
     async def _next_seq(self, counter_id: str) -> int:
         doc = await self.db.counters.find_one_and_update(

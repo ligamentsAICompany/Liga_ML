@@ -33,6 +33,7 @@ from agent.core.doom_loop import check_for_doom_loop
 from agent.core.llm_params import _resolve_llm_params
 from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import DEFAULT_SESSION_LOG_DIR, Event, OpType, Session
+from agent.core.session_persistence import get_session_store
 from agent.core.tools import ToolRouter
 from agent.tools.jobs_tool import CPU_FLAVORS
 from agent.tools.sandbox_tool import (
@@ -44,6 +45,10 @@ from agent.tools.sandbox_tool import (
 logger = logging.getLogger(__name__)
 
 ToolCall = ChatCompletionMessageToolCall
+
+# Phase 1 micro-loop: one LiteLLM turn per run_agent call (Fareed Khan long-running agent)
+_PHASE1_MICRO_LOOP_MAX_TURNS = 1
+_MICRO_LOOP_TOOL_OUTPUT_LIMIT = 4000
 
 _MALFORMED_TOOL_PREFIX = "ERROR: Tool call to '"
 _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
@@ -78,6 +83,41 @@ _TERMINAL_CLOUD_JOB_STATES = {
     "job_state_cancelled",
     "job_state_expired",
 }
+
+
+def _truncate_tool_output(output: Any) -> str:
+    """Context protection: cap tool output appended to message history."""
+    text = output if isinstance(output, str) else str(output)
+    if len(text) <= _MICRO_LOOP_TOOL_OUTPUT_LIMIT:
+        return text
+    return text[:_MICRO_LOOP_TOOL_OUTPUT_LIMIT] + "...[TRUNCATED]"
+
+
+def _checklist_mark_progress(checklist_state: dict[str, Any]) -> None:
+    """Advance checklist after a verified tool execution (CHECKPOINT helper)."""
+    items = checklist_state.get("items")
+    if not isinstance(items, list):
+        checklist_state["items"] = []
+        return
+    for item in items:
+        if isinstance(item, dict) and item.get("status") == "in_progress":
+            item["status"] = "done"
+            checklist_state["last_checkpoint_at"] = datetime.now(UTC).isoformat()
+            return
+    done_ids = {
+        item.get("id")
+        for item in items
+        if isinstance(item, dict) and item.get("status") == "done"
+    }
+    for item in items:
+        if not isinstance(item, dict) or item.get("status") != "todo":
+            continue
+        deps = item.get("dependencies") or []
+        if all(dep in done_ids for dep in deps):
+            item["status"] = "done"
+            checklist_state["last_checkpoint_at"] = datetime.now(UTC).isoformat()
+            return
+
 _AWS_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
 _GCP_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
 _AWS_PROVIDER_DRIFT_MESSAGE = (
@@ -2668,15 +2708,23 @@ class Handlers:
             Event(event_type="processing", data={"message": "Processing user input"})
         )
 
-        # Agentic loop - continue until model doesn't call tools or max iterations is reached
+        # READ: load persistent checklist state before ACT
+        persistence_store = get_session_store()
+        checklist_state: dict[str, Any] = (
+            await persistence_store.load_checklist(session.session_id) or {"items": []}
+        )
+        micro_loop_tool_executed = False
+
+        # Agentic loop - Phase 1 micro-loop limits one LiteLLM turn per invocation
         iteration = 0
         final_response = None
         errored = False
         max_iterations = session.config.max_iterations
+        effective_max_iterations = _PHASE1_MICRO_LOOP_MAX_TURNS
         no_tool_incomplete_plan_retries = 0
         vertex_smoke_continuation_retries = 0
 
-        while max_iterations == -1 or iteration < max_iterations:
+        while effective_max_iterations == -1 or iteration < effective_max_iterations:
             # ── Cancellation check: before LLM call ──
             if session.is_cancelled:
                 break
@@ -3223,6 +3271,7 @@ class Handlers:
                                 "or retry this tool only if it is required."
                             )
                             ok = False
+                        out = _truncate_tool_output(out)
                         return (tc, name, args, out, ok)
 
                     gather_task = asyncio.ensure_future(
@@ -3268,9 +3317,11 @@ class Handlers:
                     # 4. Record results and send outputs (order preserved)
                     terminal_provider_output: str | None = None
                     for tc, tool_name, tool_args, output, success in results:
+                        truncated_output = _truncate_tool_output(output)
+                        micro_loop_tool_executed = True
                         tool_msg = Message(
                             role="tool",
-                            content=output,
+                            content=truncated_output,
                             tool_call_id=tc.id,
                             name=tool_name,
                         )
@@ -3282,7 +3333,7 @@ class Handlers:
                                 data={
                                     "tool": tool_name,
                                     "tool_call_id": tc.id,
-                                    "output": output,
+                                    "output": truncated_output,
                                     "success": success,
                                     "structured": _structured_tool_output(
                                         session, tc.id
@@ -3291,9 +3342,9 @@ class Handlers:
                             )
                         )
                         if _is_terminal_provider_tool_output(
-                            tool_name, output, success
+                            tool_name, truncated_output, success
                         ):
-                            terminal_provider_output = output
+                            terminal_provider_output = truncated_output
 
                     if terminal_provider_output is not None:
                         final_response = terminal_provider_output
@@ -3518,6 +3569,11 @@ class Handlers:
         if not getattr(session, "waiting_for_tool_approval", False):
             session.increment_turn()
         await session.auto_save_if_needed()
+
+        # CHECKPOINT: persist checklist before yielding back to submission_queue
+        if micro_loop_tool_executed:
+            _checklist_mark_progress(checklist_state)
+            await persistence_store.save_checklist(session.session_id, checklist_state)
 
         return final_response
 
@@ -3803,10 +3859,11 @@ class Handlers:
                 if was_edited:
                     output = f"[Note: The user edited the script before execution. The output below reflects the user-modified version, not your original script.]\n\n{output}"
 
+                truncated_output = _truncate_tool_output(output)
                 # Add tool result to context
                 tool_msg = Message(
                     role="tool",
-                    content=output,
+                    content=truncated_output,
                     tool_call_id=tc.id,
                     name=tool_name,
                 )
@@ -3818,7 +3875,7 @@ class Handlers:
                         data={
                             "tool": tool_name,
                             "tool_call_id": tc.id,
-                            "output": output,
+                            "output": truncated_output,
                             "success": success,
                             "structured": _structured_tool_output(session, tc.id),
                         },
