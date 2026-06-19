@@ -6,6 +6,8 @@ from typing import Any
 
 import pytest
 
+from conftest import patch_api_helper, patch_api_session_manager
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -18,7 +20,7 @@ from responses_log import (  # noqa: E402
     redact_response_value,
 )
 from agent.core.session_persistence import MongoSessionStore, NoopSessionStore  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 def _event(tool: str, state: str, **data):
@@ -1157,7 +1159,7 @@ class _StoreBackedManager:
 @pytest.mark.asyncio
 async def test_responses_routes_use_session_manager_source_of_truth(monkeypatch):
     manager = _StoreBackedManager()
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     rows = await agent.get_responses(user={"user_id": "dev"})
     summary = await agent.get_responses_summary(user={"user_id": "dev"})
@@ -1206,7 +1208,7 @@ async def test_responses_routes_can_read_rows_after_manager_restart(monkeypatch)
         return []
 
     manager.list_sessions = no_sessions
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     rows = await agent.get_responses(user={"user_id": "dev"})
 
@@ -1265,7 +1267,7 @@ async def test_responses_routes_refresh_stale_hf_rows_from_persisted_events(
         ]
 
     manager.load_response_events = completed_events
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     rows = await agent.get_responses(
         job_id="persisted",
@@ -1332,7 +1334,7 @@ async def test_responses_routes_default_unfiltered_refreshes_stale_hf_terminal_r
         ]
 
     manager.load_response_events = completed_events
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     unfiltered = await agent.get_responses(
         page=1,
@@ -1391,7 +1393,7 @@ async def test_responses_routes_refresh_stale_hf_rows_from_existing_job_inspect(
             }
         ]
     )
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     async def fake_inspect(job_id, namespace):
         assert job_id == "job-123"
@@ -1468,7 +1470,7 @@ async def test_responses_routes_refresh_stale_gcp_rows_from_persisted_events(
         ]
 
     manager.load_response_events = completed_events
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     rows = await agent.get_responses(
         job_id="customJobs/456",
@@ -1508,7 +1510,7 @@ async def test_responses_routes_refresh_stale_gcp_rows_from_vertex_describe(
             }
         ]
     )
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     async def fake_describe_vertex(job_id):
         assert job_id == job_name
@@ -1690,7 +1692,7 @@ async def test_vertex_refresh_syncs_usage_and_audit(monkeypatch):
             }
         ]
     )
-    monkeypatch.setattr(agent, "session_manager", manager)
+    patch_api_session_manager(monkeypatch, manager)
 
     async def fake_describe_vertex(job_id):
         return SimpleNamespace(

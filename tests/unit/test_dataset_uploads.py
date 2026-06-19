@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+
+from conftest import patch_api_helper
 from docx import Document
 from fastapi import HTTPException, UploadFile
 from huggingface_hub.errors import HfHubHTTPError
@@ -17,7 +19,7 @@ if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 import dataset_uploads  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 def _upload(filename: str, content: bytes = b"a,b\n1,2\n") -> UploadFile:
@@ -605,7 +607,7 @@ async def test_upload_route_requires_hf_token_without_parsing_upload(monkeypatch
             hf_username="alice",
         )
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
@@ -640,7 +642,7 @@ async def test_upload_route_rejects_content_length_before_parsing(monkeypatch):
     async def fake_check_session_access(*_args, **_kwargs):
         raise AssertionError("session access should not run for oversized uploads")
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
@@ -675,7 +677,7 @@ async def test_upload_route_rejects_busy_session_without_parsing_upload(monkeypa
             hf_username="alice",
         )
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
 
     with pytest.raises(HTTPException) as exc_info:
         await agent.upload_session_dataset(
@@ -749,9 +751,8 @@ async def test_upload_route_appends_context_note_and_persists(monkeypatch):
     async def fake_persist_session_snapshot(value):
         persisted.append(value)
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
-    monkeypatch.setattr(
-        agent, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
     )
     monkeypatch.setattr(
         agent.session_manager,
@@ -841,9 +842,8 @@ async def test_upload_route_records_uploaded_dataset_metadata(monkeypatch):
     async def fake_persist_session_snapshot(_value):
         return None
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
-    monkeypatch.setattr(
-        agent, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
     )
     monkeypatch.setattr(
         agent.session_manager,
@@ -908,9 +908,8 @@ async def test_upload_route_closes_upload_when_hub_upload_fails(monkeypatch):
     async def fake_push_dataset_upload_to_hub(**_kwargs):
         raise RuntimeError("hub unavailable")
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
-    monkeypatch.setattr(
-        agent, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -956,9 +955,8 @@ async def test_upload_route_maps_hub_permission_error_safely(monkeypatch):
             server_message="token hf_secret cannot write",
         )
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
-    monkeypatch.setattr(
-        agent, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "push_dataset_upload_to_hub", fake_push_dataset_upload_to_hub
     )
 
     with pytest.raises(HTTPException) as exc_info:

@@ -4,11 +4,15 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from fastapi import Request
+from fastapi.responses import StreamingResponse
 
 from agent.config import load_config
 from agent.core.agent_loop import process_submission
@@ -97,6 +101,36 @@ class EventBroadcaster:
                 break
             except Exception as e:
                 logger.error(f"EventBroadcaster error: {e}")
+
+
+_SSE_TERMINAL_EVENTS = frozenset(
+    {
+        "turn_complete",
+        "approval_required",
+        "error",
+        "stream_error",
+        "interrupted",
+        "shutdown",
+    }
+)
+_SSE_KEEPALIVE_SECONDS = 15
+
+
+def _format_sse_message(msg: dict[str, Any]) -> str:
+    seq = msg.get("seq")
+    body = {"event_type": msg.get("event_type"), "data": msg.get("data") or {}}
+    if seq is not None:
+        body["seq"] = seq
+        return f"id: {seq}\ndata: {json.dumps(body)}\n\n"
+    return f"data: {json.dumps(body)}\n\n"
+
+
+def _event_doc_to_sse_msg(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_type": doc.get("event_type"),
+        "data": doc.get("data") or doc.get("payload") or {},
+        "seq": doc.get("seq"),
+    }
 
 
 @dataclass
@@ -1749,7 +1783,8 @@ class SessionManager:
                     except asyncio.TimeoutError:
                         continue
                     except asyncio.CancelledError:
-                        logger.info(f"Session {session_id} cancelled")
+                        # Background session task cancelled (shutdown/delete) — not SSE disconnect.
+                        logger.info("Session %s background task cancelled", session_id)
                         break
                     except Exception as e:
                         logger.exception(
@@ -2395,6 +2430,129 @@ class SessionManager:
                 .startswith(("error:", "tool error:")),
             },
         }
+
+    def build_sse_response(
+        self,
+        broadcaster: EventBroadcaster,
+        event_queue: asyncio.Queue,
+        sub_id: int,
+        *,
+        request: Request | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        stream_started_at: float | None = None,
+        replay_events: list[dict[str, Any]] | None = None,
+        after_seq: int = 0,
+    ) -> StreamingResponse:
+        """Build SSE stream decoupled from the background agent task.
+
+        Client disconnect only ends this generator; the session's asyncio.Task
+        and Micro-Loop checkpointing continue uninterrupted.
+        """
+
+        async def event_generator():
+            try:
+                for doc in replay_events or []:
+                    msg = _event_doc_to_sse_msg(doc)
+                    seq = msg.get("seq")
+                    if isinstance(seq, int) and seq <= after_seq:
+                        continue
+                    yield _format_sse_message(msg)
+                    if msg.get("event_type", "") in _SSE_TERMINAL_EVENTS:
+                        return
+
+                while True:
+                    try:
+                        try:
+                            msg = await asyncio.wait_for(
+                                event_queue.get(), timeout=_SSE_KEEPALIVE_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            if request is not None and await request.is_disconnected():
+                                logger.info(
+                                    "chat_stream_event request_id=%s session_id=%s "
+                                    "event_type=client_disconnected duration_ms=%s",
+                                    request_id,
+                                    session_id,
+                                    int(
+                                        (
+                                            time.monotonic()
+                                            - (stream_started_at or time.monotonic())
+                                        )
+                                        * 1000
+                                    ),
+                                )
+                                break
+                            yield _format_sse_message(
+                                {
+                                    "event_type": "heartbeat",
+                                    "data": {
+                                        "request_id": request_id,
+                                        "session_id": session_id,
+                                    },
+                                }
+                            )
+                            continue
+                        event_type = msg.get("event_type", "")
+                        data = msg.get("data") or {}
+                        safe_data = {
+                            "request_id": data.get("request_id") or request_id,
+                            "session_id": data.get("session_id") or session_id,
+                        }
+                        if event_type in {"tool_call", "tool_output"}:
+                            safe_data["tool"] = data.get("tool")
+                        logger.info(
+                            "chat_stream_event request_id=%s session_id=%s event_type=%s "
+                            "cloud_provider=%s selected_model=%s duration_ms=%s",
+                            safe_data.get("request_id"),
+                            safe_data.get("session_id"),
+                            event_type,
+                            data.get("cloud_provider"),
+                            data.get("model"),
+                            int(
+                                (
+                                    time.monotonic()
+                                    - (stream_started_at or time.monotonic())
+                                )
+                                * 1000
+                            ),
+                        )
+                        yield _format_sse_message(msg)
+                        if event_type in _SSE_TERMINAL_EVENTS:
+                            break
+                    except asyncio.CancelledError:
+                        logger.info("Client disconnected from SSE")
+                        break
+            except asyncio.CancelledError:
+                logger.info("Client disconnected from SSE")
+            except Exception as e:
+                logger.exception(
+                    "chat_stream_event request_id=%s session_id=%s event_type=stream_error",
+                    request_id,
+                    session_id,
+                )
+                yield _format_sse_message(
+                    {
+                        "event_type": "stream_error",
+                        "data": {
+                            "error": str(e),
+                            "request_id": request_id,
+                            "session_id": session_id,
+                        },
+                    }
+                )
+            finally:
+                broadcaster.unsubscribe(sub_id)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @property
     def active_session_count(self) -> int:

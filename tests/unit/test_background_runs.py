@@ -13,7 +13,7 @@ from agent.core.background_runs import (  # noqa: E402
     load_background_run_settings,
 )
 from agent.core.session import Event, Session  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 class _FakeConfig:

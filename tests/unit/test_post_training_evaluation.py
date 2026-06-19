@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import patch_api_helper
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -17,7 +19,7 @@ from agent.core.post_training_evaluation import (  # noqa: E402
     plan_post_training_evaluation,
 )
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 def _context(**overrides):
@@ -273,7 +275,7 @@ async def test_evaluation_api_endpoints_and_manual_trigger_are_static_idempotent
     async def _allow_access(session_id, user, request=None, preload_sandbox=True):
         return SimpleNamespace(session_id=session_id, user_id=user["user_id"])
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     monkeypatch.setattr(agent.session_manager, "persistence_store", store)
     monkeypatch.setattr(agent.session_manager, "_store", lambda: store)
 
@@ -418,7 +420,7 @@ async def test_create_run_response_serializes_latest_audit_timestamp(monkeypatch
     async def _allow_access(session_id, user, request=None, preload_sandbox=True):
         return SimpleNamespace(session_id=session_id, user_id=user["user_id"])
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     monkeypatch.setattr(agent.session_manager, "persistence_store", store)
     monkeypatch.setattr(agent.session_manager, "_store", lambda: store)
     monkeypatch.setitem(

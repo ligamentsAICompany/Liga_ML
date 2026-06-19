@@ -4,11 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import patch_api_helper
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -48,9 +50,7 @@ async def test_health_reports_mongodb_session_store_as_durable(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_provider_health_returns_hf_gcp_and_aws(monkeypatch):
-    monkeypatch.setattr(
-        agent,
-        "build_gcp_vertex_readiness_snapshot",
+    patch_api_helper(monkeypatch, "build_gcp_vertex_readiness_snapshot",
         lambda: {
             "configured": False,
             "missing_env": ["GOOGLE_CLOUD_PROJECT"],
@@ -65,9 +65,7 @@ async def test_provider_health_returns_hf_gcp_and_aws(monkeypatch):
             "errors": [],
         },
     )
-    monkeypatch.setattr(
-        agent,
-        "build_aws_sagemaker_readiness_snapshot",
+    patch_api_helper(monkeypatch, "build_aws_sagemaker_readiness_snapshot",
         lambda: {
             "configured": False,
             "missing_env": ["AWS_S3_BUCKET"],

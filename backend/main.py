@@ -15,7 +15,10 @@ from fastapi.responses import FileResponse
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from agent.core.gcp_readiness import build_gcp_vertex_readiness_snapshot  # noqa: E402
-from routes.agent import router as agent_router  # noqa: E402
+from routes.api.chat import router as chat_router  # noqa: E402
+from routes.api.observability import router as observability_router  # noqa: E402
+from routes.api.sessions import router as sessions_router  # noqa: E402
+from routes.api.training import router as training_router  # noqa: E402
 from routes.auth import router as auth_router  # noqa: E402
 from session_manager import session_manager  # noqa: E402
 
@@ -109,7 +112,10 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(agent_router)
+app.include_router(sessions_router, prefix="/api", tags=["Sessions"])
+app.include_router(chat_router, prefix="/api", tags=["Chat"])
+app.include_router(training_router, prefix="/api", tags=["Training"])
+app.include_router(observability_router, prefix="/api", tags=["Observability"])
 app.include_router(auth_router)
 
 

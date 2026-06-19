@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import patch_api_helper
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
@@ -17,7 +19,7 @@ from agent.core.audit import (  # noqa: E402
     training_preflight_audit_events,
 )
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -183,7 +185,7 @@ async def test_audit_apis_and_disabled_behavior(monkeypatch):
     async def _allow_access(*args, **kwargs):
         return SimpleNamespace()
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     response = await agent.list_audit(session_id="s1", user={"user_id": "dev"})
     summary = await agent.audit_summary(session_id="s1", user={"user_id": "dev"})
     response_payload = response.model_dump()
@@ -220,7 +222,7 @@ async def test_audit_api_response_omits_secrets(monkeypatch):
     async def _allow_access(*args, **kwargs):
         return SimpleNamespace()
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     response = await agent.list_audit(session_id="s1", user={"user_id": "dev"})
     response_payload = response.model_dump()
 

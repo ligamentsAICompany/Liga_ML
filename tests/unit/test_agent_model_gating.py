@@ -1,4 +1,4 @@
-"""Tests for premium model handling in backend/routes/agent.py."""
+"""Tests for premium model handling in backend/routes/api/common.py."""
 
 import asyncio
 import sys
@@ -6,13 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from conftest import patch_api_helper
 from fastapi import HTTPException
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -99,7 +101,7 @@ async def test_switching_to_premium_model_is_allowed_for_authenticated_user(
     async def fake_update_session_model(session_id, model_id):
         updated.append((session_id, model_id))
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(
         agent.session_manager,
         "update_session_model",
@@ -135,7 +137,7 @@ async def test_switching_cloud_provider_persists_for_session(monkeypatch):
         updated.append((session_id, cloud_provider))
         return True
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(
         agent.session_manager,
         "update_session_cloud_provider",
@@ -176,7 +178,7 @@ async def test_switching_cloud_provider_persists_gcloud_preflight_options(monkey
         updated.append((session_id, cloud_provider, training_goal, output_policy))
         return True
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(
         agent.session_manager,
         "update_session_cloud_provider",
@@ -221,7 +223,7 @@ async def test_switching_cloud_provider_accepts_aws_sagemaker(monkeypatch):
         updated.append((session_id, cloud_provider, training_goal, output_policy))
         return True
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(
         agent.session_manager,
         "update_session_cloud_provider",
@@ -249,7 +251,7 @@ async def test_switching_cloud_provider_rejects_unknown_provider(monkeypatch):
     async def fake_check_session_access(session_id, user, request=None):
         return SimpleNamespace(user_id=user["user_id"])
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
 
     with pytest.raises(HTTPException) as exc_info:
         await agent.set_session_cloud_provider(
@@ -460,7 +462,7 @@ async def test_set_session_yolo_calls_manager_with_cap_presence(monkeypatch):
             "remaining_usd": 7.5,
         }
 
-    monkeypatch.setattr(agent, "_check_session_access", fake_check_session_access)
+    patch_api_helper(monkeypatch, "_check_session_access", fake_check_session_access)
     monkeypatch.setattr(
         agent.session_manager,
         "update_session_auto_approval",
@@ -599,7 +601,7 @@ async def test_create_session_capacity_response_includes_actionable_metadata(
         return {}
 
     monkeypatch.setattr(agent.session_manager, "create_session", fake_create_session)
-    monkeypatch.setattr(agent, "resolve_hf_request_token", lambda _request: None)
+    patch_api_helper(monkeypatch, "resolve_hf_request_token", lambda _request: None)
 
     with pytest.raises(HTTPException) as exc_info:
         await agent.create_session(
@@ -633,7 +635,7 @@ async def test_create_session_route_disables_automatic_sandbox_preload(monkeypat
         return {}
 
     monkeypatch.setattr(agent.session_manager, "create_session", fake_create_session)
-    monkeypatch.setattr(agent, "resolve_hf_request_token", lambda _request: None)
+    patch_api_helper(monkeypatch, "resolve_hf_request_token", lambda _request: None)
 
     response = await agent.create_session(
         SimpleNamespace(json=request_json),

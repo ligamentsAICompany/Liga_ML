@@ -4,13 +4,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import patch_api_helper
+
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from agent.core.usage import sanitize_metadata  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 async def _store_with_usage(monkeypatch, estimate=1.25, budget="1"):
@@ -180,7 +182,7 @@ async def test_vertex_usage_summary_and_api_include_estimate(monkeypatch):
     async def _allow_access(*args, **kwargs):
         return SimpleNamespace()
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
 
     summary = await store.usage_summary(session_id="s-vertex")
     api_summary = await agent.usage_summary(
@@ -343,7 +345,7 @@ async def test_usage_api_response_omits_secrets(monkeypatch):
     async def _allow_access(*args, **kwargs):
         return SimpleNamespace()
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
 
     response = await agent.list_usage(session_id="s1", user={"user_id": "dev"})
 

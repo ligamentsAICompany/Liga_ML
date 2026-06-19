@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from conftest import patch_api_helper
 from fastapi import HTTPException
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent.parent / "backend"
@@ -13,7 +15,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from models import DatasetDiscoveryResponse, TrainingPreflightRequest  # noqa: E402
-from routes import agent  # noqa: E402
+from routes import api as agent  # noqa: E402
 
 
 def _recommendation() -> dict:
@@ -107,7 +109,7 @@ def allow_access(monkeypatch):
             is_active=True,
         )
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     return calls
 
 
@@ -195,7 +197,7 @@ async def test_post_training_preflight_merges_partial_request_from_latest_vertex
             is_active=True,
         )
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
 
     response = await agent.run_training_preflight(
         TrainingPreflightRequest(
@@ -241,7 +243,7 @@ async def test_post_training_preflight_without_recommendation_returns_failed_res
     async def _missing_recommendation(_session_id):
         return None
 
-    monkeypatch.setattr(agent, "_check_session_access", _allow_access)
+    patch_api_helper(monkeypatch, "_check_session_access", _allow_access)
     monkeypatch.setattr(
         agent.session_manager,
         "get_latest_training_recommendation",
@@ -294,7 +296,7 @@ async def test_preflight_routes_enforce_session_access(monkeypatch):
     async def _deny(*_args, **_kwargs):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    monkeypatch.setattr(agent, "_check_session_access", _deny)
+    patch_api_helper(monkeypatch, "_check_session_access", _deny)
 
     with pytest.raises(HTTPException) as exc_info:
         await agent.run_training_preflight(
