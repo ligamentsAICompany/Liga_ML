@@ -35,6 +35,7 @@ from agent.core.prompt_caching import with_prompt_caching
 from agent.core.session import DEFAULT_SESSION_LOG_DIR, Event, OpType, Session
 from agent.core.session_persistence import get_session_store
 from agent.core.tools import ToolRouter
+from agent.training_templates.verification import run_deterministic_checks
 from agent.tools.jobs_tool import CPU_FLAVORS
 from agent.tools.sandbox_tool import (
     DEFAULT_CPU_SANDBOX_HARDWARE,
@@ -93,17 +94,26 @@ def _truncate_tool_output(output: Any) -> str:
     return text[:_MICRO_LOOP_TOOL_OUTPUT_LIMIT] + "...[TRUNCATED]"
 
 
-def _checklist_mark_progress(checklist_state: dict[str, Any]) -> None:
-    """Advance checklist after a verified tool execution (CHECKPOINT helper)."""
+def _resolve_checklist_workspace_path(session: Session) -> str:
+    """Resolve the filesystem path used for deterministic verification."""
+    sandbox = getattr(session, "sandbox", None)
+    for attr in ("workspace", "root", "path"):
+        value = getattr(sandbox, attr, None)
+        if value:
+            return str(value)
+    return str(Path(__file__).resolve().parents[2])
+
+
+def _find_checklist_item_to_complete(
+    checklist_state: dict[str, Any],
+) -> dict[str, Any] | None:
     items = checklist_state.get("items")
     if not isinstance(items, list):
         checklist_state["items"] = []
-        return
+        return None
     for item in items:
         if isinstance(item, dict) and item.get("status") == "in_progress":
-            item["status"] = "done"
-            checklist_state["last_checkpoint_at"] = datetime.now(UTC).isoformat()
-            return
+            return item
     done_ids = {
         item.get("id")
         for item in items
@@ -114,9 +124,42 @@ def _checklist_mark_progress(checklist_state: dict[str, Any]) -> None:
             continue
         deps = item.get("dependencies") or []
         if all(dep in done_ids for dep in deps):
-            item["status"] = "done"
-            checklist_state["last_checkpoint_at"] = datetime.now(UTC).isoformat()
-            return
+            return item
+    return None
+
+
+def _checklist_mark_progress(
+    session: Session,
+    checklist_state: dict[str, Any],
+    *,
+    workspace_path: str | None = None,
+) -> None:
+    """Advance checklist after VERIFY gate passes deterministic checks."""
+    item = _find_checklist_item_to_complete(checklist_state)
+    if item is None:
+        return
+
+    workspace = workspace_path or _resolve_checklist_workspace_path(session)
+    passed, message = run_deterministic_checks(workspace)
+    if not passed:
+        item["status"] = "blocked"
+        metadata = item.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["verification_error"] = message
+        metadata["verification_workspace"] = workspace
+        metadata["blocked_at"] = datetime.now(UTC).isoformat()
+        item["metadata"] = metadata
+        checklist_state["last_blocked_at"] = datetime.now(UTC).isoformat()
+        return
+
+    item["status"] = "done"
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("verification_error", None)
+        item["metadata"] = metadata
+    checklist_state["last_checkpoint_at"] = datetime.now(UTC).isoformat()
+
 
 _AWS_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
 _GCP_MONITORING_ALLOWED_OPS = {"inspect", "logs", "ps", "cancel"}
@@ -2710,9 +2753,9 @@ class Handlers:
 
         # READ: load persistent checklist state before ACT
         persistence_store = get_session_store()
-        checklist_state: dict[str, Any] = (
-            await persistence_store.load_checklist(session.session_id) or {"items": []}
-        )
+        checklist_state: dict[str, Any] = await persistence_store.load_checklist(
+            session.session_id
+        ) or {"items": []}
         micro_loop_tool_executed = False
 
         # Agentic loop - Phase 1 micro-loop limits one LiteLLM turn per invocation
@@ -3572,7 +3615,7 @@ class Handlers:
 
         # CHECKPOINT: persist checklist before yielding back to submission_queue
         if micro_loop_tool_executed:
-            _checklist_mark_progress(checklist_state)
+            _checklist_mark_progress(session, checklist_state)
             await persistence_store.save_checklist(session.session_id, checklist_state)
 
         return final_response

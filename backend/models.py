@@ -643,6 +643,7 @@ class ChecklistItem(BaseModel):
     description: str
     status: TaskStatus = "todo"
     dependencies: list[str] = []
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class Checklist(BaseModel):
