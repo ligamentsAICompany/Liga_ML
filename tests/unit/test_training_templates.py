@@ -1,4 +1,5 @@
 import ast
+import json
 
 from agent.training_templates.sft import SftTemplateConfig, build_sft_training_script
 
@@ -323,3 +324,60 @@ def test_sft_template_reuse_existing_verifies_space_before_enabling_trackio():
     assert '"trackio_mode": "reuse-existing"' in script
     assert 'api.repo_info(repo_id=trackio_space_id, repo_type="space")' in script
     assert "reuse-existing requested but TRACKIO_SPACE_ID was not provided" in script
+
+
+def _load_format_example_runner(column_mapping: dict[str, str | list[str]]):
+    config = SftTemplateConfig(
+        dataset_name="owner/session-datasets",
+        model_name="Qwen/Qwen2.5-0.5B-Instruct",
+        hub_model_id="",
+        output_policy="cloud-private",
+        column_mapping=column_mapping,
+    )
+    script = build_sft_training_script(config)
+    start = script.index("def _string_value")
+    end = script.index("\n\ndef load_dataset_split")
+    namespace: dict[str, object] = {
+        "CONFIG": {
+            "column_mapping": config.column_mapping,
+        },
+        "json": json,
+    }
+    exec(script[start:end], namespace)
+    return namespace["format_example"]
+
+
+def test_format_example_nested_json_string_column():
+    format_example = _load_format_example_runner(
+        {
+            "user": "Prompt (Natural Language)",
+            "assistant": "Completion (JSX/TSX)",
+        }
+    )
+    example = {
+        "data": (
+            '{"Prompt (Natural Language)": "Create a button", '
+            '"Completion (JSX/TSX)": "<Button/>"}'
+        )
+    }
+
+    result = format_example(example)
+
+    assert result["messages"][0]["content"] == "Create a button"
+    assert result["messages"][1]["content"] == "<Button/>"
+
+
+def test_tool_description_prefers_template_over_raw_script():
+    from agent.tools.gcp_vertex_jobs_tool import GCP_VERTEX_JOBS_TOOL_SPEC
+
+    description = GCP_VERTEX_JOBS_TOOL_SPEC["description"]
+    assert "template='sft'" in description
+    assert (
+        "For uploaded datasets (XLSX, CSV, JSONL), always use template='sft'"
+        in description
+    )
+    assert "'script': '/app/train.py'" not in description
+    assert (
+        "Raw script mode is only for workflows the template cannot support."
+        in description
+    )

@@ -297,6 +297,31 @@ def _missing_column_error(kind, column):
     return KeyError(f"Mapped {{kind}} column is missing: {{column}}")
 
 
+def _parsed_json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _resolve_column_value(example, column):
+    if column in example:
+        return _string_value(example, column)
+    for value in example.values():
+        parsed = _parsed_json_object(value)
+        if parsed and column in parsed:
+            return str(parsed[column]).strip()
+    return None
+
+
 def fallback_text_from_example(example):
     data = example.get("data")
     if isinstance(data, dict):
@@ -310,20 +335,26 @@ def fallback_text_from_example(example):
 
 
 def _messages_from_pair(example, user_column, assistant_columns):
-    if user_column not in example:
+    user_value = _resolve_column_value(example, user_column)
+    if user_value is None:
         raise _missing_column_error("user", user_column)
-    missing = [column for column in assistant_columns if column not in example]
+    missing = [
+        column
+        for column in assistant_columns
+        if _resolve_column_value(example, column) is None
+    ]
     if missing:
         raise _missing_column_error("assistant", missing[0])
 
     assistant_text = "\\n\\n".join(
-        _string_value(example, column)
+        value
         for column in assistant_columns
-        if _string_value(example, column)
+        for value in [_resolve_column_value(example, column)]
+        if value
     )
     return {{
         "messages": [
-            {{"role": "user", "content": _string_value(example, user_column)}},
+            {{"role": "user", "content": user_value}},
             {{"role": "assistant", "content": assistant_text}},
         ]
     }}
@@ -354,9 +385,10 @@ def format_example(example):
         return {{"messages": example["messages"]}}
     if mapping.get("text"):
         text_column = mapping["text"]
-        if text_column not in example:
+        text_value = _resolve_column_value(example, text_column)
+        if text_value is None:
             raise _missing_column_error("text", text_column)
-        return {{"text": _string_value(example, text_column)}}
+        return {{"text": text_value}}
     if mapping.get("user") or mapping.get("assistant"):
         user_column = mapping.get("user") or "input"
         assistant_columns = mapping.get("assistant") or ["output"]

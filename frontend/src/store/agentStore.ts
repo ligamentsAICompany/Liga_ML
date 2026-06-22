@@ -73,6 +73,7 @@ export interface JobRuntimeState {
   s3ModelArtifact?: string;
   cloudWatchLogsUrl?: string;
   outputPolicy?: string;
+  updatedAt?: number;
 }
 
 export type ActivityStatus =
@@ -164,6 +165,7 @@ interface AgentStore {
 
   // Runtime job metadata emitted by long-running backends such as Vertex AI.
   jobRuntimeStates: Record<string, JobRuntimeState>;
+  jobRuntimeStatesByJobName: Record<string, JobRuntimeState>;
 
   // Trackio dashboard config per tool call (tool_call_id -> {spaceId, project?})
   // Set by hf_jobs / sandbox_create tools when the agent declares trackio_space_id;
@@ -226,6 +228,7 @@ interface AgentStore {
 
   setJobRuntimeState: (toolCallId: string, patch: JobRuntimeState) => void;
   getJobRuntimeState: (toolCallId: string) => JobRuntimeState | undefined;
+  getJobRuntimeStateByJobName: (jobName: string) => JobRuntimeState | undefined;
 
   setTrackioDashboard: (toolCallId: string, spaceId: string, project?: string) => void;
   getTrackioDashboard: (toolCallId: string) => { spaceId: string; project?: string } | undefined;
@@ -340,6 +343,7 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   jobUrls: {},
   jobStatuses: {},
   jobRuntimeStates: {},
+  jobRuntimeStatesByJobName: {},
   trackioDashboards: loadTrackioDashboards(),
   toolErrors: loadToolErrors(),
   rejectedTools: loadRejectedTools(),
@@ -542,18 +546,33 @@ export const useAgentStore = create<AgentStore>()((set, get) => ({
   getJobStatus: (toolCallId) => get().jobStatuses[toolCallId],
 
   setJobRuntimeState: (toolCallId, patch) => {
-    set((state) => ({
-      jobRuntimeStates: {
-        ...state.jobRuntimeStates,
-        [toolCallId]: {
-          ...state.jobRuntimeStates[toolCallId],
-          ...patch,
+    const updatedAt = Date.now();
+    set((state) => {
+      const merged: JobRuntimeState = {
+        ...state.jobRuntimeStates[toolCallId],
+        ...patch,
+        updatedAt,
+      };
+      const nextByJobName = { ...state.jobRuntimeStatesByJobName };
+      if (merged.jobName) {
+        const existing = nextByJobName[merged.jobName];
+        if (!existing || (existing.updatedAt ?? 0) <= updatedAt) {
+          nextByJobName[merged.jobName] = merged;
+        }
+      }
+      return {
+        jobRuntimeStates: {
+          ...state.jobRuntimeStates,
+          [toolCallId]: merged,
         },
-      },
-    }));
+        jobRuntimeStatesByJobName: nextByJobName,
+      };
+    });
   },
 
   getJobRuntimeState: (toolCallId) => get().jobRuntimeStates[toolCallId],
+
+  getJobRuntimeStateByJobName: (jobName) => get().jobRuntimeStatesByJobName[jobName],
 
   // ── Trackio Dashboards ──────────────────────────────────────────────
 

@@ -24,6 +24,8 @@ system_prompt: |
 
   You can also call research tools directly (explore_hf_docs, github_read_file, etc.) for quick lookups.
 
+  Do NOT use web search or library research tools for internal Liga ML tools (gcp_vertex_jobs, hf_jobs, sandbox_tool, training_preflight). Use the tool schema and system prompt as the reference.
+
   Skip research only for trivial non-code operations.
 
   # Mistakes you WILL make without research
@@ -143,6 +145,8 @@ system_prompt: |
   For Google Cloud Vertex AI provider flow (`cloud_provider=gcp-vertex`) after a `gcp_vertex_jobs` run has launched:
     1. Monitor only with `gcp_vertex_jobs` operations `inspect`, `logs`, or `ps`.
     2. Do not use `sandbox_create`, sandbox `bash`/`sleep`, `hf_jobs`, or `aws_sagemaker_jobs` for Vertex job cooldown, polling, or monitoring unless the user explicitly changes provider.
+    3. When gcp_vertex_jobs returns poll_blocked=true, do NOT call gcp_vertex_jobs again. Tell the user the job is running and you will check back after retry_after_seconds.
+    4. When a Vertex AI job reaches a terminal state, if an HF sandbox is active, stop it immediately to avoid unnecessary charges.
 
   GPU preflight is mandatory before hf_jobs or gcp_vertex_jobs when the job will run on GPU, or when the script loads a model, uses CUDA, bf16/fp16, quantization, flash attention, or torch.compile. First create a GPU sandbox with sandbox_create (t4-small minimum; choose larger hardware when VRAM requires it), run a tiny smoke test there using the same imports, model-loading path, training entrypoint, and a tiny dataset/subset, then fix failures before submitting. If you skip GPU sandbox preflight, state why before calling the cloud job tool.
 

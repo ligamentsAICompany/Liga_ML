@@ -11,7 +11,11 @@ from agent.core.preflight_gcp_vertex import (
     _probe_vertex_custom_jobs,
     run_gcp_vertex_preflight_checks,
 )
-from agent.core.training_preflight import PreflightStatus, run_training_preflight
+from agent.core.training_preflight import (
+    PreflightSeverity,
+    PreflightStatus,
+    run_training_preflight,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -443,3 +447,23 @@ async def test_credential_paths_are_redacted_and_no_mutating_methods_called():
         }
         for call in fake_client.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_vertex_api_sdk_missing_is_info_severity():
+    result = await run_gcp_vertex_preflight_checks(
+        provider="gcp-vertex",
+        model_id="Qwen/Qwen2.5-0.5B-Instruct",
+        hardware_id="gcp-vertex:n1-standard-8-t4",
+        output_policy="cloud-private",
+        project_id="proj-1",
+        region="us-central1",
+        target_bucket="gs://bucket",
+        gcp_client_factory=lambda: FakeGcpClient(vertex_api=None),
+    )
+
+    check = {item.check_id: item for item in result.checks}["gcp.vertex.api"]
+    assert check.status == PreflightStatus.UNKNOWN
+    assert check.severity == PreflightSeverity.INFO
+    assert check.error_code == "sdk_missing"
+    assert "does NOT block job submission" in check.message

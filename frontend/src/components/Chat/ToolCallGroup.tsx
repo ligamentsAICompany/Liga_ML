@@ -11,7 +11,7 @@ import { useAgentStore, type ResearchAgentState } from '@/store/agentStore';
 import { useLayoutStore } from '@/store/layoutStore';
 import { logger } from '@/utils/logger';
 import { RESEARCH_MAX_STEPS } from '@/lib/research-store';
-import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel } from '@/lib/vertex-job-panel';
+import { appendTrainingResultSummary, buildVertexStateMarkdown, createVertexRunPanel, resolveVertexRuntimeState } from '@/lib/vertex-job-panel';
 import { storageDestinationLabel, trainingGoalLabel } from '@/lib/gcloud-preflight';
 import { createTrainingPlannerPanel } from '@/lib/training-planner-panel';
 import { createTrainingPreflightPanel } from '@/lib/training-preflight-panel';
@@ -899,7 +899,7 @@ function InlineApproval({
 const EMPTY_AGENTS: Record<string, ResearchAgentState> = {};
 
 export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProps) {
-  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getJobRuntimeState, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected } = useAgentStore();
+  const { setPanel, lockPanel, getJobUrl, getEditedScript, setJobStatus, getJobStatus, getJobRuntimeState, getJobRuntimeStateByJobName, getTrackioDashboard, setToolError, getToolError, setToolRejected, getToolRejected, jobRuntimeStates, jobRuntimeStatesByJobName } = useAgentStore();
   const activeSessionId = useAgentStore(s => s.activeSessionId);
   const researchAgents = useAgentStore(s => {
     const activeId = s.activeSessionId;
@@ -1208,7 +1208,13 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       if (tool.toolName === 'gcp_vertex_jobs' && args) {
         const vertexPanel = createVertexRunPanel(args);
         const jobOutput = tool.output ?? (tool.state === 'output-error' ? (tool as Record<string, unknown>).errorText : undefined);
-        const runtimeState = getJobRuntimeState(tool.toolCallId);
+        const directRuntime = getJobRuntimeState(tool.toolCallId);
+        const runtimeState = resolveVertexRuntimeState(
+          tool.toolCallId,
+          directRuntime?.jobName,
+          jobRuntimeStates,
+          jobRuntimeStatesByJobName,
+        ) ?? directRuntime;
         const stateMarkdown = buildVertexStateMarkdown(runtimeState || {});
         const outputContent = appendTrainingResultSummary([jobOutput ? String(jobOutput) : '', stateMarkdown]
           .filter(Boolean)
@@ -1325,7 +1331,7 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
         setRightPanelOpen(true);
       }
     },
-    [toolDisplayMap, setPanelIfChanged, getEditedScript, getJobRuntimeState, setRightPanelOpen, setLeftSidebarOpen],
+    [toolDisplayMap, setPanelIfChanged, getEditedScript, getJobRuntimeState, jobRuntimeStates, jobRuntimeStatesByJobName, setRightPanelOpen, setLeftSidebarOpen],
   );
 
   // ── Panel click handler ───────────────────────────────────────────
@@ -1539,7 +1545,14 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
           const isJobTool = tool.toolName === 'hf_jobs' || tool.toolName === 'gcp_vertex_jobs' || tool.toolName === 'aws_sagemaker_jobs';
           const jobUrlFromStore = isJobTool ? getJobUrl(tool.toolCallId) : undefined;
           const jobStatusFromStore = tool.toolName === 'hf_jobs' ? getJobStatus(tool.toolCallId) : undefined;
-          const vertexRuntimeState = tool.toolName === 'gcp_vertex_jobs' ? getJobRuntimeState(tool.toolCallId) : undefined;
+          const vertexRuntimeState = tool.toolName === 'gcp_vertex_jobs'
+            ? resolveVertexRuntimeState(
+              tool.toolCallId,
+              getJobRuntimeState(tool.toolCallId)?.jobName,
+              jobRuntimeStates,
+              jobRuntimeStatesByJobName,
+            ) ?? getJobRuntimeState(tool.toolCallId)
+            : undefined;
           const awsRuntimeState = tool.toolName === 'aws_sagemaker_jobs' ? getJobRuntimeState(tool.toolCallId) : undefined;
 
           const jobMetaFromOutput = tool.toolName === 'hf_jobs' && (tool.output || (tool as Record<string, unknown>).errorText)

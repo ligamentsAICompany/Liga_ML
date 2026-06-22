@@ -1,6 +1,7 @@
 import base64
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -933,3 +934,104 @@ async def test_run_sft_template_staging_failure_emits_blocked_state(monkeypatch)
     assert session.events[0].data["state"] == "blocked"
     assert session.events[0].data["tool"] == "gcp_vertex_jobs"
     assert FakeCustomJob.instances == []
+
+
+class FakePendingJobServiceClient:
+    def __init__(self, *, create_time, state_name="JOB_STATE_PENDING"):
+        self.create_time = create_time
+        self.state_name = state_name
+        self.kwargs = {}
+
+    def get_custom_job(self, name):
+        return SimpleNamespace(
+            name=name,
+            display_name="pending-job",
+            state=FakeState(self.state_name),
+            create_time=self.create_time,
+            update_time="updated",
+        )
+
+
+@pytest.mark.asyncio
+async def test_cooldown_response_includes_poll_blocked_key(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+    monkeypatch.setenv("GCP_VERTEX_MONITOR_COOLDOWN_SECONDS", "120")
+
+    session = FakeSession()
+    job_name = "projects/test-project/locations/us-central1/customJobs/123"
+    session._gcp_vertex_monitor_cache = {
+        job_name: {"monotonic": 999999999.0, "state": "JOB_STATE_RUNNING"}
+    }
+    tool = GcpVertexJobsTool(
+        session=session,
+        job_service_client_cls=FakeJobServiceClient,
+    )
+
+    result = await tool.execute({"operation": "logs", "job_name": job_name})
+
+    assert result["poll_blocked"] is True
+    assert result["retry_after_seconds"] > 0
+
+
+@pytest.mark.asyncio
+async def test_inspect_pending_too_long_sets_flag(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+
+    create_time = datetime.now(timezone.utc) - timedelta(minutes=20)
+    tool = GcpVertexJobsTool(
+        job_service_client_cls=lambda **kwargs: FakePendingJobServiceClient(
+            create_time=create_time
+        ),
+    )
+    job_name = "projects/test-project/locations/us-central1/customJobs/123"
+
+    result = await tool.execute({"operation": "inspect", "job_name": job_name})
+
+    assert result["pending_too_long"] is True
+    assert result["suggested_fallback_machine"] == "n1-standard-8"
+    assert result["suggested_fallback_accelerator"] == "NVIDIA_TESLA_T4"
+
+
+@pytest.mark.asyncio
+async def test_inspect_pending_recent_no_flag(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+
+    create_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+    tool = GcpVertexJobsTool(
+        job_service_client_cls=lambda **kwargs: FakePendingJobServiceClient(
+            create_time=create_time
+        ),
+    )
+    job_name = "projects/test-project/locations/us-central1/customJobs/123"
+
+    result = await tool.execute({"operation": "inspect", "job_name": job_name})
+
+    assert "pending_too_long" not in result
+
+
+@pytest.mark.asyncio
+async def test_inspect_terminal_job_sets_sandbox_stop_flag(monkeypatch):
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_CLOUD_REGION", "us-central1")
+    monkeypatch.setenv("GCS_BUCKET", "liga-training")
+
+    session = FakeSession()
+    session.sandbox = object()
+    tool = GcpVertexJobsTool(
+        session=session,
+        tool_call_id="call-terminal",
+        job_service_client_cls=FakeFailedJobServiceClient,
+        logging_client_cls=FakeFailureLoggingClient,
+    )
+    job_name = "projects/test-project/locations/us-central1/customJobs/123"
+
+    result = await tool.execute({"operation": "inspect", "job_name": job_name})
+
+    assert result["sandbox_still_running"] is True
+    assert result["sandbox_stop_recommended"] is True

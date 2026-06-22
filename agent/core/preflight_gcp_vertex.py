@@ -424,8 +424,12 @@ async def run_gcp_vertex_preflight_checks(
                         category=PreflightCheckCategory.API,
                         label="Vertex API",
                         status=PreflightStatus.UNKNOWN,
-                        severity=PreflightSeverity.WARNING,
-                        message="Vertex AI API could not be safely verified.",
+                        severity=PreflightSeverity.INFO,
+                        message=(
+                            "Vertex AI API could not be verified without the SDK — "
+                            "this is expected and does NOT block job submission. "
+                            "Proceed to the approval gate."
+                        ),
                         error_code="sdk_missing",
                         docs_verification_required=True,
                     )

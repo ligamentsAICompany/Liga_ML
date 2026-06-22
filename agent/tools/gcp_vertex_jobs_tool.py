@@ -851,13 +851,13 @@ class GcpVertexJobsTool:
             failure_reason, logs_unavailable = await self._failure_reason_for_job(
                 config, job
             )
-            await self._emit_vertex_state_change(
-                job,
-                state=state,
-                console_url=console_url,
-                failure_reason=failure_reason,
-                logs_unavailable=logs_unavailable,
-            )
+        await self._emit_vertex_state_change(
+            job,
+            state=state,
+            console_url=console_url,
+            failure_reason=failure_reason,
+            logs_unavailable=logs_unavailable,
+        )
         failure_section = ""
         if failure_reason:
             failure_section = (
@@ -868,7 +868,7 @@ class GcpVertexJobsTool:
                 "\n\n**Failure reason:** Vertex reported failure, but logs are not "
                 f"available yet. View in Vertex AI: {console_url}"
             )
-        return {
+        result: dict[str, Any] = {
             "formatted": (
                 "**Vertex AI job details:**\n\n"
                 f"**Job:** `{job.name}`\n"
@@ -882,6 +882,20 @@ class GcpVertexJobsTool:
             "totalResults": 1,
             "resultsShared": 1,
         }
+        if state == "JOB_STATE_PENDING":
+            pending_minutes = _job_pending_minutes(job)
+            if pending_minutes is not None and pending_minutes >= 15:
+                result["pending_too_long"] = True
+                result["suggested_fallback_machine"] = "n1-standard-8"
+                result["suggested_fallback_accelerator"] = "NVIDIA_TESLA_T4"
+        if (
+            state in TERMINAL_JOB_STATES
+            and self.session
+            and getattr(self.session, "sandbox", None)
+        ):
+            result["sandbox_still_running"] = True
+            result["sandbox_stop_recommended"] = True
+        return result
 
     async def _cancel_job(self, args: dict[str, Any]) -> ToolResult:
         job_name = args.get("job_name") or args.get("job_id")
@@ -988,12 +1002,7 @@ class GcpVertexJobsTool:
     ) -> None:
         if not self.session or not self.tool_call_id:
             return
-        state_label = {
-            "JOB_STATE_SUCCEEDED": "succeeded",
-            "JOB_STATE_FAILED": "failed",
-            "JOB_STATE_CANCELLED": "cancelled",
-            "JOB_STATE_EXPIRED": "expired",
-        }.get(state, state.lower())
+        state_label = _vertex_state_label(state)
         await self.session.send_event(
             Event(
                 event_type="tool_state_change",
@@ -1052,6 +1061,8 @@ class GcpVertexJobsTool:
                 "Google Cloud wait; continue other work or summarize that the job is "
                 "running in Vertex AI."
             ),
+            "poll_blocked": True,
+            "retry_after_seconds": remaining,
             "totalResults": 0,
             "resultsShared": 0,
         }
@@ -1105,6 +1116,51 @@ def _state_name(state: Any) -> str:
     return str(state)
 
 
+def _vertex_state_label(state: str) -> str:
+    mapping = {
+        "JOB_STATE_SUCCEEDED": "succeeded",
+        "JOB_STATE_FAILED": "failed",
+        "JOB_STATE_CANCELLED": "cancelled",
+        "JOB_STATE_EXPIRED": "expired",
+        "JOB_STATE_RUNNING": "running",
+        "JOB_STATE_PENDING": "queued",
+        "JOB_STATE_QUEUED": "queued",
+        "JOB_STATE_CANCELLING": "cancelling",
+    }
+    if state in mapping:
+        return mapping[state]
+    normalized = state.lower()
+    if normalized.startswith("job_state_"):
+        return normalized.replace("job_state_", "", 1)
+    return normalized
+
+
+def _job_pending_minutes(job: Any) -> float | None:
+    create_time = getattr(job, "create_time", None)
+    if create_time is None:
+        return None
+    try:
+        if hasattr(create_time, "timestamp"):
+            created = datetime.fromtimestamp(create_time.timestamp(), tz=timezone.utc)
+        elif isinstance(create_time, datetime):
+            created = (
+                create_time
+                if create_time.tzinfo
+                else create_time.replace(tzinfo=timezone.utc)
+            )
+        elif isinstance(create_time, str):
+            normalized = create_time.replace("Z", "+00:00")
+            created = datetime.fromisoformat(normalized)
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+        else:
+            return None
+        elapsed = datetime.now(timezone.utc) - created
+        return elapsed.total_seconds() / 60.0
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _safe_job_resource_name(job: Any) -> str:
     for attr in ("resource_name", "name"):
         try:
@@ -1133,7 +1189,8 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
         "For normal supervised fine-tuning, prefer {'operation': 'run', 'template': 'sft', ...} "
         "instead of hand-writing an inline script. The SFT template uses the stable Liga ML "
         "runtime, conservative defaults, GCS output, and output-policy-aware final storage. "
-        "Use raw script mode only for advanced workflows that the template does not support.\n\n"
+        "For uploaded datasets (XLSX, CSV, JSONL), always use template='sft' with column_mapping. "
+        "Raw script mode is only for workflows the template cannot support.\n\n"
         "Vertex AI run operations are billable and approval-gated. Include max_run_hours "
         "on run calls so approval and auto-approval budget checks can estimate a conservative "
         "upper bound. If max_run_hours is omitted, manual approval is required.\n\n"
@@ -1149,13 +1206,21 @@ GCP_VERTEX_JOBS_TOOL_SPEC = {
         "Monitoring discipline: after a run is submitted, call inspect/logs once, then wait. "
         "Do not call sandbox bash/read/write/edit just to sleep or poll a Vertex job. "
         "If this tool returns a monitoring cooldown message, stop polling that job until "
-        "the cooldown expires and tell the user the job is still running in Vertex AI.\n\n"
+        "the cooldown expires and tell the user the job is still running in Vertex AI. "
+        "When poll_blocked=true is returned, do NOT call gcp_vertex_jobs again until "
+        "retry_after_seconds has elapsed. "
+        "If inspect returns pending_too_long=true, inform the user and offer to cancel "
+        "and resubmit with suggested_fallback_machine and suggested_fallback_accelerator.\n\n"
         "Operations: run, ps, logs, inspect, cancel.\n"
         "Examples:\n"
-        "{'operation': 'run', 'script': '/app/train.py', 'display_name': 'gst-sft', "
-        "'machine_type': 'n1-standard-8', 'accelerator_type': 'NVIDIA_TESLA_T4', "
-        "'accelerator_count': 1, 'max_run_hours': 2, "
-        "'env': {'HF_MODEL_ID': 'ligaments/gst-model'}}\n"
+        "{'operation': 'run', 'template': 'sft', 'display_name': 'uploaded-xlsx-sft', "
+        "'dataset_name': 'owner/session-datasets', 'dataset_config': 'upload_abc', "
+        "'model_name': 'Qwen/Qwen2.5-0.5B-Instruct', "
+        "'column_mapping': {'user': 'Prompt (Natural Language)', "
+        "'assistant': 'Completion (JSX/TSX)'}, "
+        "'training_goal': 'smoke-test', 'output_policy': 'cloud-private', "
+        "'machine_type': 'g2-standard-16', 'accelerator_type': 'NVIDIA_L4', "
+        "'accelerator_count': 1, 'max_run_hours': 2}\n"
         "{'operation': 'run', 'template': 'sft', 'display_name': 'medical-sft', "
         "'dataset_name': 'FreedomIntelligence/medical-o1-reasoning-SFT', "
         "'dataset_config': 'en', 'model_name': 'Qwen/Qwen2.5-0.5B-Instruct', "

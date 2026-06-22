@@ -1,6 +1,7 @@
 import { parseLigaTrainingResult, type TrainingResult } from '../utils/trainingResult.js';
 import { buildEvaluationMarkdown } from './post-training-evaluation.js';
 import { outputPolicyLabel, storageDestinationLabel, trainingGoalLabel } from './gcloud-preflight.js';
+import type { JobRuntimeState } from '../store/agentStore.js';
 import type { OutputPolicy, TrainingGoal } from '../types/agent.js';
 
 interface PanelSection {
@@ -41,11 +42,37 @@ export function vertexRunStatusLabel(
 /** Human-readable label for Vertex provider tool_state_change values. */
 export function vertexProviderStateLabel(state: string | undefined): string {
   const normalized = String(state ?? '').toLowerCase();
-  if (normalized === 'queued' || normalized === 'pending' || normalized === 'starting') {
+  if (!normalized || normalized === 'unknown') return 'Checking...';
+  if (
+    normalized.includes('pending')
+    || normalized === 'queued'
+    || normalized === 'starting'
+  ) {
     return 'Queued on GCP';
   }
-  if (normalized === 'running') return 'Running on GCP';
-  return normalized || 'unknown';
+  if (normalized.includes('running')) return 'Running on GCP';
+  if (normalized === 'succeeded') return 'Succeeded on GCP';
+  if (normalized === 'failed') return 'Failed on GCP';
+  if (normalized === 'cancelled' || normalized === 'cancelling') return 'Cancelled on GCP';
+  if (normalized === 'expired') return 'Expired on GCP';
+  return normalized;
+}
+
+/** Prefer the newest runtime state for a Vertex job across tool calls. */
+export function resolveVertexRuntimeState(
+  toolCallId: string,
+  jobName: string | undefined,
+  states: Record<string, JobRuntimeState>,
+  statesByJobName: Record<string, JobRuntimeState>,
+): JobRuntimeState | undefined {
+  const direct = states[toolCallId];
+  const named = jobName ? statesByJobName[jobName] : undefined;
+  if (!direct && !named) return undefined;
+  if (!direct) return named;
+  if (!named) return direct;
+  return (named.updatedAt ?? 0) >= (direct.updatedAt ?? 0)
+    ? { ...direct, ...named }
+    : { ...named, ...direct };
 }
 
 const VERTEX_SUMMARY_FIELDS = [
