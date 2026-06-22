@@ -49,6 +49,10 @@ _MALFORMED_TOOL_PREFIX = "ERROR: Tool call to '"
 _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
 _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT = 2
 _VERTEX_SMOKE_CONTINUATION_RETRY_LIMIT = 2
+# A reasoning model can burn its whole output budget on internal reasoning,
+# returning empty visible content with finish_reason="length". Retry a bounded
+# number of times with a concise-output hint before surfacing a hard error.
+_EMPTY_LENGTH_RETRY_LIMIT = 2
 _ACTIVE_CLOUD_JOB_STATES = {
     "created",
     "creating",
@@ -2675,6 +2679,7 @@ class Handlers:
         max_iterations = session.config.max_iterations
         no_tool_incomplete_plan_retries = 0
         vertex_smoke_continuation_retries = 0
+        empty_length_retries = 0
 
         while max_iterations == -1 or iteration < max_iterations:
             # ── Cancellation check: before LLM call ──
@@ -2827,6 +2832,52 @@ class Handlers:
                 # If no tool calls, add assistant message and we're done
                 if not tool_calls:
                     if not content:
+                        # A reasoning model can hit the output token limit while
+                        # emitting only internal reasoning, leaving empty visible
+                        # content and no tool call. Don't treat this as a dead
+                        # end — nudge it toward a concise answer and retry a
+                        # bounded number of times before surfacing the error.
+                        if (
+                            finish_reason == "length"
+                            and empty_length_retries < _EMPTY_LENGTH_RETRY_LIMIT
+                        ):
+                            empty_length_retries += 1
+                            logger.warning(
+                                "Empty response with finish_reason=length (no "
+                                "content, no tool calls) — retrying with a "
+                                "concise-output hint (attempt %d/%d)",
+                                empty_length_retries,
+                                _EMPTY_LENGTH_RETRY_LIMIT,
+                            )
+                            session.context_manager.add_message(
+                                Message(
+                                    role="user",
+                                    content=(
+                                        "[SYSTEM: Your previous response hit the "
+                                        "output token limit before producing any "
+                                        "visible text or tool call "
+                                        "(finish_reason=length). This usually "
+                                        "means too much internal reasoning. "
+                                        "Respond now with a concise, direct answer "
+                                        "or a single tool call, and keep reasoning "
+                                        "brief.]"
+                                    ),
+                                )
+                            )
+                            await session.send_event(
+                                Event(
+                                    event_type="tool_log",
+                                    data={
+                                        "tool": "system",
+                                        "log": (
+                                            "Output truncated before any content — "
+                                            "retrying with a concise-output hint"
+                                        ),
+                                    },
+                                )
+                            )
+                            iteration += 1
+                            continue
                         if _should_emit_hf_planner_fallback(session, text):
                             fallback_msg = _hf_planner_fallback_message(session)
                             await _emit_visible_assistant_message(session, fallback_msg)

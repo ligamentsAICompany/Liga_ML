@@ -1348,6 +1348,26 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
 
   // ── Auto-follow currently active tool when not locked ─────────────
   const activeToolIdRef = useRef<string | null>(null);
+  // Signature of the last panel we auto-pushed. ToolCallGroup subscribes to the
+  // whole agent store, so every setPanel re-renders it and re-runs the
+  // auto-follow effect below. Without this guard the effect re-pushes the panel
+  // on every render; if any panel field isn't byte-stable across renders that
+  // becomes an infinite setPanel loop ("Maximum update depth exceeded"). Only
+  // re-show when the followed tool's meaningful state actually changes.
+  const lastAutoFollowSigRef = useRef<string | null>(null);
+  const autoFollowSignature = useCallback(
+    (tool: DynamicToolPart): string => {
+      const output = tool.output ?? (tool as Record<string, unknown>).errorText ?? '';
+      const runtime = getJobRuntimeState(tool.toolCallId);
+      return [
+        tool.toolCallId,
+        tool.state,
+        String(output).length,
+        runtime ? JSON.stringify(runtime) : '',
+      ].join('|');
+    },
+    [getJobRuntimeState],
+  );
 
   useEffect(() => {
     if (lockedToolId !== null) return; // User has locked a tool, don't auto-follow
@@ -1359,19 +1379,24 @@ export default function ToolCallGroup({ tools, approveTools }: ToolCallGroupProp
       t.state === 'approval-responded'
     );
 
-    if (runningTool) {
-      // Track this as the active tool and show its panel
-      activeToolIdRef.current = runningTool.toolCallId;
-      showToolPanel(runningTool);
-    } else if (activeToolIdRef.current) {
-      // No running tool, but we were following one - check if it completed
-      const completedTool = tools.find(t => t.toolCallId === activeToolIdRef.current);
-      if (completedTool && (completedTool.state === 'output-available' || completedTool.state === 'output-error')) {
-        // The tool we were following has completed - update its panel
-        showToolPanel(completedTool);
-      }
-    }
-  }, [tools, lockedToolId, showToolPanel]);
+    const followTool = runningTool
+      ?? (activeToolIdRef.current
+        ? tools.find(t =>
+            t.toolCallId === activeToolIdRef.current
+            && (t.state === 'output-available' || t.state === 'output-error'))
+        : undefined);
+
+    if (!followTool) return;
+
+    // Skip if nothing meaningful changed since the last auto-push — this is the
+    // guard that prevents the re-render → setPanel → re-render loop.
+    const sig = autoFollowSignature(followTool);
+    if (sig === lastAutoFollowSigRef.current) return;
+    lastAutoFollowSigRef.current = sig;
+
+    activeToolIdRef.current = followTool.toolCallId;
+    showToolPanel(followTool);
+  }, [tools, lockedToolId, showToolPanel, autoFollowSignature]);
 
   // ── Parse hf_jobs metadata from output ────────────────────────────
   function parseJobMeta(output: unknown): { jobUrl?: string; jobStatus?: string } {

@@ -195,6 +195,102 @@ async def test_empty_llm_response_emits_visible_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_empty_length_response_retries_with_concise_hint_then_succeeds(
+    monkeypatch,
+):
+    """finish_reason=length with no content/tools should retry, not hard-fail.
+
+    A reasoning model (e.g. Kimi K2.6) can exhaust its output budget on
+    internal reasoning, returning empty visible content with
+    finish_reason='length'. Instead of surfacing an empty_response error,
+    the loop injects a concise-output hint and retries the turn.
+    """
+    session = _session()
+    calls = 0
+
+    async def fake_call_llm_non_streaming(session, messages, tools, llm_params):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return LLMResult(
+                content=None,
+                tool_calls_acc={},
+                token_count=0,
+                finish_reason="length",
+            )
+        return LLMResult(
+            content="Here is a concise plan.",
+            tool_calls_acc={},
+            token_count=10,
+            finish_reason="stop",
+        )
+
+    monkeypatch.setattr(
+        agent_loop, "_resolve_llm_params", lambda *_, **__: {"model": "openai/test"}
+    )
+    monkeypatch.setattr(
+        agent_loop, "_call_llm_non_streaming", fake_call_llm_non_streaming
+    )
+
+    final = await Handlers.run_agent(session, "train a tiny model")
+
+    events = await _drain_events(session)
+    assert calls == 2
+    assert final == "Here is a concise plan."
+    # A concise-output hint was injected for the retry.
+    assert any(
+        getattr(item, "role", None) == "user"
+        and "finish_reason=length" in str(getattr(item, "content", ""))
+        for item in session.context_manager.items
+    )
+    # No empty_response error surfaced because the retry recovered.
+    assert not any(
+        event.event_type == "error"
+        and (event.data or {}).get("error_type") == "empty_response"
+        for event in events
+    )
+    assert any(event.event_type == "turn_complete" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_empty_length_response_errors_after_retry_budget(monkeypatch):
+    """If length-truncation keeps recurring, the loop must stop and surface
+    a bounded empty_response error rather than retrying forever."""
+    session = _session()
+    calls = 0
+
+    async def fake_call_llm_non_streaming(session, messages, tools, llm_params):
+        nonlocal calls
+        calls += 1
+        return LLMResult(
+            content=None,
+            tool_calls_acc={},
+            token_count=0,
+            finish_reason="length",
+        )
+
+    monkeypatch.setattr(
+        agent_loop, "_resolve_llm_params", lambda *_, **__: {"model": "openai/test"}
+    )
+    monkeypatch.setattr(
+        agent_loop, "_call_llm_non_streaming", fake_call_llm_non_streaming
+    )
+
+    final = await Handlers.run_agent(session, "train a tiny model")
+
+    events = await _drain_events(session)
+    assert final is None
+    # Bounded: original attempt + a small fixed number of retries, not unbounded.
+    assert calls <= 4
+    assert any(
+        event.event_type == "error"
+        and (event.data or {}).get("error_type") == "empty_response"
+        for event in events
+    )
+    assert not any(event.event_type == "turn_complete" for event in events)
+
+
+@pytest.mark.asyncio
 async def test_empty_llm_response_after_hf_planner_emits_visible_preflight_fallback(
     monkeypatch,
 ):
