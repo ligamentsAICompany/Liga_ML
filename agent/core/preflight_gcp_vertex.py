@@ -64,7 +64,14 @@ class _GoogleReadOnlyClient:
     def discover_credentials(self) -> tuple[Any, str | None]:
         import google.auth
 
+        cloud_platform_scope = ("https://www.googleapis.com/auth/cloud-platform",)
         credentials, project_id = google.auth.default()
+        if hasattr(credentials, "with_scopes_if_required"):
+            credentials = credentials.with_scopes_if_required(cloud_platform_scope)
+        elif getattr(credentials, "scopes", None) is None and hasattr(
+            credentials, "with_scopes"
+        ):
+            credentials = credentials.with_scopes(cloud_platform_scope)
         return credentials, project_id
 
     def refresh_credentials(self, credentials: Any) -> None:
