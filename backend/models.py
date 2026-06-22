@@ -325,13 +325,6 @@ class SessionNotificationsRequest(BaseModel):
     destinations: list[str]
 
 
-class SessionYoloRequest(BaseModel):
-    """Update a session's auto-approval policy."""
-
-    enabled: bool
-    cost_cap_usd: float | None = Field(default=None, ge=0)
-
-
 class DatasetUploadResponse(BaseModel):
     """Response for a dataset file uploaded to the Hub."""
 

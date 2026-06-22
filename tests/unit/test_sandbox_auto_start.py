@@ -14,14 +14,14 @@ from agent.tools.sandbox_tool import get_sandbox_tools
 
 
 def test_default_cpu_sandbox_create_does_not_require_approval():
-    config = SimpleNamespace(yolo_mode=False)
+    config = SimpleNamespace()
 
     assert _needs_approval("sandbox_create", {}, config) is False
     assert _needs_approval("sandbox_create", {"hardware": "cpu-basic"}, config) is False
 
 
 def test_non_default_sandbox_create_still_requires_approval():
-    config = SimpleNamespace(yolo_mode=False)
+    config = SimpleNamespace()
 
     assert (
         _needs_approval("sandbox_create", {"hardware": "cpu-upgrade"}, config) is True

@@ -13,7 +13,6 @@ def _config(**overrides):
         "model_name": "moonshotai/Kimi-K2.6",
         "confirm_cpu_jobs": True,
         "auto_file_upload": False,
-        "yolo_mode": False,
         **overrides,
     }
     return Config.model_validate(data)
@@ -22,9 +21,6 @@ def _config(**overrides):
 def _session(*, cap=5.0, spent=0.0, enabled=True):
     return SimpleNamespace(
         config=_config(),
-        auto_approval_enabled=enabled,
-        auto_approval_cost_cap_usd=cap,
-        auto_approval_estimated_spend_usd=spent,
         sandbox=None,
         logged_events=[],
         context_manager=SimpleNamespace(items=[]),
@@ -39,25 +35,12 @@ def _aws_state(state: str):
 
 
 @pytest.mark.asyncio
-async def test_session_yolo_auto_approves_non_costed_approval_tool():
-    decision = await agent_loop._approval_decision(
-        "hf_repo_files",
-        {"operation": "upload", "path": "README.md"},
-        _session(),
-    )
-
-    assert decision.requires_approval is False
-    assert decision.auto_approved is True
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operation",
     ["scheduled run", "scheduled uv", "scheduled  run"],
 )
 async def test_scheduled_hf_jobs_always_require_manual_approval(operation):
     session = _session()
-    session.config.yolo_mode = True
 
     decision = await agent_loop._approval_decision(
         "hf_jobs",
@@ -66,7 +49,6 @@ async def test_scheduled_hf_jobs_always_require_manual_approval(operation):
     )
 
     assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
     assert "Scheduled HF jobs" in decision.block_reason
     assert agent_loop._needs_approval(
         "hf_jobs", {"operation": operation}, session.config
@@ -131,7 +113,7 @@ def test_existing_sandbox_approval_behavior_is_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_immediate_hf_job_under_cap_auto_runs(monkeypatch):
+async def test_immediate_hf_job_requires_approval(monkeypatch):
     async def fake_estimate(*args, **kwargs):
         return CostEstimate(estimated_cost_usd=2.0, billable=True)
 
@@ -143,31 +125,8 @@ async def test_immediate_hf_job_under_cap_auto_runs(monkeypatch):
         _session(cap=5.0, spent=1.0),
     )
 
-    assert decision.requires_approval is False
-    assert decision.auto_approved is True
-    assert decision.estimated_cost_usd == 2.0
-
-
-@pytest.mark.asyncio
-async def test_immediate_hf_job_global_yolo_still_requires_manual_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=2.0, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-    session = _session(enabled=False, cap=None, spent=0.0)
-    session.config.yolo_mode = True
-
-    decision = await agent_loop._approval_decision(
-        "hf_jobs",
-        {"operation": "run", "hardware_flavor": "a10g-large", "timeout": "1h"},
-        session,
-    )
-
     assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert decision.auto_approved is False
     assert decision.estimated_cost_usd == 2.0
-    assert "manual approval" in decision.block_reason
 
 
 def test_hf_jobs_approval_metadata_includes_provider_model_and_dataset():
@@ -336,7 +295,7 @@ def test_typed_approval_words_are_detected_without_auto_launching():
 
 
 @pytest.mark.asyncio
-async def test_gcp_vertex_job_under_cap_auto_runs_when_cost_is_known(monkeypatch):
+async def test_gcp_vertex_job_requires_approval(monkeypatch):
     async def fake_estimate(*args, **kwargs):
         return CostEstimate(estimated_cost_usd=1.5, billable=True)
 
@@ -348,74 +307,7 @@ async def test_gcp_vertex_job_under_cap_auto_runs_when_cost_is_known(monkeypatch
         _session(cap=5.0, spent=1.0),
     )
 
-    assert decision.requires_approval is False
-    assert decision.auto_approved is True
-    assert decision.estimated_cost_usd == 1.5
-
-
-@pytest.mark.asyncio
-async def test_gcp_vertex_global_yolo_still_requires_manual_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=1.5, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-    session = _session(enabled=False, cap=None, spent=0.0)
-    session.config.yolo_mode = True
-
-    decision = await agent_loop._approval_decision(
-        "gcp_vertex_jobs",
-        {"operation": "run", "machine_type": "n1-standard-8", "max_run_hours": 1},
-        session,
-    )
-
     assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert decision.auto_approved is False
-    assert decision.estimated_cost_usd == 1.5
-    assert "manual approval" in decision.block_reason
-
-
-@pytest.mark.asyncio
-async def test_gcp_vertex_unknown_cost_blocks_auto_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(
-            estimated_cost_usd=None,
-            billable=True,
-            block_reason="Vertex AI cost requires max_run_hours.",
-        )
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-
-    decision = await agent_loop._approval_decision(
-        "gcp_vertex_jobs",
-        {"operation": "run", "machine_type": "n1-standard-8"},
-        _session(cap=5.0, spent=0.0),
-    )
-
-    assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert "max_run_hours" in decision.block_reason
-
-
-@pytest.mark.asyncio
-async def test_aws_sagemaker_job_under_cap_auto_runs_when_cost_is_known(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=1.5, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-
-    decision = await agent_loop._approval_decision(
-        "aws_sagemaker_jobs",
-        {
-            "operation": "run",
-            "instance_type": "ml.g5.xlarge",
-            "max_run_seconds": 3600,
-        },
-        _session(cap=5.0, spent=1.0),
-    )
-
-    assert decision.requires_approval is False
-    assert decision.auto_approved is True
     assert decision.estimated_cost_usd == 1.5
 
 
@@ -442,34 +334,11 @@ async def test_second_aws_sagemaker_run_after_terminal_job_requires_manual_appro
     )
 
     assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
     assert "second paid AWS SageMaker run" in decision.block_reason
 
 
 @pytest.mark.asyncio
-async def test_aws_sagemaker_unknown_cost_blocks_auto_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(
-            estimated_cost_usd=None,
-            billable=True,
-            block_reason="SageMaker jobs need max_run_seconds.",
-        )
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-
-    decision = await agent_loop._approval_decision(
-        "aws_sagemaker_jobs",
-        {"operation": "run", "instance_type": "ml.g5.xlarge"},
-        _session(cap=5.0, spent=0.0),
-    )
-
-    assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert "max_run_seconds" in decision.block_reason
-
-
-@pytest.mark.asyncio
-async def test_aws_sagemaker_cancel_stays_manual_with_auto_approval():
+async def test_aws_sagemaker_cancel_requires_approval():
     decision = await agent_loop._approval_decision(
         "aws_sagemaker_jobs",
         {"operation": "cancel", "job_name": "training-job"},
@@ -477,113 +346,4 @@ async def test_aws_sagemaker_cancel_stays_manual_with_auto_approval():
     )
 
     assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
     assert "cancellation" in decision.block_reason
-
-
-@pytest.mark.asyncio
-async def test_immediate_hf_job_over_cap_falls_back_to_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=2.0, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-
-    decision = await agent_loop._approval_decision(
-        "hf_jobs",
-        {"operation": "run", "hardware_flavor": "a10g-large", "timeout": "1h"},
-        _session(cap=5.0, spent=4.0),
-    )
-
-    assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert "exceeds" in decision.block_reason
-    assert decision.remaining_cap_usd == 1.0
-
-
-@pytest.mark.asyncio
-async def test_unknown_cost_falls_back_to_approval(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(
-            estimated_cost_usd=None,
-            billable=True,
-            block_reason="No price is available.",
-        )
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-
-    decision = await agent_loop._approval_decision(
-        "sandbox_create",
-        {"hardware": "mystery-gpu"},
-        _session(),
-    )
-
-    assert decision.requires_approval is True
-    assert decision.auto_approval_blocked is True
-    assert decision.estimated_cost_usd is None
-
-
-@pytest.mark.asyncio
-async def test_batch_reservation_blocks_second_over_budget_job(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=3.0, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-    session = _session(cap=5.0, spent=0.0)
-
-    first = await agent_loop._approval_decision(
-        "hf_jobs",
-        {"operation": "run", "hardware_flavor": "a10g-large"},
-        session,
-        reserved_spend_usd=0.0,
-    )
-    second = await agent_loop._approval_decision(
-        "hf_jobs",
-        {"operation": "run", "hardware_flavor": "a10g-large"},
-        session,
-        reserved_spend_usd=first.estimated_cost_usd or 0.0,
-    )
-
-    assert first.requires_approval is False
-    assert second.requires_approval is True
-    assert second.remaining_cap_usd == 2.0
-
-
-@pytest.mark.asyncio
-async def test_manual_approval_does_not_record_spend_when_session_yolo_disabled(
-    monkeypatch,
-):
-    called = False
-
-    async def fake_estimate(*args, **kwargs):
-        nonlocal called
-        called = True
-        return CostEstimate(estimated_cost_usd=2.0, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-    session = _session(enabled=False, cap=5.0, spent=0.0)
-
-    await agent_loop._record_manual_approved_spend_if_needed(
-        session,
-        "sandbox_create",
-        {"hardware": "a10g-large"},
-    )
-
-    assert called is False
-    assert session.auto_approval_estimated_spend_usd == 0.0
-
-
-@pytest.mark.asyncio
-async def test_manual_approval_records_spend_when_session_yolo_enabled(monkeypatch):
-    async def fake_estimate(*args, **kwargs):
-        return CostEstimate(estimated_cost_usd=1.25, billable=True)
-
-    monkeypatch.setattr(agent_loop, "estimate_tool_cost", fake_estimate)
-    session = _session(enabled=True, cap=5.0, spent=0.5)
-
-    await agent_loop._record_manual_approved_spend_if_needed(
-        session,
-        "sandbox_create",
-        {"hardware": "a10g-large"},
-    )
-
-    assert session.auto_approval_estimated_spend_usd == 1.75

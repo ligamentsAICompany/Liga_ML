@@ -237,10 +237,6 @@ export interface SessionMeta {
    *  disables input until the user chooses to restore-with-summary or
    *  start fresh. */
   expired?: boolean;
-  autoApprovalEnabled?: boolean;
-  autoApprovalCostCapUsd?: number | null;
-  autoApprovalEstimatedSpendUsd?: number;
-  autoApprovalRemainingUsd?: number | null;
   uploadedDatasets?: UploadedDatasetInfo[];
   latestDatasetDiscovery?: DatasetDiscoveryInfo | null;
   runs?: BackgroundRunSummary[];

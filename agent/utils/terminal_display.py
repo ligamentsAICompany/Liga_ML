@@ -444,12 +444,6 @@ def print_approval_item(index: int, total: int, tool_name: str, operation: str) 
     )
 
 
-def print_yolo_approve(count: int) -> None:
-    _console.print(
-        f"{_I}[bold yellow]yolo →[/bold yellow] auto-approved {count} item(s)"
-    )
-
-
 # ── Help ───────────────────────────────────────────────────────────────
 
 HELP_ROWS: tuple[tuple[str, str, str], ...] = (
@@ -465,7 +459,6 @@ HELP_ROWS: tuple[tuple[str, str, str], ...] = (
         "[level]",
         "Set reasoning effort preference",
     ),
-    ("/yolo", "", "Toggle auto-approve mode"),
     ("/status", "", "Current model & turn count"),
     (
         "/share-traces",

@@ -188,24 +188,6 @@ def _old_idle_agent_session(
 
 
 @pytest.mark.asyncio
-async def test_update_session_auto_approval_defaults_to_five_dollars():
-    manager = _manager_with_store(NoopSessionStore())
-    existing = _runtime_agent_session("s1", user_id="owner")
-    manager.sessions["s1"] = existing
-
-    summary = await manager.update_session_auto_approval(
-        "s1",
-        enabled=True,
-        cost_cap_usd=None,
-        cap_provided=False,
-    )
-
-    assert summary["enabled"] is True
-    assert summary["cost_cap_usd"] == 5.0
-    assert summary["remaining_usd"] == 5.0
-
-
-@pytest.mark.asyncio
 async def test_submit_user_input_preserves_hf_training_metadata():
     manager = _manager_with_store(NoopSessionStore())
     existing = _runtime_agent_session("s1", user_id="owner")
@@ -1007,34 +989,6 @@ async def test_lazy_restore_preserves_pending_approval_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_lazy_restore_preserves_auto_approval_policy():
-    store = RestoreStore(
-        metadata={
-            "session_id": "yolo-session",
-            "user_id": "owner",
-            "model": "test-model",
-            "auto_approval_enabled": True,
-            "auto_approval_cost_cap_usd": 5.0,
-            "auto_approval_estimated_spend_usd": 1.25,
-        }
-    )
-    manager = _manager_with_store(store)
-    stop = _install_fake_runtime(manager)
-
-    try:
-        restored = await manager.ensure_session_loaded("yolo-session", user_id="owner")
-
-        assert restored is not None
-        assert restored.session.auto_approval_enabled is True
-        assert restored.session.auto_approval_cost_cap_usd == 5.0
-        assert restored.session.auto_approval_estimated_spend_usd == 1.25
-        assert restored.session.auto_approval_policy_summary()["remaining_usd"] == 3.75
-    finally:
-        stop.set()
-        await _cancel_runtime_tasks(manager)
-
-
-@pytest.mark.asyncio
 async def test_lazy_restore_preserves_hf_training_metadata_and_uploaded_datasets():
     store = RestoreStore(
         metadata={
@@ -1116,11 +1070,5 @@ async def test_list_sessions_dev_uses_store_dev_visibility():
 
     assert store.seen_user_id == "dev"
     assert {session["session_id"] for session in sessions} == {"s1", "s2"}
-    yolo = next(session for session in sessions if session["session_id"] == "s1")
-    assert yolo["cloud_provider"] == "aws-sagemaker"
-    assert yolo["auto_approval"] == {
-        "enabled": True,
-        "cost_cap_usd": 5.0,
-        "estimated_spend_usd": 2.0,
-        "remaining_usd": 3.0,
-    }
+    s1 = next(session for session in sessions if session["session_id"] == "s1")
+    assert s1["cloud_provider"] == "aws-sagemaker"

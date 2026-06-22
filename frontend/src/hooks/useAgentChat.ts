@@ -81,7 +81,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
   const isActiveRef = useRef(isActive);
   isActiveRef.current = isActive;
 
-  const { setNeedsAttention, updateSessionYolo, markSessionModelUnavailable } = useSessionStore();
+  const { setNeedsAttention, markSessionModelUnavailable } = useSessionStore();
 
   // Helper: update this session's state (mirrors to globals if active)
   const updateSession = useAgentStore.getState().updateSession;
@@ -762,9 +762,6 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             );
             if (pendingIds.size > 0) setNeedsAttention(sessionId, true);
           }
-          if (info.auto_approval) {
-            updateSessionYolo(sessionId, info.auto_approval);
-          }
           return { data, pendingIds, info };
         }
         return { data, pendingIds, info: null };
@@ -1134,9 +1131,6 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           );
           if (pendingIds.size > 0) setNeedsAttention(sessionId, true);
         }
-        if (info.auto_approval) {
-          updateSessionYolo(sessionId, info.auto_approval);
-        }
         if (!info.is_processing && !(pendingIds && pendingIds.size > 0)) {
           updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
         }
@@ -1156,7 +1150,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     } catch {
       return false;
     }
-  }, [sessionId, setNeedsAttention, updateSessionYolo]);
+  }, [sessionId, setNeedsAttention]);
 
   return {
     messages: chat.messages,

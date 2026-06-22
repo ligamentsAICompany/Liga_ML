@@ -40,7 +40,6 @@ class Config(BaseModel):
     # crash before turn_complete (e.g. a multi-hour hf_jobs wait that OOMs).
     # 0 = disabled. Consumed by agent.core.telemetry.HeartbeatSaver.
     heartbeat_interval_s: int = 60
-    yolo_mode: bool = False  # Auto-approve all tool calls without confirmation
     max_iterations: int = 300  # Max LLM calls per agent turn (-1 = unlimited)
 
     # Permission control parameters

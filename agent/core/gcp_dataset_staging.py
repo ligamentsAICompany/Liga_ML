@@ -31,7 +31,8 @@ METADATA_COLUMN_NAMES = frozenset(
 
 SUPPORTED_SCHEMA_LABELS = (
     "messages, text, prompt+completion, prompt+chosen(+rejected), "
-    "instruction/output, question/answer, question/response, user/assistant"
+    "instruction/output, instruction/output+context, "
+    "question/answer, question/response, user/assistant"
 )
 
 
@@ -87,11 +88,18 @@ def _messages_have_user_and_assistant(messages: Any) -> bool:
 
 
 def _messages_from_pair(
-    row: dict[str, Any], user_column: str, assistant_columns: list[str]
+    row: dict[str, Any],
+    user_column: str,
+    assistant_columns: list[str],
+    context_column: str | None = None,
 ) -> dict[str, Any]:
     user_text = _string_value(row.get(user_column))
     if not user_text:
         raise ValueError(f"Missing user content in column {user_column!r}.")
+    if context_column:
+        context_text = _string_value(row.get(context_column))
+        if context_text:
+            user_text = f"{context_text}\n\n{user_text}"
     assistant_text = "\n\n".join(
         _string_value(row.get(column))
         for column in assistant_columns
@@ -149,7 +157,18 @@ def detect_dataset_schema(
     mapped = resolve_mapping_source_columns(row, column_mapping)
     if mapped is not None:
         user_column, assistant_columns = mapped
-        return f"{user_column}_{assistant_columns[0]}"
+        assistant_col = assistant_columns[0]
+        # If the mapped user column is "instruction" and the row has a non-empty
+        # "input" context column, promote to the _with_context schema so that the
+        # optional context field is prepended to the user message.
+        if (
+            user_column == "instruction"
+            and assistant_col in ("output", "response")
+            and "input" in row
+            and _string_value(row.get("input"))
+        ):
+            return f"instruction_{assistant_col}_with_context"
+        return f"{user_column}_{assistant_col}"
 
     if _messages_have_user_and_assistant(row.get("messages")):
         return "messages"
@@ -174,6 +193,18 @@ def detect_dataset_schema(
                 row.get(assistant_column)
             ):
                 return f"{user_column}_{assistant_column}"
+    # Fallback: instruction + output/response with optional input context column.
+    # Handles datasets like sahil2801/CodeAlpaca-20k (instruction, input, output).
+    for assistant_column in ("output", "response"):
+        if (
+            "instruction" in row
+            and assistant_column in row
+            and _string_value(row.get("instruction"))
+            and _string_value(row.get(assistant_column))
+        ):
+            if "input" in row:
+                return f"instruction_{assistant_column}_with_context"
+            return f"instruction_{assistant_column}"
     return None
 
 
@@ -205,8 +236,12 @@ def normalize_row_to_sft(
         return _messages_from_pair(row, "prompt", ["chosen"]), schema
     if schema == "instruction_output":
         return _messages_from_pair(row, "instruction", ["output"]), schema
+    if schema == "instruction_output_with_context":
+        return _messages_from_pair(row, "instruction", ["output"], context_column="input"), schema
     if schema == "instruction_response":
         return _messages_from_pair(row, "instruction", ["response"]), schema
+    if schema == "instruction_response_with_context":
+        return _messages_from_pair(row, "instruction", ["response"], context_column="input"), schema
     if schema == "input_output":
         return _messages_from_pair(row, "input", ["output"]), schema
     if schema == "input_response":

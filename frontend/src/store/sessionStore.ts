@@ -46,12 +46,6 @@ interface SessionStore {
     is_active?: boolean;
     model?: string | null;
     pending_approval?: unknown[] | null;
-    auto_approval?: {
-      enabled?: boolean;
-      cost_cap_usd?: number | null;
-      estimated_spend_usd?: number;
-      remaining_usd?: number | null;
-    } | null;
     cloud_provider?: CloudProviderId | null;
     training_goal?: TrainingGoal | null;
     output_policy?: OutputPolicy | null;
@@ -59,12 +53,6 @@ interface SessionStore {
     latest_dataset_discovery?: DatasetDiscoveryInfo | null;
     runs?: BackgroundRunSummary[];
   }>) => void;
-  updateSessionYolo: (id: string, policy: {
-    enabled: boolean;
-    cost_cap_usd?: number | null;
-    estimated_spend_usd?: number;
-    remaining_usd?: number | null;
-  }) => void;
   /** Atomically swap a session's id in the list + both localStorage caches.
    *  Used when we rehydrate an expired session into a freshly-created backend
    *  session — preserves title, timestamps, and messages. */
@@ -88,10 +76,6 @@ export const useSessionStore = create<SessionStore>()(
           cloudProvider: cloudProvider ?? 'hf-jobs',
           trainingGoal: DEFAULT_TRAINING_GOAL,
           outputPolicy: DEFAULT_OUTPUT_POLICY,
-          autoApprovalEnabled: false,
-          autoApprovalCostCapUsd: null,
-          autoApprovalEstimatedSpendUsd: 0,
-          autoApprovalRemainingUsd: null,
           uploadedDatasets: [],
           runs: [],
           unavailableModels: {},
@@ -141,7 +125,6 @@ export const useSessionStore = create<SessionStore>()(
             if (!id) continue;
             const existing = byId.get(id);
             if (existing) {
-              const auto = server.auto_approval;
               const updated = {
                 ...existing,
                 title: redactText(server.title || existing.title),
@@ -156,14 +139,6 @@ export const useSessionStore = create<SessionStore>()(
                 latestDatasetDiscovery: server.latest_dataset_discovery ?? existing.latestDatasetDiscovery ?? null,
                 runs: server.runs ?? existing.runs ?? [],
                 unavailableModels: existing.unavailableModels ?? {},
-                ...(auto
-                  ? {
-                      autoApprovalEnabled: Boolean(auto.enabled),
-                      autoApprovalCostCapUsd: auto.cost_cap_usd ?? null,
-                      autoApprovalEstimatedSpendUsd: auto.estimated_spend_usd ?? 0,
-                      autoApprovalRemainingUsd: auto.remaining_usd ?? null,
-                    }
-                  : {}),
               };
               const idx = merged.findIndex((s) => s.id === id);
               if (idx >= 0) merged[idx] = updated;
@@ -181,10 +156,6 @@ export const useSessionStore = create<SessionStore>()(
               trainingGoal: server.training_goal ?? DEFAULT_TRAINING_GOAL,
               outputPolicy: server.output_policy ?? DEFAULT_OUTPUT_POLICY,
               expired: false,
-              autoApprovalEnabled: Boolean(server.auto_approval?.enabled),
-              autoApprovalCostCapUsd: server.auto_approval?.cost_cap_usd ?? null,
-              autoApprovalEstimatedSpendUsd: server.auto_approval?.estimated_spend_usd ?? 0,
-              autoApprovalRemainingUsd: server.auto_approval?.remaining_usd ?? null,
               uploadedDatasets: server.uploaded_datasets ?? [],
               latestDatasetDiscovery: server.latest_dataset_discovery ?? null,
               runs: server.runs ?? [],
@@ -198,22 +169,6 @@ export const useSessionStore = create<SessionStore>()(
             activeSessionId: state.activeSessionId || merged[merged.length - 1]?.id || null,
           };
         });
-      },
-
-      updateSessionYolo: (id, policy) => {
-        set((state) => ({
-          sessions: state.sessions.map((s) =>
-            s.id === id
-              ? {
-                  ...s,
-                  autoApprovalEnabled: policy.enabled,
-                  autoApprovalCostCapUsd: policy.cost_cap_usd ?? null,
-                  autoApprovalEstimatedSpendUsd: policy.estimated_spend_usd ?? 0,
-                  autoApprovalRemainingUsd: policy.remaining_usd ?? null,
-                }
-              : s,
-          ),
-        }));
       },
 
       renameSession: (oldId: string, newId: string) => {

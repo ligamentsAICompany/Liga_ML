@@ -299,7 +299,6 @@ def test_restore_does_not_overwrite_source_log_on_save(tmp_path, monkeypatch):
         auto_save_interval = 1
         heartbeat_interval_s = 60
         max_iterations = 10
-        yolo_mode = False
         confirm_cpu_jobs = False
         auto_file_upload = False
         reasoning_effort = None

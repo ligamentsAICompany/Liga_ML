@@ -48,7 +48,6 @@ from agent.utils.terminal_display import (
     print_tool_log,
     print_tool_output,
     print_turn_complete,
-    print_yolo_approve,
 )
 
 litellm.drop_params = True
@@ -493,33 +492,6 @@ async def event_listener(
                 tools_data = event.data.get("tools", []) if event.data else []
                 count = event.data.get("count", 0) if event.data else 0
 
-                # If yolo mode is active, auto-approve everything except
-                # scheduled HF jobs, whose recurring cost stays manual.
-                if (
-                    config
-                    and config.yolo_mode
-                    and not any(_is_scheduled_hf_job_tool(t) for t in tools_data)
-                ):
-                    approvals = [
-                        {
-                            "tool_call_id": t.get("tool_call_id", ""),
-                            "approved": True,
-                            "feedback": None,
-                        }
-                        for t in tools_data
-                    ]
-                    print_yolo_approve(count)
-                    submission_id[0] += 1
-                    approval_submission = Submission(
-                        id=f"approval_{submission_id[0]}",
-                        operation=Operation(
-                            op_type=OpType.EXEC_APPROVAL,
-                            data={"approvals": approvals},
-                        ),
-                    )
-                    await submission_queue.put(approval_submission)
-                    continue
-
                 print_approval_header(count)
                 approvals = []
 
@@ -739,7 +711,7 @@ async def event_listener(
                     # the main loop deadlocks waiting for turn_complete.
                     try:
                         response = await prompt_session.prompt_async(
-                            f"Approve item {i}? (y=yes, yolo=approve all, n=no, or provide feedback): "
+                            f"Approve item {i}? (y=yes, n=no, or provide feedback): "
                         )
                     except (KeyboardInterrupt, EOFError):
                         get_console().print(
@@ -763,30 +735,6 @@ async def event_listener(
                         break
 
                     response = response.strip().lower()
-
-                    # Handle yolo mode activation
-                    if response == "yolo":
-                        config.yolo_mode = True
-                        print(
-                            "YOLO MODE ACTIVATED - Auto-approving all future tool calls"
-                        )
-                        # Auto-approve this item and all remaining
-                        approvals.append(
-                            {
-                                "tool_call_id": tool_call_id,
-                                "approved": True,
-                                "feedback": None,
-                            }
-                        )
-                        for remaining in tools_data[i:]:
-                            approvals.append(
-                                {
-                                    "tool_call_id": remaining.get("tool_call_id", ""),
-                                    "approved": True,
-                                    "feedback": None,
-                                }
-                            )
-                        break
 
                     approved = response in ["y", "yes"]
                     feedback = None if approved or response in ["n", "no"] else response
@@ -972,12 +920,6 @@ async def _handle_slash_command(
             console,
             resolve_hf_token(),
         )
-        return None
-
-    if command == "/yolo":
-        config.yolo_mode = not config.yolo_mode
-        state = "ON" if config.yolo_mode else "OFF"
-        print(f"YOLO mode: {state}")
         return None
 
     if command == "/effort":
@@ -1394,7 +1336,6 @@ async def headless_main(
     _configure_runtime_logging()
 
     config = load_config(CLI_CONFIG_PATH, include_user_defaults=True)
-    config.yolo_mode = True  # Auto-approve everything in headless mode
 
     if model:
         config.model_name = model

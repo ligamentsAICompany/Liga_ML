@@ -21,7 +21,6 @@ def test_training_planner_does_not_require_approval():
             "model_name": "moonshotai/Kimi-K2.6",
             "confirm_cpu_jobs": True,
             "auto_file_upload": False,
-            "yolo_mode": False,
         }
     )
 
@@ -38,7 +37,6 @@ def test_dataset_discovery_does_not_require_approval():
             "model_name": "moonshotai/Kimi-K2.6",
             "confirm_cpu_jobs": True,
             "auto_file_upload": False,
-            "yolo_mode": False,
         }
     )
 
