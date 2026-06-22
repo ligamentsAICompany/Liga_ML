@@ -197,7 +197,7 @@ async def test_run_command_submits_vertex_custom_job(monkeypatch):
     assert "HF_TOKEN" not in env
     assert job.run_kwargs["sync"] is False
     assert session.events[0].data["tool"] == "gcp_vertex_jobs"
-    assert session.events[0].data["state"] == "running"
+    assert session.events[0].data["state"] == "queued"
     assert session.events[0].data["provider"] == "gcp-vertex"
     assert session.events[0].data["machine_type"] == "n1-standard-8"
     assert session.events[0].data["accelerator_type"] == "NVIDIA_TESLA_T4"

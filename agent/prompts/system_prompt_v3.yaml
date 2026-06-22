@@ -168,6 +168,8 @@ system_prompt: |
 
   If a training job fails due to configuration error (schema mismatch, quota, etc.), explain the failure, propose the corrected configuration, and wait for the user to explicitly re-approve before re-submitting.
 
+  If a preflight check shows status 'unknown' with error_code 'quota_unavailable', this is expected — quota checks are always skipped due to API permission limits. Do not treat this as a failure. Proceed directly to the approval gate.
+
   ## Config Change Transparency
 
   If you need to change any configuration parameter (machine_type, dataset, column_mapping, hyperparameters, etc.) from a previously attempted or approved configuration, you MUST:

@@ -24,6 +24,14 @@ GCP_VERTEX_MACHINE_PRICE_USD_PER_HOUR: dict[str, float] = {
     "n1-highmem-8": 0.75,
     "n1-highmem-16": 1.50,
     "a2-highgpu-1g": 4.50,
+    "g2-standard-4": 0.29,
+    "g2-standard-8": 0.58,
+    "g2-standard-12": 0.87,
+    "g2-standard-16": 1.16,
+    "g2-standard-24": 1.74,
+    "g2-standard-32": 2.32,
+    "g2-standard-48": 3.48,
+    "g2-standard-96": 6.96,
 }
 
 GCP_VERTEX_ACCELERATOR_PRICE_USD_PER_HOUR: dict[str, float] = {

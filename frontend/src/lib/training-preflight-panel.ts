@@ -63,7 +63,10 @@ function statusDescription(status: string, launchReady = false): string {
 
 function checkLine(check: TrainingPreflightCheck): string {
   const status = cleanText(check.status) ?? 'unknown';
-  const description = statusDescription(status, false);
+  const description =
+    status === 'unknown' && cleanText(check.error_code) === 'quota_unavailable'
+      ? 'Check skipped (no quota API access) — does not block launch'
+      : statusDescription(status, false);
   const parts = [
     cleanText(check.label) ?? cleanText(check.check_id) ?? 'Unnamed check',
     cleanText(check.category) ? `category: ${cleanText(check.category)}` : null,

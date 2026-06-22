@@ -25,6 +25,29 @@ export interface VertexToolState {
   logsUnavailable?: boolean;
 }
 
+/** Human-readable label for durable background run status on GCP Vertex jobs. */
+export function vertexRunStatusLabel(
+  status: string | undefined,
+  provider?: string,
+): string {
+  const normalized = String(status ?? '').toLowerCase();
+  if (provider === 'gcp-vertex' || provider === 'gcp_vertex') {
+    if (normalized === 'waiting_provider') return 'Queued on GCP';
+    if (normalized === 'running') return 'Running on GCP';
+  }
+  return normalized || 'unknown';
+}
+
+/** Human-readable label for Vertex provider tool_state_change values. */
+export function vertexProviderStateLabel(state: string | undefined): string {
+  const normalized = String(state ?? '').toLowerCase();
+  if (normalized === 'queued' || normalized === 'pending' || normalized === 'starting') {
+    return 'Queued on GCP';
+  }
+  if (normalized === 'running') return 'Running on GCP';
+  return normalized || 'unknown';
+}
+
 const VERTEX_SUMMARY_FIELDS = [
   ['Dataset', 'dataset_name'],
   ['Dataset config', 'dataset_config'],
@@ -97,7 +120,7 @@ export function buildVertexSftSummary(args: Record<string, unknown>): string {
 
 export function buildVertexStateMarkdown(state: VertexToolState): string {
   const rows = [
-    ['State', state.state],
+    ['State', vertexProviderStateLabel(state.state)],
     ['Vertex job', state.jobName],
     ['GCS output directory', state.outputDir],
     ['Vertex console', state.jobUrl],

@@ -101,6 +101,23 @@ async def test_estimate_gcp_vertex_job_cost_blocks_unknown_machine():
 
 
 @pytest.mark.asyncio
+async def test_estimate_gcp_vertex_job_cost_for_g2_standard_16_with_l4():
+    estimate = await cost_estimation.estimate_gcp_vertex_job_cost(
+        {
+            "operation": "run",
+            "machine_type": "g2-standard-16",
+            "accelerator_type": "NVIDIA_L4",
+            "accelerator_count": 1,
+            "max_run_hours": 4,
+        }
+    )
+
+    assert estimate.estimated_cost_usd is not None
+    assert estimate.estimated_cost_usd == pytest.approx(8.24, rel=1e-3)
+    assert estimate.billable is True
+
+
+@pytest.mark.asyncio
 async def test_estimate_tool_cost_routes_gcp_vertex_jobs():
     estimate = await cost_estimation.estimate_tool_cost(
         "gcp_vertex_jobs",

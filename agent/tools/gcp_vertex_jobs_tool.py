@@ -740,7 +740,7 @@ class GcpVertexJobsTool:
                         "tool_call_id": self.tool_call_id,
                         "tool": "gcp_vertex_jobs",
                         "provider": "gcp-vertex",
-                        "state": "running",
+                        "state": "queued",
                         "jobName": resource_name,
                         "jobUrl": console_url,
                         "outputDir": output_dir,

@@ -271,7 +271,7 @@ async def test_approval_pending_and_provider_metadata_survive_replay():
     saved = await store.get_run(run_id)
     replay = await store.load_run_events_after(run_id, 0)
 
-    assert saved["status"] == "waiting_provider"
+    assert saved["status"] == "running"
     assert saved["approval_id"] == "approve-1"
     assert saved["active_provider_job_id"] == "train-job"
     assert saved["provider_metadata"]["provider_artifact_path"] == (

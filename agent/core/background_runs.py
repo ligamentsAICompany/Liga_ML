@@ -121,8 +121,10 @@ def run_status_from_event(
         return "waiting_approval"
     if event_type == "tool_state_change":
         state = str(data.get("state") or "").lower()
-        if state in {"running", "queued", "starting"}:
+        if state in {"queued", "starting"}:
             return "waiting_provider"
+        if state == "running":
+            return "running"
         if state in {"succeeded", "completed", "success"}:
             return "running"
         if state in {"failed", "error", "billing_required"}:
