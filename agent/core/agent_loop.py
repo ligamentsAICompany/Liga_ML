@@ -1232,10 +1232,70 @@ async def _explain_typed_approval_not_launched(session: Session) -> str:
 
 
 # -- LLM retry constants --------------------------------------------------
+MAX_GCP_VERTEX_JOBS_HISTORY = 6
 _LLM_TIMEOUT_SECONDS = 300
 _MAX_LLM_RETRIES = 3
 _LLM_RETRY_DELAYS = [5, 15, 30]  # seconds between retries
 _LLM_RATE_LIMIT_RETRY_DELAYS = [30, 60]  # exceed Bedrock's ~60s TPM bucket window
+
+
+def _cap_gcp_vertex_jobs_history(session: Session) -> None:
+    """Keep only the most recent gcp_vertex_jobs tool_use/tool_result pairs."""
+    items = session.context_manager.items
+    pairs: list[tuple[int, str]] = []
+    for index, msg in enumerate(items):
+        if getattr(msg, "role", None) != "assistant":
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            fn = getattr(getattr(tc, "function", None), "name", None)
+            tc_id = getattr(tc, "id", None)
+            if fn == "gcp_vertex_jobs" and tc_id:
+                pairs.append((index, tc_id))
+
+    excess = len(pairs) - MAX_GCP_VERTEX_JOBS_HISTORY
+    if excess <= 0:
+        return
+
+    drop_ids = {tc_id for _, tc_id in pairs[:excess]}
+    new_items: list[Message] = []
+    for msg in items:
+        role = getattr(msg, "role", None)
+        if (
+            role == "tool"
+            and getattr(msg, "name", None) == "gcp_vertex_jobs"
+            and getattr(msg, "tool_call_id", None) in drop_ids
+        ):
+            continue
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        if role == "assistant" and tool_calls:
+            filtered = [
+                tc
+                for tc in tool_calls
+                if not (
+                    getattr(getattr(tc, "function", None), "name", None)
+                    == "gcp_vertex_jobs"
+                    and getattr(tc, "id", None) in drop_ids
+                )
+            ]
+            if len(filtered) != len(tool_calls):
+                content = getattr(msg, "content", None)
+                if not filtered and not (content or "").strip():
+                    continue
+                msg = Message(
+                    role="assistant",
+                    content=content,
+                    tool_calls=filtered or None,
+                )
+        new_items.append(msg)
+
+    session.context_manager.items = new_items
+
+
+def _add_tool_message_to_context(session: Session, tool_msg: Message) -> None:
+    session.context_manager.add_message(tool_msg)
+    if getattr(tool_msg, "name", None) == "gcp_vertex_jobs":
+        _cap_gcp_vertex_jobs_history(session)
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -2484,7 +2544,7 @@ class Handlers:
                 tool_call_id=tc.id,
                 name=tool_name,
             )
-            session.context_manager.add_message(tool_msg)
+            _add_tool_message_to_context(session, tool_msg)
 
             await session.send_event(
                 Event(
@@ -3156,7 +3216,7 @@ class Handlers:
                             tool_call_id=tc.id,
                             name=tool_name,
                         )
-                        session.context_manager.add_message(tool_msg)
+                        _add_tool_message_to_context(session, tool_msg)
 
                         await session.send_event(
                             Event(
@@ -3482,7 +3542,7 @@ class Handlers:
                     tool_call_id=tc.id,
                     name=tool_name,
                 )
-                session.context_manager.add_message(tool_msg)
+                _add_tool_message_to_context(session, tool_msg)
                 await session.send_event(
                     Event(
                         event_type="tool_output",
@@ -3664,7 +3724,7 @@ class Handlers:
                     tool_call_id=tc.id,
                     name=tool_name,
                 )
-                session.context_manager.add_message(tool_msg)
+                _add_tool_message_to_context(session, tool_msg)
 
                 await session.send_event(
                     Event(
@@ -3703,7 +3763,7 @@ class Handlers:
                 tool_call_id=tc.id,
                 name=tool_name,
             )
-            session.context_manager.add_message(tool_msg)
+            _add_tool_message_to_context(session, tool_msg)
 
             await session.send_event(
                 Event(

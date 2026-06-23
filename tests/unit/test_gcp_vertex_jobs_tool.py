@@ -1038,3 +1038,36 @@ async def test_inspect_terminal_job_sets_sandbox_stop_flag(monkeypatch):
 
     assert result["sandbox_still_running"] is True
     assert result["sandbox_stop_recommended"] is True
+
+
+def test_trim_inspect_logs_result_truncates_large_payload():
+    from agent.tools.gcp_vertex_jobs_tool import _trim_inspect_logs_result
+
+    large_body = "line\n" * 5000
+    result = _trim_inspect_logs_result(
+        {
+            "formatted": f"**Vertex AI logs:**\n\n```text\n{large_body}\n```",
+            "totalResults": 5000,
+            "resultsShared": 5000,
+        }
+    )
+
+    assert result["truncated"] is True
+    assert "[... " in result["formatted"]
+    assert "lines omitted for brevity" in result["formatted"]
+    assert len(json.dumps(result, default=str)) <= 4000 or len(result["formatted"]) <= 4000 + 200
+
+
+def test_trim_inspect_logs_result_keeps_small_payload():
+    from agent.tools.gcp_vertex_jobs_tool import _trim_inspect_logs_result
+
+    result = _trim_inspect_logs_result(
+        {
+            "formatted": "small payload",
+            "totalResults": 1,
+            "resultsShared": 1,
+        }
+    )
+
+    assert "truncated" not in result
+    assert result["formatted"] == "small payload"

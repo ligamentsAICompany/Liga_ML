@@ -29,6 +29,35 @@ from agent.training_templates.sft import SftTemplateConfig, build_sft_training_s
 from agent.training_templates.validation import validate_sft_template_request
 from agent.tools.types import ToolResult
 
+_INSPECT_LOGS_MAX_JSON_CHARS = 4000
+_INSPECT_LOGS_KEEP_CHARS = 1500
+
+
+def _trim_inspect_logs_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Shorten oversized inspect/logs payloads before they enter agent context."""
+    if result.get("isError"):
+        return result
+    serialized = json.dumps(result, default=str)
+    if len(serialized) <= _INSPECT_LOGS_MAX_JSON_CHARS:
+        return result
+
+    formatted = str(result.get("formatted") or "")
+    if len(formatted) <= _INSPECT_LOGS_MAX_JSON_CHARS:
+        trimmed = dict(result)
+        trimmed["truncated"] = True
+        return trimmed
+
+    head = formatted[:_INSPECT_LOGS_KEEP_CHARS]
+    tail = formatted[-_INSPECT_LOGS_KEEP_CHARS:]
+    omitted = formatted[_INSPECT_LOGS_KEEP_CHARS : len(formatted) - _INSPECT_LOGS_KEEP_CHARS]
+    omitted_lines = omitted.count("\n") + (1 if omitted and not omitted.endswith("\n") else 0)
+    summary = f"[... {omitted_lines} lines omitted for brevity ...]"
+    return {
+        **result,
+        "formatted": f"{head}{summary}{tail}",
+        "truncated": True,
+    }
+
 
 DEFAULT_VERTEX_IMAGE = os.environ.get(
     "GCP_VERTEX_DEFAULT_IMAGE",
@@ -930,7 +959,7 @@ class GcpVertexJobsTool:
         ):
             result["sandbox_still_running"] = True
             result["sandbox_stop_recommended"] = True
-        return result
+        return _trim_inspect_logs_result(result)
 
     async def _cancel_job(self, args: dict[str, Any]) -> ToolResult:
         job_name = args.get("job_name") or args.get("job_id")
@@ -979,13 +1008,15 @@ class GcpVertexJobsTool:
         )
         self._record_monitor_poll(job_name, "JOB_STATE_MONITORING")
         lines = [str(getattr(entry, "payload", entry)) for entry in entries[-limit:]]
-        return {
-            "formatted": "**Vertex AI logs:**\n\n```text\n"
-            + ("\n".join(lines) if lines else "No logs found yet.")
-            + "\n```",
-            "totalResults": len(entries),
-            "resultsShared": len(lines),
-        }
+        return _trim_inspect_logs_result(
+            {
+                "formatted": "**Vertex AI logs:**\n\n```text\n"
+                + ("\n".join(lines) if lines else "No logs found yet.")
+                + "\n```",
+                "totalResults": len(entries),
+                "resultsShared": len(lines),
+            }
+        )
 
     async def _failure_reason_for_job(
         self, config: dict[str, str], job: Any
@@ -1528,6 +1559,9 @@ async def gcp_vertex_jobs_handler(
 
         tool = GcpVertexJobsTool(session=session, tool_call_id=tool_call_id)
         result = await tool.execute(arguments)
-        return result["formatted"], not result.get("isError", False)
+        formatted = str(result.get("formatted") or "")
+        if result.get("truncated"):
+            formatted = f"{formatted}\n\n(truncated: true)"
+        return formatted, not result.get("isError", False)
     except Exception as e:
         return f"Error executing Vertex AI Jobs tool: {e}", False

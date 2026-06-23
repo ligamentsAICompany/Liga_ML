@@ -40,6 +40,19 @@ interface UseAgentChatOptions {
 
 const STREAMABLE_TOOLS = new Set(['hf_jobs', 'gcp_vertex_jobs', 'aws_sagemaker_jobs', 'sandbox', 'bash']);
 
+const STALL_FAST_RETRY_MS = 2000;
+const STALL_MAX_FAST_RETRIES = 5;
+const STALL_SLOW_POLL_MS = 10000;
+const TERMINAL_RUN_STATUSES = new Set([
+  'complete',
+  'completed',
+  'error',
+  'succeeded',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+
 function appendPanelOutput(existing: string, next: string): string {
   if (!existing) return next;
   if (!next) return existing;
@@ -85,6 +98,10 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
 
   // Helper: update this session's state (mirrors to globals if active)
   const updateSession = useAgentStore.getState().updateSession;
+
+  const startReconnectRef = useRef<(() => void) | null>(null);
+  const reconnectRetryCountRef = useRef(0);
+  const stallPollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // -- Build side-channel callbacks (stable ref) --------------------------
   const sideChannel = useMemo<SideChannelCallbacks>(
@@ -564,18 +581,27 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         updateSession(sessionId, {
           activityStatus: { type: 'stalled', message },
           streamRecoveryError: null,
+          isProcessing: true,
         });
+        startReconnectRef.current?.();
       },
       onStreamRecoveryResult: (message: string | null, data?: Record<string, unknown>) => {
+        const sessionInfo = data?.session as { is_processing?: boolean } | undefined;
+        const stillProcessing = Boolean(sessionInfo?.is_processing);
         updateSession(sessionId, {
-          isProcessing: false,
+          isProcessing: stillProcessing,
           streamRecoveryError: message,
           activityStatus: message
             ? { type: 'stalled', message }
-            : { type: 'idle' },
+            : stillProcessing
+              ? { type: 'thinking' }
+              : { type: 'idle' },
         });
         if (data?.session && typeof data.session === 'object') {
           refreshMessages();
+        }
+        if (!message && stillProcessing) {
+          startReconnectRef.current?.();
         }
       },
     }),
@@ -778,17 +804,120 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
         clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
       }
+      if (stallPollTimeoutRef.current) {
+        clearTimeout(stallPollTimeoutRef.current);
+        stallPollTimeoutRef.current = null;
+      }
+    };
+
+    const resetReconnectRetries = () => {
+      reconnectRetryCountRef.current = 0;
+    };
+
+    const getReconnectDelay = () =>
+      reconnectRetryCountRef.current < STALL_MAX_FAST_RETRIES
+        ? STALL_FAST_RETRY_MS
+        : STALL_SLOW_POLL_MS;
+
+    const applyHydratedMessages = (
+      fresh: NonNullable<Awaited<ReturnType<typeof hydrateMessages>>>,
+    ) => {
+      const msgs = llmMessagesToUIMessages(
+        fresh.data,
+        fresh.pendingIds,
+        chatActionsRef.current.messages,
+      );
+      const currentCount = chatActionsRef.current.messages.length;
+      if (msgs.length > currentCount || currentCount === 0) {
+        chat.setMessages(msgs);
+        saveMessages(sessionId, msgs);
+      }
+    };
+
+    const unlockIfTerminalRun = async (): Promise<boolean> => {
+      try {
+        const [infoRes, runsRes] = await Promise.all([
+          apiFetch(`/api/session/${sessionId}`),
+          apiFetch(`/api/session/${sessionId}/runs`),
+        ]);
+        const info = infoRes.ok ? await infoRes.json().catch(() => null) : null;
+        const runs = runsRes.ok ? await runsRes.json().catch(() => []) : [];
+        const latestRun = Array.isArray(runs) && runs.length > 0 ? runs[0] : null;
+        const runStatus = latestRun?.status ? String(latestRun.status).toLowerCase() : '';
+        const runTerminal = TERMINAL_RUN_STATUSES.has(runStatus);
+        if (runTerminal || (info && !info.is_processing)) {
+          const fresh = await hydrateMessages();
+          if (fresh) {
+            applyHydratedMessages(fresh);
+          }
+          updateSession(sessionId, {
+            isProcessing: false,
+            activityStatus: { type: 'idle' },
+            streamRecoveryError: null,
+          });
+          stopReconnect();
+          resetReconnectRetries();
+          return true;
+        }
+      } catch {
+        /* keep polling */
+      }
+      return false;
+    };
+
+    const scheduleAdaptivePoll = (pollTick: () => Promise<void>) => {
+      if (stallPollTimeoutRef.current) {
+        clearTimeout(stallPollTimeoutRef.current);
+      }
+      const delay = getReconnectDelay();
+      if (reconnectRetryCountRef.current < STALL_MAX_FAST_RETRIES) {
+        reconnectRetryCountRef.current += 1;
+      }
+      stallPollTimeoutRef.current = setTimeout(() => {
+        void pollTick();
+      }, delay);
+    };
+
+    const startAdaptivePoll = () => {
+      const pollTick = async () => {
+        if (await unlockIfTerminalRun()) {
+          return;
+        }
+
+        const fresh = await hydrateMessages();
+        if (!fresh) {
+          scheduleAdaptivePoll(pollTick);
+          return;
+        }
+
+        applyHydratedMessages(fresh);
+
+        if (fresh.info && !fresh.info.is_processing) {
+          updateSession(sessionId, {
+            isProcessing: false,
+            activityStatus: { type: 'idle' },
+            streamRecoveryError: null,
+          });
+          stopReconnect();
+          resetReconnectRetries();
+          return;
+        }
+
+        scheduleAdaptivePoll(pollTick);
+      };
+
+      scheduleAdaptivePoll(pollTick);
     };
 
     /** Read the event stream from GET /api/events and forward to side-channel. */
-    const consumeEventStream = async (signal: AbortSignal) => {
+    const consumeEventStream = async (signal: AbortSignal): Promise<boolean> => {
       try {
         const lastEventKey = `hf-agent-last-event:${sessionId}`;
         const lastSeq = localStorage.getItem(lastEventKey);
         const runsRes = await apiFetch(`/api/session/${sessionId}/runs`, { signal });
         const runs = runsRes.ok ? await runsRes.json().catch(() => []) : [];
         const run = Array.isArray(runs)
-          ? runs.find((item) => item?.run_id && !['succeeded', 'failed', 'cancelled', 'interrupted'].includes(String(item.status))) ||
+          ? runs.find((item) => item?.run_id && !TERMINAL_RUN_STATUSES.has(String(item.status).toLowerCase())) ||
             runs.find((item) => item?.run_id)
           : null;
         const qs = lastSeq ? `?after=${encodeURIComponent(lastSeq)}` : '';
@@ -799,7 +928,13 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           headers: { 'Accept': 'text/event-stream' },
           signal,
         });
-        if (!res.ok || !res.body) return;
+        if (!res.ok || !res.body) return false;
+
+        resetReconnectRetries();
+        updateSession(sessionId, {
+          streamRecoveryError: null,
+          activityStatus: { type: 'thinking' },
+        });
 
         const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
         let buf = '';
@@ -818,6 +953,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           }
           eventId = null;
           eventData = '';
+          resetReconnectRetries();
           // Forward to side-channel for real-time UI updates
           const et = event.event_type as string;
           if (et === 'processing') sideChannel.onProcessing();
@@ -863,14 +999,11 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
           } else if (et === 'turn_complete' || et === 'error' || et === 'interrupted') {
             sideChannel.onProcessingDone();
             stopReconnect();
+            resetReconnectRetries();
             // Final hydration to get the complete message state
             const result = await hydrateMessages();
             if (result) {
-              const uiMsgs = llmMessagesToUIMessages(result.data, result.pendingIds, chatActionsRef.current.messages);
-              if (uiMsgs.length > 0) {
-                chat.setMessages(uiMsgs);
-                saveMessages(sessionId, uiMsgs);
-              }
+              applyHydratedMessages(result);
             }
             return true;
           } else if (et === 'approval_required') {
@@ -886,13 +1019,10 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
               }>,
             );
             stopReconnect();
+            resetReconnectRetries();
             const result = await hydrateMessages();
             if (result) {
-              const uiMsgs = llmMessagesToUIMessages(result.data, result.pendingIds, chatActionsRef.current.messages);
-              if (uiMsgs.length > 0) {
-                chat.setMessages(uiMsgs);
-                saveMessages(sessionId, uiMsgs);
-              }
+              applyHydratedMessages(result);
             }
             return true;
           }
@@ -908,7 +1038,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             const trimmed = line.replace(/\r$/, '');
             if (trimmed === '') {
               try {
-                if (await dispatch()) return;
+                if (await dispatch()) return true;
               } catch { /* ignore parse errors */ }
               continue;
             }
@@ -922,10 +1052,31 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
             }
           }
         }
+        return true;
       } catch {
         /* stream ended or aborted */
+        return false;
       }
     };
+
+    const startProcessingReconnect = () => {
+      stopReconnect();
+      updateSession(sessionId, {
+        isProcessing: true,
+        activityStatus: { type: 'stalled', message: 'Connection stalled. Checking session status...' },
+      });
+
+      const abort = new AbortController();
+      reconnectAbortRef.current = abort;
+      void consumeEventStream(abort.signal).then((connected) => {
+        if (connected) {
+          resetReconnectRetries();
+        }
+      });
+      startAdaptivePoll();
+    };
+
+    startReconnectRef.current = startProcessingReconnect;
 
     const onVisible = async () => {
       if (document.visibilityState !== 'visible') return;
@@ -934,44 +1085,11 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
       const result = await hydrateMessages();
       if (!result) return;
 
-      const { data, pendingIds, info } = result;
-      const uiMsgs = llmMessagesToUIMessages(data, pendingIds, chatActionsRef.current.messages);
-      if (uiMsgs.length > 0) {
-        chat.setMessages(uiMsgs);
-        saveMessages(sessionId, uiMsgs);
-      }
+      applyHydratedMessages(result);
 
       // If the backend is still processing, reconnect to the live event stream
-      if (info?.is_processing) {
-        updateSession(sessionId, { isProcessing: true, activityStatus: { type: 'thinking' } });
-
-        // Stop any previous reconnection
-        stopReconnect();
-
-        // Start live event subscription
-        const abort = new AbortController();
-        reconnectAbortRef.current = abort;
-        consumeEventStream(abort.signal);
-
-        // Poll messages every 3 s so the chat message list stays up-to-date
-        // (the event stream gives us real-time status but not full message diffs)
-        pollTimerRef.current = setInterval(async () => {
-          const fresh = await hydrateMessages();
-          if (!fresh) return;
-          const msgs = llmMessagesToUIMessages(fresh.data, fresh.pendingIds, chatActionsRef.current.messages);
-
-          const currentCount = chatActionsRef.current.messages.length;
-          if (msgs.length > currentCount || currentCount === 0) {
-            chat.setMessages(msgs);
-            saveMessages(sessionId, msgs);
-          } 
-
-          // If backend stopped processing, clean up
-          if (fresh.info && !fresh.info.is_processing) {
-            updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
-            stopReconnect();
-          }
-        }, 3000);
+      if (result.info?.is_processing) {
+        startProcessingReconnect();
       } else {
         updateSession(sessionId, { isProcessing: false, activityStatus: { type: 'idle' } });
         stopReconnect();
@@ -981,6 +1099,7 @@ export function useAgentChat({ sessionId, isActive, onReady, onError, onSessionD
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       document.removeEventListener('visibilitychange', onVisible);
+      startReconnectRef.current = null;
       stopReconnect();
     };
   }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
