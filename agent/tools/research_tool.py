@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 _RESEARCH_CONTEXT_WARN = 170_000  # 85% of 200k
 _RESEARCH_CONTEXT_MAX = 190_000
 _RESEARCH_WALL_CLOCK_MAX_SECONDS = 12 * 60
+_RESEARCH_MAX_TOOL_CALLS = 20
 
 
 def _persist_research_dataset_discovery(
@@ -496,6 +497,16 @@ async def research_handler(
             )
         )
         for tc in msg.tool_calls:
+            if _tool_uses >= _RESEARCH_MAX_TOOL_CALLS:
+                return await _summarize_without_tools(
+                    "Research sub-agent hit tool call cap (%d) — forcing summary"
+                    % _RESEARCH_MAX_TOOL_CALLS,
+                    (
+                        f"TOOL CALL LIMIT REACHED: {_RESEARCH_MAX_TOOL_CALLS} "
+                        "sub-tool calls used — forcing wrap-up"
+                    ),
+                )
+
             try:
                 tool_args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, TypeError):

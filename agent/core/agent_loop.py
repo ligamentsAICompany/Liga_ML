@@ -50,9 +50,9 @@ _MALFORMED_TOOL_SUFFIX = "' had malformed JSON arguments"
 _NO_TOOL_INCOMPLETE_PLAN_RETRY_LIMIT = 2
 _VERTEX_SMOKE_CONTINUATION_RETRY_LIMIT = 2
 # A reasoning model can burn its whole output budget on internal reasoning,
-# returning empty visible content with finish_reason="length". Retry a bounded
-# number of times with a concise-output hint before surfacing a hard error.
-_EMPTY_LENGTH_RETRY_LIMIT = 2
+# returning empty visible content with finish_reason="length". Trim history
+# and retry once before surfacing a hard error.
+_LENGTH_TRIM_RETRY_LIMIT = 1
 _ACTIVE_CLOUD_JOB_STATES = {
     "created",
     "creating",
@@ -2225,7 +2225,11 @@ async def _call_llm_streaming(
                 )
                 await asyncio.sleep(_delay)
                 continue
-            _is_timeout = isinstance(e, TimeoutError) or type(e).__name__ in ("Timeout", "ReadTimeout", "ConnectTimeout") or "timeout" in str(e).lower()
+            _is_timeout = (
+                isinstance(e, TimeoutError)
+                or type(e).__name__ in ("Timeout", "ReadTimeout", "ConnectTimeout")
+                or "timeout" in str(e).lower()
+            )
             if _is_timeout:
                 await session.send_event(
                     Event(
@@ -2393,7 +2397,11 @@ async def _call_llm_non_streaming(
                 )
                 await asyncio.sleep(_delay)
                 continue
-            _is_timeout = isinstance(e, TimeoutError) or type(e).__name__ in ("Timeout", "ReadTimeout", "ConnectTimeout") or "timeout" in str(e).lower()
+            _is_timeout = (
+                isinstance(e, TimeoutError)
+                or type(e).__name__ in ("Timeout", "ReadTimeout", "ConnectTimeout")
+                or "timeout" in str(e).lower()
+            )
             if _is_timeout:
                 await session.send_event(
                     Event(
@@ -2529,7 +2537,7 @@ class Handlers:
         max_iterations = session.config.max_iterations
         no_tool_incomplete_plan_retries = 0
         vertex_smoke_continuation_retries = 0
-        empty_length_retries = 0
+        length_trim_retries = 0
 
         while max_iterations == -1 or iteration < max_iterations:
             # ── Cancellation check: before LLM call ──
@@ -2689,39 +2697,22 @@ class Handlers:
                         # bounded number of times before surfacing the error.
                         if (
                             finish_reason == "length"
-                            and empty_length_retries < _EMPTY_LENGTH_RETRY_LIMIT
+                            and length_trim_retries < _LENGTH_TRIM_RETRY_LIMIT
                         ):
-                            empty_length_retries += 1
+                            length_trim_retries += 1
                             logger.warning(
-                                "Empty response with finish_reason=length (no "
-                                "content, no tool calls) — retrying with a "
-                                "concise-output hint (attempt %d/%d)",
-                                empty_length_retries,
-                                _EMPTY_LENGTH_RETRY_LIMIT,
+                                "LLM context limit hit (finish_reason=length). "
+                                "Trimming and retrying."
                             )
-                            session.context_manager.add_message(
-                                Message(
-                                    role="user",
-                                    content=(
-                                        "[SYSTEM: Your previous response hit the "
-                                        "output token limit before producing any "
-                                        "visible text or tool call "
-                                        "(finish_reason=length). This usually "
-                                        "means too much internal reasoning. "
-                                        "Respond now with a concise, direct answer "
-                                        "or a single tool call, and keep reasoning "
-                                        "brief.]"
-                                    ),
-                                )
-                            )
+                            removed = session.context_manager.trim_for_length_retry()
                             await session.send_event(
                                 Event(
                                     event_type="tool_log",
                                     data={
                                         "tool": "system",
                                         "log": (
-                                            "Output truncated before any content — "
-                                            "retrying with a concise-output hint"
+                                            "Context limit hit (finish_reason=length) "
+                                            f"— trimmed {removed} messages and retrying"
                                         ),
                                     },
                                 )

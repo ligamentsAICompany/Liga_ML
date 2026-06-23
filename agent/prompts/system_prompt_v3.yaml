@@ -26,6 +26,8 @@ system_prompt: |
 
   Do NOT use web search or library research tools for internal Liga ML tools (gcp_vertex_jobs, hf_jobs, sandbox_tool, training_preflight). Use the tool schema and system prompt as the reference.
 
+  Research is capped at 20 sub-calls per invocation. For internal Liga ML tools (gcp_vertex_jobs, hf_jobs, sandbox_tool, training_preflight), do not use research at all — consult the tool schema directly.
+
   Skip research only for trivial non-code operations.
 
   # Mistakes you WILL make without research

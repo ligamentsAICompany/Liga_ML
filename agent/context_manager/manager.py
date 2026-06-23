@@ -84,6 +84,45 @@ _COMPACT_PROMPT = (
 # context shrinks to 200k+ because one tool output is 80k tokens). We replace
 # such messages with a placeholder before compaction runs.
 _MAX_TOKENS_PER_MESSAGE = 50_000
+_LENGTH_RETRY_TAIL_TURNS = 6
+
+
+def trim_messages_for_length_retry(
+    messages: list[Message],
+    *,
+    max_turns: int = _LENGTH_RETRY_TAIL_TURNS,
+) -> list[Message]:
+    """Keep system prompt plus the most recent user/assistant turns for retry.
+
+    Tool messages in the preserved tail are kept so assistant/tool_call pairing
+    stays valid for the next LLM request.
+    """
+    if not messages:
+        return []
+
+    system_start = (
+        1 if messages and getattr(messages[0], "role", None) == "system" else 0
+    )
+    if system_start >= len(messages):
+        return list(messages)
+
+    tail_start = system_start
+    turn_count = 0
+    for index in range(len(messages) - 1, system_start - 1, -1):
+        if getattr(messages[index], "role", None) in ("user", "assistant"):
+            turn_count += 1
+            tail_start = index
+            if turn_count >= max_turns:
+                break
+
+    trimmed = list(messages[:system_start]) + list(messages[tail_start:])
+    if len(trimmed) < len(messages):
+        logger.warning(
+            "Trimmed conversation for finish_reason=length retry: %d -> %d messages",
+            len(messages),
+            len(trimmed),
+        )
+    return trimmed
 
 
 class CompactionFailedError(Exception):
@@ -302,6 +341,21 @@ class ContextManager:
         """
         self._patch_dangling_tool_calls()
         return self.items
+
+    def trim_for_length_retry(
+        self, *, max_turns: int = _LENGTH_RETRY_TAIL_TURNS
+    ) -> int:
+        """Drop middle history before a finish_reason=length retry.
+
+        Returns the number of messages removed.
+        """
+        before = len(self.items)
+        self.items = trim_messages_for_length_retry(self.items, max_turns=max_turns)
+        self._patch_dangling_tool_calls()
+        removed = before - len(self.items)
+        if removed > 0:
+            self.running_context_usage = 0
+        return removed
 
     @staticmethod
     def _normalize_tool_calls(msg: Message) -> None:

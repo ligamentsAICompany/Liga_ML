@@ -93,3 +93,43 @@ async def test_research_agent_wall_clock_deadline_forces_partial_summary(
     assert output == "Partial manufacturing dataset findings."
     assert calls[-1] is None
     assert len([call for call in calls if call is not None]) == 1
+
+
+@pytest.mark.asyncio
+async def test_research_tool_capped_at_20_calls(monkeypatch):
+    tool_calls = []
+
+    class CountingToolRouter(FakeToolRouter):
+        async def call_tool(
+            self, tool_name, arguments, session=None, tool_call_id=None
+        ):
+            tool_calls.append(tool_name)
+            return "result", True
+
+    session = FakeSession()
+    session.tool_router = CountingToolRouter()
+
+    async def fake_acompletion(*, tools=None, **kwargs):
+        if tools is None:
+            message = SimpleNamespace(content="Partial research summary after cap.")
+            return SimpleNamespace(
+                usage=SimpleNamespace(total_tokens=250),
+                choices=[SimpleNamespace(message=message, finish_reason="stop")],
+            )
+        return _tool_call_response()
+
+    monkeypatch.setattr(research_tool, "acompletion", fake_acompletion)
+    monkeypatch.setattr(research_tool, "_RESEARCH_MAX_TOOL_CALLS", 20, raising=False)
+    monkeypatch.setattr(
+        research_tool.telemetry, "record_llm_call", lambda *args, **kwargs: None
+    )
+
+    output, ok = await research_tool.research_handler(
+        {"task": "Find datasets forever."},
+        session=session,
+        tool_call_id="call_research_cap",
+    )
+
+    assert ok is True
+    assert output == "Partial research summary after cap."
+    assert len(tool_calls) == 20
