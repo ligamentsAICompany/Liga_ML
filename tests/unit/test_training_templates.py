@@ -60,6 +60,7 @@ def test_sft_template_uses_deterministic_dependency_install():
     assert "subprocess.check_call" in script
     assert "for package in REQUIRED_PACKAGES:" not in script
     assert "*REQUIRED_PACKAGES" in script
+    assert script.index("install_dependencies()") < script.index("from datasets import")
 
 
 def test_sft_template_phase4_script_contract_static_checks():

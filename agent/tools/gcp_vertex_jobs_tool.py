@@ -184,7 +184,42 @@ def _apply_dataset_scale_guardrails(args: dict[str, Any]) -> tuple[dict[str, Any
     )
 
 
+_VERTEX_ML_PIP_BOOTSTRAP = """import subprocess
+import sys
+
+subprocess.check_call([
+    sys.executable,
+    "-m",
+    "pip",
+    "install",
+    "-q",
+    "datasets",
+    "transformers",
+    "trl",
+    "trackio",
+    "accelerate",
+    "peft",
+    "huggingface_hub",
+    "bitsandbytes",
+    "google-cloud-storage",
+])
+"""
+
+
+def _ensure_vertex_script_dependencies(script: str) -> str:
+    """Install ML deps before any agent-supplied inline script runs on Vertex."""
+    lowered = script.lower()
+    if (
+        "pip install" in lowered
+        or "install_dependencies()" in script
+        or "liga_ml_skip_dep_install" in lowered
+    ):
+        return script
+    return f"{_VERTEX_ML_PIP_BOOTSTRAP.rstrip()}\n\n{script.lstrip()}"
+
+
 def _script_command(script: str, script_args: list[str] | None = None) -> list[str]:
+    script = _ensure_vertex_script_dependencies(script)
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
     args_json = json.dumps(script_args or [])
     runner = (

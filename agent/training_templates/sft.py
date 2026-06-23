@@ -132,6 +132,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+REQUIRED_PACKAGES = {packages_source}
+
+
+def install_dependencies() -> None:
+    if os.environ.get("LIGA_ML_SKIP_DEP_INSTALL") == "1":
+        return
+    if any(not package for package in REQUIRED_PACKAGES):
+        raise RuntimeError("Empty dependency entry is not allowed.")
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--quiet",
+        "--upgrade",
+        *REQUIRED_PACKAGES,
+    ])
+
+
+install_dependencies()
+
 CONFIG = json.loads({config_json!r})
 
 DATASET_NAME = "{config.dataset_name}"
@@ -175,7 +196,6 @@ OUTPUT_DIR = (
     else VERTEX_OUTPUT_DIR
 )
 RESULT_FILE_NAME = "liga_training_result.json"
-REQUIRED_PACKAGES = {packages_source}
 TRACKIO_MODE = (
     os.environ.get("TRACKIO_MODE")
     or CONFIG.get("trackio_mode")
@@ -183,25 +203,6 @@ TRACKIO_MODE = (
 ).strip().lower()
 TRACKIO_WARNING = ""
 TRACKIO_ENABLED = False
-
-
-def install_dependencies() -> None:
-    if os.environ.get("LIGA_ML_SKIP_DEP_INSTALL") == "1":
-        return
-    if any(not package for package in REQUIRED_PACKAGES):
-        raise RuntimeError("Empty dependency entry is not allowed.")
-    subprocess.check_call([
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--quiet",
-        "--upgrade",
-        *REQUIRED_PACKAGES,
-    ])
-
-
-install_dependencies()
 
 from datasets import load_dataset
 from google.cloud import storage

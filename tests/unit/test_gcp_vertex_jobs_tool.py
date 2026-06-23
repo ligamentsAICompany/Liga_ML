@@ -879,7 +879,10 @@ async def test_handler_reads_script_from_active_sandbox(monkeypatch):
     command = FakeCustomJob.instances[0].kwargs["worker_pool_specs"][0][
         "container_spec"
     ]["command"]
-    assert base64.b64encode(b"print('train')").decode("ascii") in command[-1]
+    encoded = re.search(r"b64decode\('([^']+)'\)", command[-1]).group(1)
+    decoded = base64.b64decode(encoded).decode("utf-8")
+    assert "pip" in decoded and "install" in decoded
+    assert "print('train')" in decoded
 
 
 def test_registered_tool_is_available():
